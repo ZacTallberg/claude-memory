@@ -23,10 +23,15 @@
 #>
 $ErrorActionPreference = "Continue"
 
-# Singleton: the SessionStart hook (and the logon Run key) may both spawn this script;
-# only one supervisor per logon session may live.
-$script:supervisorMutex = New-Object System.Threading.Mutex($false, "Local\ClaudeMemoryPersistence")
-if (-not $script:supervisorMutex.WaitOne(0)) { exit 0 }
+# Singleton: the scheduled task, the SessionStart hook, and manual runs may all spawn this
+# script. Global\ (not Local\) because the task can land in a different logon session, and any
+# failure to ACQUIRE (held elsewhere, or unopenable across an elevation/ACL boundary) means
+# another instance owns the stack — exit. A bare guard statement is not enough: an exception
+# here under ErrorActionPreference=Continue would skip the check and run a duplicate.
+try {
+  $script:supervisorMutex = New-Object System.Threading.Mutex($false, "Global\ClaudeMemoryPersistence")
+  if (-not $script:supervisorMutex.WaitOne(0)) { exit 0 }
+} catch { exit 0 }
 
 $root = Split-Path -Parent (Split-Path -Parent $MyInvocation.MyCommand.Path)
 $py = Join-Path $root ".venv\Scripts\python.exe"
