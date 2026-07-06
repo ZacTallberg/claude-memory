@@ -23,16 +23,6 @@
 #>
 $ErrorActionPreference = "Continue"
 
-# Singleton: the scheduled task, the SessionStart hook, and manual runs may all spawn this
-# script. Global\ (not Local\) because the task can land in a different logon session, and any
-# failure to ACQUIRE (held elsewhere, or unopenable across an elevation/ACL boundary) means
-# another instance owns the stack — exit. A bare guard statement is not enough: an exception
-# here under ErrorActionPreference=Continue would skip the check and run a duplicate.
-try {
-  $script:supervisorMutex = New-Object System.Threading.Mutex($false, "Global\ClaudeMemoryPersistence")
-  if (-not $script:supervisorMutex.WaitOne(0)) { exit 0 }
-} catch { exit 0 }
-
 $root = Split-Path -Parent (Split-Path -Parent $MyInvocation.MyCommand.Path)
 $py = Join-Path $root ".venv\Scripts\python.exe"
 if (-not (Test-Path $py)) { $py = "python" }
@@ -43,7 +33,7 @@ $logDir = Join-Path $root "data\logs"
 New-Item -ItemType Directory -Force -Path $logDir | Out-Null
 $log = Join-Path $logDir "persistence.log"
 
-# With the store pinned to sqlite, the WSL pin + ParadeDB legs are dead weight — supervise
+# With the store pinned to sqlite, the WSL pin + ParadeDB legs are dead weight - supervise
 # only the dashboard server. They re-arm automatically if config.toml pins postgres/auto.
 $needDb = $true
 try {
@@ -55,6 +45,26 @@ function Write-Log([string]$msg) {
   $line = "{0}  {1}" -f (Get-Date -Format "yyyy-MM-dd HH:mm:ss"), $msg
   Add-Content -Path $log -Value $line -Encoding utf8
 }
+
+# Singleton guard: the scheduled task, the SessionStart hook, and manual runs may all spawn
+# this script. Global\ (not Local\) because the task can land in a different logon session.
+# AbandonedMutexException = the previous holder died without releasing - WE own it now, so
+# continue. Any other failure to acquire (held elsewhere, or unopenable across an elevation/
+# ACL boundary) means another instance owns the stack - log the decision and exit.
+$script:acquired = $false
+try {
+  $script:supervisorMutex = New-Object System.Threading.Mutex($false, "Global\ClaudeMemoryPersistence")
+  try { $script:acquired = $script:supervisorMutex.WaitOne(0) }
+  catch [System.Threading.AbandonedMutexException] { $script:acquired = $true }
+} catch {
+  Write-Log "singleton: mutex unopenable ($($_.Exception.GetType().Name)) - another instance owns it; exiting (pid $PID)"
+  exit 0
+}
+if (-not $script:acquired) {
+  Write-Log "singleton: mutex held elsewhere; exiting (pid $PID)"
+  exit 0
+}
+Write-Log "singleton: mutex acquired (pid $PID)"
 
 Write-Log "persistence supervisor starting (root=$root)"
 
