@@ -1,0 +1,19 @@
+[project]
+name = "claudemem"
+version = "0.1.0"
+description = "Local best-of-breed agent-memory layer for Claude Code (ParadeDB hybrid recall + dashboard)."
+requires-python = ">=3.12"
+readme = "docs/README.md"
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+include = ["claudemem*"]
+
+[tool.setuptools.package-data]
+"claudemem.dashboard" = ["static/**/*", "templates/**/*"]
+
+[project.scripts]
+mem = "claudemem.cli:main"

@@ -1,0 +1,20 @@
+# runtime / derived
+data/
+.venv/
+__pycache__/
+*.pyc
+.fastembed_cache/
+
+# kill switch is operational state, not source
+DISABLED
+
+# secrets
+.env
+*.local.toml
+
+# os
+Thumbs.db
+.DS_Store
+
+# build artifacts
+claudemem.egg-info/

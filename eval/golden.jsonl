@@ -1,0 +1,12 @@
+{"q": "dokku deploy to production droplet", "expect_sessions": ["35615c8c-ec9e-40ab-b294-6b69cf6b8506"], "expect_facts": ["droplet-infra"], "note": "infra: existing dokku host + deploy keys"}
+{"q": "golden ratio as a design gimmick", "expect_sessions": ["957c37fc-26dd-4a41-aa13-43db0ea16707"], "expect_facts": ["Golden ratio"], "note": "design feedback against gimmicky golden-ratio layouts"}
+{"q": "plant genome and flora database checkpoint", "expect_sessions": ["f542c97f-90d7-42b5-95d6-133ff8b160ae"], "expect_facts": ["Flora DB"], "note": "flora/plant DB schema + checkpoint"}
+{"q": "blob PvP netcode over QUIC webtransport", "expect_sessions": ["3538b2e7-fd7c-4823-98fb-c470d8ba8710"], "expect_facts": ["quic-webtransport"], "note": "blobs game multiplayer transport"}
+{"q": "explore the codebase before building anything", "expect_sessions": [], "expect_facts": ["feedback-explore-before-building"], "note": "user feedback: investigate before implementing"}
+{"q": "never ship or deploy half-finished implementations", "expect_sessions": [], "expect_facts": ["Never deploy half-implementations"], "note": "no half-implementations rule"}
+{"q": "always check the browser console for errors", "expect_sessions": ["11b07829-b5f7-45d0-8d47-8efdb516d525"], "expect_facts": ["check-console-every-time"], "note": "QA habit: inspect console each time"}
+{"q": "EventBus naming convention in the Unity project", "expect_sessions": [], "expect_facts": ["EventBus naming convention"], "note": "motewild Unity event bus naming"}
+{"q": "verification must audit file contents against the spec not just existence", "expect_sessions": [], "expect_facts": ["Verification must audit CONTENTS"], "note": "strict verification discipline"}
+{"q": "analytics revamp: fix the data and label it freely", "expect_sessions": ["d404ebba-20df-4ebf-bd8f-5704f524c386"], "expect_facts": ["analytics"], "note": "analytics data labeling + revamp project"}
+{"q": "screenshot and dev server gotchas", "expect_sessions": ["06016ba1-be36-4341-bd38-729236da6a0f"], "expect_facts": ["screenshot-and-devserver-gotchas"], "note": "playwright screenshot / devserver pitfalls"}
+{"q": "plant visual quality feedback in verdant", "expect_sessions": [], "expect_facts": ["Plant Visual Quality"], "note": "verdant plant rendering quality bar"}

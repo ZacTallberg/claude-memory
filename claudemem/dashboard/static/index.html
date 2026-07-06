@@ -1,0 +1,422 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>claude-memory · hub</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;550;600;650;700&family=JetBrains+Mono:wght@400;500;600&display=swap" rel="stylesheet" />
+  <link rel="stylesheet" href="/static/css/app.css" />
+  <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24'><circle cx='12' cy='12' r='9' fill='none' stroke='%23e9c46a' stroke-width='2'/><circle cx='12' cy='12' r='3' fill='%23e9c46a'/></svg>" />
+
+  <!-- vendored libs (offline). Loaded before Alpine so x-init can use them. -->
+  <script src="/static/js/vendor/echarts.min.js" defer></script>
+  <script src="/static/js/vendor/cytoscape.min.js" defer></script>
+  <script src="/static/js/vendor/markdown-it.min.js" defer></script>
+  <script src="/static/js/app.js" defer></script>
+  <!-- Alpine LAST so all helpers/components are registered first -->
+  <script src="/static/js/vendor/alpine.min.js" defer></script>
+</head>
+<body>
+<div class="app" x-data="hub()" x-init="init()" x-cloak>
+
+  <!-- ============================== SIDEBAR ============================== -->
+  <aside class="sidebar">
+    <div class="brand">
+      <div class="mark" title="golden-ratio knowledge hub">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6">
+          <path d="M21 12a9 9 0 1 1-9-9" stroke-linecap="round"/>
+          <path d="M12 12a4.5 4.5 0 1 0 4.5 4.5" stroke-linecap="round" opacity=".7"/>
+          <circle cx="12" cy="12" r="1.6" fill="currentColor" stroke="none"/>
+        </svg>
+      </div>
+      <div class="title"><b>claude·memory</b><span>knowledge hub</span></div>
+    </div>
+
+    <nav class="nav">
+      <template x-for="item in nav" :key="item.id">
+        <button class="nav-item" :class="{active: view===item.id}" @click="go(item.id)">
+          <span x-html="icons[item.id]"></span>
+          <span x-text="item.label"></span>
+          <span class="kbd" x-text="item.key"></span>
+        </button>
+      </template>
+    </nav>
+
+    <div class="sidebar-foot">
+      <div class="stat-pill">
+        <span class="dot" :class="stats.ok ? 'ok' : 'bad'"></span>
+        <span x-text="stats.backend ? stats.backend + ' · ' + (stats.vector ? 'vector+bm25' : 'bm25') : 'connecting…'"></span>
+      </div>
+      <div class="stat-pill">
+        <span class="dot" :class="stats.killswitch ? 'bad' : 'ok'"></span>
+        <span x-text="stats.killswitch ? 'memory DISABLED' : 'memory active'"></span>
+      </div>
+      <div class="stat-pill" x-show="stats.chunks!==undefined">
+        <span class="dot ok"></span>
+        <span><b x-text="fmt(stats.chunks)"></b> chunks · <b x-text="fmt(stats.facts)"></b> notes</span>
+      </div>
+    </div>
+  </aside>
+
+  <!-- =============================== MAIN ================================ -->
+  <main class="main">
+    <header class="topbar">
+      <h1>
+        <span x-text="nav.find(n=>n.id===view)?.label"></span>
+        <span class="sub" x-text="subtitle()"></span>
+      </h1>
+      <div class="spacer"></div>
+      <button class="btn ghost sm" @click="refreshAll()" title="refresh">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 12a9 9 0 1 1-3-6.7M21 4v4h-4" stroke-linecap="round" stroke-linejoin="round"/></svg>
+      </button>
+    </header>
+
+    <div class="content">
+
+      <!-- ============================ SEARCH ============================ -->
+      <section class="section" x-show="view==='search'">
+        <div class="searchbar">
+          <svg class="lead" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="11" cy="11" r="7"/><path d="M21 21l-4.3-4.3" stroke-linecap="round"/></svg>
+          <input type="text" x-model="q" @input="onType()" @keydown.escape="q=''; doSearch()"
+                 placeholder="Search your memory — recalls and curated notes…" autofocus spellcheck="false" />
+          <div class="timing" x-show="searched">
+            <span class="spinner" x-show="loading"></span>
+            <span x-show="!loading" x-text="timing"></span>
+          </div>
+        </div>
+
+        <div class="search-tabs" x-show="searched">
+          <button class="tab" :class="{active: kind==='all'}" @click="kind='all'; doSearch()">All<span class="n" x-text="res.length+facts.length"></span></button>
+          <button class="tab" :class="{active: kind==='facts'}" @click="kind='facts'; doSearch()">Notes<span class="n" x-text="facts.length"></span></button>
+          <button class="tab" :class="{active: kind==='transcripts'}" @click="kind='transcripts'; doSearch()">Recalls<span class="n" x-text="res.length"></span></button>
+          <label class="switch rerank-toggle" title="cross-encoder rerank (slower, sharper)">
+            <input type="checkbox" x-model="rerank" @change="doSearch()" />
+            <span class="track"></span>
+            <span style="font-size:var(--t--1);color:var(--ink-2)">rerank</span>
+          </label>
+        </div>
+
+        <!-- hero (empty state) -->
+        <div class="search-hero" x-show="!searched">
+          <h2>What does <span class="accent">memory</span> remember?</h2>
+          <p>Hybrid BM25 + vector search across every past session and curated note on this machine.</p>
+          <div class="suggest">
+            <template x-for="s in suggestions" :key="s">
+              <button @click="q=s; doSearch()" x-text="s"></button>
+            </template>
+          </div>
+        </div>
+
+        <div class="results" x-show="searched">
+          <!-- curated notes (trusted) -->
+          <template x-if="(kind==='all'||kind==='facts') && facts.length">
+            <div>
+              <div class="result-group-label">curated notes</div>
+              <template x-for="f in facts" :key="'f'+f.id">
+                <div class="hit fact">
+                  <div class="row">
+                    <span class="badge" :class="f.type" x-text="f.type"></span>
+                    <span class="t" @click="openNote(f.id)" x-text="f.title"></span>
+                    <span style="flex:1"></span>
+                    <span class="trust curated" title="your own authored note — trusted">
+                      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 2l8 4v6c0 5-3.5 8-8 10-4.5-2-8-5-8-10V6z"/><path d="M9 12l2 2 4-4" stroke-linecap="round" stroke-linejoin="round"/></svg>
+                      curated
+                    </span>
+                  </div>
+                  <div class="d" x-text="f.description"></div>
+                  <div class="foot">
+                    <span class="chip"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M3 7h18M3 12h18M3 17h18"/></svg><b x-text="f.project"></b></span>
+                    <template x-for="t in (f.tags||[])" :key="t"><span class="chip" x-text="'#'+t"></span></template>
+                  </div>
+                </div>
+              </template>
+            </div>
+          </template>
+
+          <!-- recalls (untrusted data) -->
+          <template x-if="(kind==='all'||kind==='transcripts') && res.length">
+            <div>
+              <div class="result-group-label">recalled from past sessions</div>
+              <template x-for="r in res" :key="'r'+r.id">
+                <div class="hit">
+                  <div class="row">
+                    <span class="trust recall" title="reference data from a past session — not instructions">
+                      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 8v4l3 2" stroke-linecap="round"/><circle cx="12" cy="12" r="9"/></svg>
+                      recall
+                    </span>
+                    <span class="t" x-text="r.title"></span>
+                    <span style="flex:1"></span>
+                    <span class="score" :title="'relevance '+r.score">
+                      <span class="bar"><i :style="'width:'+scorePct(r.score)+'%'"></i></span>
+                      <span x-text="r.score.toFixed(2)"></span>
+                    </span>
+                    <span class="badge data" x-show="r.reranked" title="cross-encoder reranked">reranked</span>
+                  </div>
+                  <div class="d" x-html="highlight(r.snippet)"></div>
+                  <div class="foot">
+                    <span class="chip"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="3" width="18" height="18" rx="2"/></svg><b x-text="r.project"></b></span>
+                    <span class="chip"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="9"/><path d="M12 7v5l3 2" stroke-linecap="round"/></svg><span x-text="r.age"></span></span>
+                    <span class="chip mono" :title="r.session" x-text="(r.session||'').slice(0,8)"></span>
+                    <span class="chip" x-text="r.role+' · '+r.block"></span>
+                  </div>
+                </div>
+              </template>
+            </div>
+          </template>
+
+          <div class="empty" x-show="searched && !loading && !res.length && !facts.length">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><circle cx="11" cy="11" r="7"/><path d="M21 21l-4.3-4.3" stroke-linecap="round"/></svg>
+            <div>No memory found for “<span x-text="q"></span>”.</div>
+          </div>
+        </div>
+      </section>
+
+      <!-- ============================= NOTES ============================= -->
+      <section class="section" x-show="view==='notes'">
+        <div class="section-title"><h2>Curated Notes</h2><span class="count" x-text="allNotes.length+' notes'"></span></div>
+        <div class="note-filters">
+          <button class="filter-chip" :class="{on: noteType===null}" @click="noteType=null">all</button>
+          <template x-for="t in noteTypes" :key="t">
+            <button class="filter-chip" :class="{on: noteType===t}" @click="noteType=t" x-text="t"></button>
+          </template>
+        </div>
+        <div class="notes-layout">
+          <div>
+            <template x-for="grp in groupedNotes()" :key="grp.project">
+              <div class="note-group">
+                <h3><svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" style="color:var(--gold)"><path d="M3 7l9-4 9 4-9 4-9-4z"/><path d="M3 7v10l9 4 9-4V7" opacity=".5"/></svg><span x-text="grp.project"></span><span class="n" x-text="grp.notes.length"></span></h3>
+                <div class="note-list">
+                  <template x-for="n in grp.notes" :key="n.id">
+                    <div class="note-item" :class="{sel: note && note.id===n.id}" @click="openNote(n.id)">
+                      <div class="nh">
+                        <span class="badge" :class="n.type" x-text="n.type"></span>
+                        <span class="nt" x-text="n.title"></span>
+                      </div>
+                      <div class="nd" x-text="n.description"></div>
+                    </div>
+                  </template>
+                </div>
+              </div>
+            </template>
+            <div class="empty" x-show="!allNotes.length"><span class="spinner"></span> loading notes…</div>
+          </div>
+
+          <div class="card note-detail">
+            <template x-if="note">
+              <div>
+                <div class="nd-head">
+                  <span class="badge" :class="note.type" x-text="note.type"></span>
+                  <span class="trust curated">
+                    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 2l8 4v6c0 5-3.5 8-8 10-4.5-2-8-5-8-10V6z"/></svg>curated
+                  </span>
+                </div>
+                <h2 x-text="note.title"></h2>
+                <div class="nd-meta">
+                  <span class="chip"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="3" width="18" height="18" rx="2"/></svg><b x-text="note.project"></b></span>
+                  <span class="chip mono" :title="note.path" x-text="shortPath(note.path)"></span>
+                  <template x-for="t in (note.tags||[])" :key="t"><span class="chip" x-text="'#'+t"></span></template>
+                </div>
+                <div class="prose" x-html="note.body_html"></div>
+                <div class="backlinks" x-show="note._backlinks && note._backlinks.length">
+                  <h4>Linked notes</h4>
+                  <template x-for="b in (note._backlinks||[])" :key="b.id">
+                    <a @click.prevent="b.id>0 ? openNote(b.id) : null" :class="{muted: b.id<0}">
+                      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" width="13" height="13"><path d="M10 13a5 5 0 0 0 7 0l3-3a5 5 0 0 0-7-7l-1 1" stroke-linecap="round"/><path d="M14 11a5 5 0 0 0-7 0l-3 3a5 5 0 0 0 7 7l1-1" stroke-linecap="round"/></svg>
+                      <span x-text="b.label"></span>
+                    </a>
+                  </template>
+                </div>
+              </div>
+            </template>
+            <div class="empty" x-show="!note">
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><path d="M4 4h11l5 5v11a0 0 0 0 1 0 0H4z"/><path d="M14 4v6h6" opacity=".6"/></svg>
+              <div>Select a note to read it.</div>
+            </div>
+          </div>
+        </div>
+      </section>
+
+      <!-- ============================= GRAPH ============================= -->
+      <section class="section" x-show="view==='graph'">
+        <div class="graph-wrap">
+          <div class="graph-toolbar">
+            <div class="section-title" style="margin:0;flex:1"><h2>Knowledge Graph</h2><span class="count" x-text="graph.nodes ? graph.nodes.length+' nodes · '+graph.edges.length+' links' : ''"></span></div>
+            <template x-for="t in graphTypes" :key="t">
+              <button class="filter-chip" :class="{on: graphFilter.includes(t)}" @click="toggleGraphType(t)" x-text="t"></button>
+            </template>
+          </div>
+          <div class="graph-canvas" x-show="hasCyto">
+            <div id="cy" style="width:100%;height:100%"></div>
+            <div class="graph-legend">
+              <template x-for="t in graphTypes" :key="'lg'+t">
+                <div class="lg"><span class="sw" :style="'background:'+typeColor(t)"></span><span x-text="t"></span></div>
+              </template>
+            </div>
+          </div>
+          <div class="lib-missing" x-show="!hasCyto">Graph view requires cytoscape.js (vendored lib not found).</div>
+        </div>
+      </section>
+
+      <!-- ============================ METRICS =========================== -->
+      <section class="section" x-show="view==='metrics'">
+        <div class="section-title"><h2>Metrics</h2><span class="count">corpus growth & coverage</span></div>
+        <div class="metric-grid">
+          <div class="card metric-card">
+            <svg class="ic" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M4 4v16h16"/><path d="M8 14l3-4 3 2 4-6" stroke-linecap="round" stroke-linejoin="round"/></svg>
+            <div class="label">Chunks Indexed</div><div class="value" x-text="fmt(stats.chunks)"></div>
+          </div>
+          <div class="card metric-card">
+            <svg class="ic" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="3"/><path d="M12 3v3M12 18v3M3 12h3M18 12h3"/></svg>
+            <div class="label">Embedded</div><div class="value"><span x-text="embedPct()"></span><small>%</small></div>
+          </div>
+          <div class="card metric-card">
+            <svg class="ic" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M4 4h11l5 5v11H4z"/><path d="M14 4v6h6" opacity=".6"/></svg>
+            <div class="label">Curated Notes</div><div class="value" x-text="fmt(stats.facts)"></div>
+          </div>
+          <div class="card metric-card">
+            <svg class="ic" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="3" width="18" height="18" rx="2"/><path d="M3 9h18M9 3v18" opacity=".6"/></svg>
+            <div class="label">Sources</div><div class="value" x-text="fmt(stats.sources)"></div>
+          </div>
+        </div>
+        <div class="card chart-card" x-show="hasECharts">
+          <h3>Corpus over time</h3>
+          <div id="chart-growth" class="chart"></div>
+        </div>
+        <div class="card chart-card" x-show="hasECharts" style="margin-top:var(--s-1)">
+          <h3>Embedding coverage</h3>
+          <div id="chart-embed" class="chart" style="height:240px"></div>
+        </div>
+        <div class="lib-missing" x-show="!hasECharts">Charts require echarts (vendored lib not found).</div>
+      </section>
+
+      <!-- =========================== INJECTIONS ========================= -->
+      <section class="section" x-show="view==='injections'">
+        <div class="live-head">
+          <span class="live-dot" :class="{stale: !sseInjLive}"></span>
+          <div class="section-title" style="margin:0;flex:1"><h2>Injection Audit</h2><span class="count">what memory fed the model</span></div>
+          <span class="muted" style="font-size:var(--t--1)" x-text="sseInjLive ? 'live' : 'polling'"></span>
+        </div>
+        <div class="card">
+          <div class="table-wrap">
+            <table class="audit">
+              <thead><tr><th>time</th><th>hook</th><th>prompt</th><th>recalls</th><th>notes</th><th>chars</th><th>latency</th></tr></thead>
+              <tbody>
+                <template x-for="(inj,i) in injections" :key="inj.id">
+                  <tr :class="{fresh: inj._fresh}">
+                    <td class="num" x-text="shortTime(inj.ts)"></td>
+                    <td><span class="hook-tag" :class="inj.hook" x-text="inj.hook"></span></td>
+                    <td><div class="excerpt" :title="inj.prompt_excerpt" x-text="inj.prompt_excerpt || '—'"></div></td>
+                    <td class="num" x-text="inj.n_recalled"></td>
+                    <td class="num" x-text="inj.n_facts"></td>
+                    <td class="num" x-text="fmt(inj.chars)"></td>
+                    <td class="num" x-text="inj.latency_ms!=null ? inj.latency_ms+'ms' : '—'"></td>
+                  </tr>
+                </template>
+              </tbody>
+            </table>
+          </div>
+          <div class="empty" x-show="!injections.length">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><path d="M12 8v5M12 16h.01"/><circle cx="12" cy="12" r="9"/></svg>
+            <div>No injections logged yet. They appear here live as recall/unify fire.</div>
+          </div>
+        </div>
+      </section>
+
+      <!-- =========================== PROMOTIONS ========================= -->
+      <section class="section" x-show="view==='promotions'">
+        <div class="section-title"><h2>Promotion Candidates</h2><span class="count" x-text="promotions.length+' pending'"></span></div>
+        <div class="promo-grid">
+          <template x-for="p in promotions" :key="p.id">
+            <div class="card promo-card">
+              <div class="ph">
+                <span class="badge" :class="p.type||'reference'" x-text="p.type||'note'"></span>
+                <h3 x-text="p.title"></h3>
+              </div>
+              <div class="pbody prose" x-html="renderMd(p.body)"></div>
+              <div class="support" x-text="supportLabel(p)"></div>
+              <div class="actions">
+                <button class="btn gold sm" @click="actPromo(p.id,'accept')" :disabled="p._busy">
+                  <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2"><path d="M5 13l4 4 10-11" stroke-linecap="round" stroke-linejoin="round"/></svg> Accept
+                </button>
+                <button class="btn danger sm" @click="actPromo(p.id,'reject')" :disabled="p._busy">
+                  <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2"><path d="M6 6l12 12M18 6L6 18" stroke-linecap="round"/></svg> Reject
+                </button>
+              </div>
+            </div>
+          </template>
+        </div>
+        <div class="empty" x-show="!promotions.length">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><path d="M12 3l2.5 5 5.5.8-4 4 1 5.5L12 16l-5 2.3 1-5.5-4-4 5.5-.8z"/></svg>
+          <div>No promotion candidates. Run <code>mem promote</code> to mine recurring lessons.</div>
+        </div>
+      </section>
+
+      <!-- ============================ SETTINGS ========================== -->
+      <section class="section" x-show="view==='settings'">
+        <div class="section-title"><h2>Settings</h2><span class="count">health · control</span></div>
+
+        <div class="killbox" :class="{armed: stats.killswitch}">
+          <div class="kt">
+            <b x-text="stats.killswitch ? 'Memory is DISABLED' : 'Memory is active'"></b>
+            <span>Kill switch toggles the DISABLED sentinel — both recall & unify hooks no-op instantly.</span>
+          </div>
+          <label class="switch danger">
+            <input type="checkbox" :checked="stats.killswitch" @change="toggleKill($event.target.checked)" />
+            <span class="track"></span>
+          </label>
+        </div>
+
+        <div class="settings-grid">
+          <div class="card set-card">
+            <h3><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 2a10 10 0 1 0 10 10"/><path d="M12 6v6l4 2" stroke-linecap="round"/></svg> System Status</h3>
+            <div class="kv-list">
+              <div class="kv"><span class="k">Backend</span><span class="v" x-text="stats.backend||'—'"></span></div>
+              <div class="kv"><span class="k">Store healthy</span><span class="v" :class="stats.ok?'ok':'bad'" x-text="stats.ok?'yes':'no'"></span></div>
+              <div class="kv"><span class="k">Vector search</span><span class="v" :class="stats.vector?'ok':'bad'" x-text="stats.vector?'on':'off'"></span></div>
+              <div class="kv"><span class="k">BM25 search</span><span class="v" :class="stats.bm25?'ok':'bad'" x-text="stats.bm25?'on':'off'"></span></div>
+              <div class="kv"><span class="k">Embedder</span><span class="v" :class="stats.embedder_available?'ok':'bad'" x-text="stats.embedder||'—'"></span></div>
+              <div class="kv"><span class="k">Reranker</span><span class="v" :class="stats.reranker_available?'ok':''" x-text="stats.reranker||'—'"></span></div>
+              <div class="kv"><span class="k">Embedding dim</span><span class="v" x-text="stats.dim||'—'"></span></div>
+            </div>
+          </div>
+
+          <div class="card set-card">
+            <h3><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M4 7h16M4 12h16M4 17h16"/></svg> Corpus</h3>
+            <div class="kv-list">
+              <div class="kv"><span class="k">Sources</span><span class="v" x-text="fmt(stats.sources)"></span></div>
+              <div class="kv"><span class="k">Chunks</span><span class="v" x-text="fmt(stats.chunks)"></span></div>
+              <div class="kv"><span class="k">Embedded</span><span class="v" x-text="fmt(stats.chunks_embedded)+' ('+embedPct()+'%)'"></span></div>
+              <div class="kv"><span class="k">Curated notes</span><span class="v" x-text="fmt(stats.facts)"></span></div>
+              <div class="kv"><span class="k">Injections logged</span><span class="v" x-text="fmt(stats.injections)"></span></div>
+            </div>
+            <div style="margin-top:var(--s-2);display:flex;gap:.6rem">
+              <button class="btn" @click="runIndex(false)" :disabled="indexRunning">
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 12a9 9 0 1 1-3-6.7M21 4v4h-4" stroke-linecap="round" stroke-linejoin="round"/></svg>
+                <span x-text="indexRunning?'indexing…':'Reindex (incremental)'"></span>
+              </button>
+              <button class="btn ghost" @click="runIndex(true)" :disabled="indexRunning">Full</button>
+            </div>
+            <div class="index-log" x-show="indexLog.length" x-ref="indexlog">
+              <template x-for="(l,i) in indexLog" :key="i">
+                <div class="line" :class="l.cls" x-text="l.text"></div>
+              </template>
+            </div>
+          </div>
+        </div>
+      </section>
+
+    </div>
+  </main>
+
+  <!-- toasts -->
+  <div class="toasts">
+    <template x-for="t in toasts" :key="t.id">
+      <div class="toast" :class="t.cls" x-text="t.msg"></div>
+    </template>
+  </div>
+
+</div>
+</body>
+</html>

@@ -1,0 +1,69 @@
+# claude-memory configuration. Built-in defaults < this file < CLAUDEMEM_* env vars.
+# Secrets (DB password, API keys) come from the environment, never this file.
+
+[scope]
+# Recall/Unify only activate when Claude Code's cwd is under one of these roots.
+workspace_roots = ["C:/code"]
+# Where Claude Code stores per-project transcripts + auto-memory dirs.
+claude_projects_dir = "C:/Users/zcobe/.claude/projects"
+
+[store]
+backend = "sqlite"           # "postgres" | "sqlite" | "auto" — auto forks the store into two diverging copies whenever ParadeDB flaps; keep pinned to one backend
+
+[store.postgres]
+host = "localhost"
+port = 55432
+dbname = "claudemem"
+user = "claudemem"
+# password via env CLAUDEMEM_PG_PASSWORD (dev default "claudemem")
+
+[store.sqlite]
+path = "data/claudemem.db"
+
+[embeddings]
+provider = "local"          # "local" | "ollama" | "voyage" | "cohere"
+model = "BAAI/bge-small-en-v1.5"   # guaranteed in fastembed; upgrade via this key
+dim = 384                   # stored embedding dimension (Matryoshka-truncate if model is larger)
+query_prefix = ""
+doc_prefix = ""
+
+[reranker]
+enabled = true
+provider = "local"          # "local" (fastembed cross-encoder) | "cohere" | "none"
+model = "Xenova/ms-marco-MiniLM-L-6-v2"
+hot_path = false            # CPU box: do NOT rerank on the prompt hot path by default
+candidates = 30             # fused candidates to rerank on the full/on-demand path
+
+[contextual]
+enabled = true              # Anthropic Contextual Retrieval at index time
+model = "claude-haiku-4-5"
+enrich_notes = true         # always enrich curated notes (small, high value)
+enrich_transcripts = false  # off by default (volume); flip on or sample later
+max_doc_chars = 60000
+
+[recall]                    # hot path (UserPromptSubmit)
+top_k = 6
+bm25_k = 40
+vector_k = 40
+rrf_k = 60
+min_terms = 3
+max_chars = 8000
+recency_half_life_days = 45
+snippet_chars = 600
+include_facts = true
+facts_k = 4
+
+[unify]                     # session start (SessionStart)
+max_facts = 120
+group_by = "project"        # "project" | "type"
+
+[server]
+host = "127.0.0.1"
+port = 7777
+open_browser = true
+
+[index]
+exclude_sidechains = true
+strip_injected = true
+tool_blobs = false          # store compact tool summaries, not full tool blobs
+batch_size = 64

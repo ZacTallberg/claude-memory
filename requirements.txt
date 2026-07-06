@@ -1,0 +1,28 @@
+# claude-memory dependencies (Python 3.12, Windows, CPU-only).
+# Pinned to conservative floors; install resolves the latest compatible.
+
+# --- core ---
+psycopg[binary]>=3.2          # PostgreSQL/ParadeDB driver (primary store)
+numpy>=1.26                   # vector math
+PyYAML>=6.0                   # markdown frontmatter parsing
+
+# --- embeddings + reranking (ONNX Runtime, CPU, NO torch) ---
+fastembed>=0.4                # local EmbeddingProvider + TextCrossEncoder reranker
+
+# --- SQLite fallback vector layer ---
+sqlite-vec>=0.1.6            # vec0 virtual table for the SQLite fallback store
+
+# --- dashboard / API ---
+fastapi>=0.115
+uvicorn[standard]>=0.30
+jinja2>=3.1
+sse-starlette>=2.1            # Server-Sent Events for live dashboard updates
+python-multipart>=0.0.9
+markdown-it-py>=3.0           # render notes/snippets to HTML
+pygments>=2.18               # code highlighting in rendered markdown
+
+# --- optional: Contextual Retrieval (index-time enrichment) ---
+anthropic>=0.40              # Claude Haiku context blurbs (needs ANTHROPIC_API_KEY)
+
+# --- optional: MCP server surface ---
+mcp>=1.2

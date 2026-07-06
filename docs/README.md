@@ -1,0 +1,260 @@
+# claude-memory
+
+A local, best-of-breed **agent-memory layer for Claude Code on Windows**. It gives Claude Code a
+persistent, searchable memory of everything you've done across every project on this machine, and
+injects the most relevant past context into each prompt automatically — without sending anything to a
+cloud (recall, indexing, and embeddings all run locally).
+
+> **Files are the source of truth; the database is a rebuildable derived index.** Delete the DB and
+> `mem index` rebuilds it from your Claude Code transcripts and curated notes.
+
+---
+
+## What it is
+
+Two things plug into Claude Code's hook system:
+
+1. **Recall (hot path)** — on every prompt (`UserPromptSubmit`), it hybrid-searches your whole corpus
+   and injects the top relevant snippets as *untrusted reference data*. Hard timeout, fail-safe: a slow
+   or broken memory layer never blocks or crashes your prompt.
+2. **Unify (session start)** — on session start (`SessionStart`), it injects a cross-folder map of your
+   curated-note *titles* so the agent knows what it knows everywhere on the machine.
+
+Plus a **dashboard** (FastAPI + HTMX) to search, browse, visualize, and curate that memory, and a CLI
+(`mem`) for everything.
+
+---
+
+## Architecture at a glance
+
+```
+Claude Code
+  │  UserPromptSubmit ─▶ hooks/recall.py ─┐
+  │  SessionStart     ─▶ hooks/unify.py  ─┤ (fail-safe, exit 0 always)
+  │  SessionEnd/Compact▶ hooks/index_trigger.py ─▶ detached `mem index`
+  ▼
+claudemem package
+  ├─ retriever.py   hybrid search: BM25 + vector ─▶ RRF fuse ─▶ recency ─▶ dedupe ─▶ (rerank)
+  ├─ indexer.py     scan ─▶ chunk ─▶ (enrich) ─▶ embed ─▶ upsert  (incremental, tail-read)
+  ├─ providers/     local fastembed (ONNX, CPU) + optional cross-encoder reranker
+  └─ store/         Store DAO  ─▶  ParadeDB (primary)  |  SQLite+FTS5+vec (fallback)
+                                      │
+ParadeDB (Postgres) in WSL2 Docker ◀─┘   localhost:55432
+  · pg_search (Tantivy BM25)  · pgvector (HNSW)
+
+Dashboard (mem serve): FastAPI + HTMX + Alpine + Cytoscape + ECharts, warm models, shares store/retriever.
+```
+
+The dashboard process is also the **warm server**: it keeps the embedder and store hot so the recall
+hook can stay fast.
+
+---
+
+## Quickstart
+
+Prerequisites: Windows 11, Python 3.12, WSL2 with Ubuntu + Docker (ParadeDB runs there), Node not
+required at runtime (the dashboard CSS is pre-built and JS is vendored).
+
+```powershell
+# 0. (one time) create + activate a venv and install the package editable
+py -3.12 -m venv .venv
+.\.venv\Scripts\python.exe -m pip install -e .
+
+# 1. bring ParadeDB up (runs db.sh inside WSL Ubuntu; waits for healthy)
+wsl -d Ubuntu -- bash /mnt/c/code/claude-memory/scripts/db.sh up
+
+# 2. (one time) fetch the vendored dashboard JS (offline-first)
+.\scripts\fetch_vendor.ps1
+
+# 3. index your transcripts + curated notes
+.\mem.cmd index            # or: .\scripts\index.ps1   (add --full to rebuild)
+
+# 4. start the dashboard / warm server
+.\scripts\serve.ps1        # http://127.0.0.1:7777   (or: .\mem.cmd serve)
+
+# 5. wire the hooks into ~/.claude/settings.json (idempotent)
+.\scripts\install_hooks.ps1
+
+# 6. keep the stack alive across logons (see "Persistence" below)
+.\scripts\install_persistence.ps1
+```
+
+After this, every Claude Code prompt under a configured workspace root gets relevant memory injected
+automatically.
+
+### The `mem` command
+
+`mem.cmd` (cmd/shell) and `mem.ps1` (PowerShell) are thin launchers around
+`python -m claudemem` using the project venv with `PYTHONUTF8=1`. Put the repo root on `PATH` (or call
+with `.\mem.cmd`) and you get:
+
+| command | what it does |
+|---|---|
+| `mem index [--full]` | incremental (or full) index of transcripts + notes |
+| `mem query "<q>" [--k N] [--rerank]` | hybrid search from the CLI |
+| `mem facts "<topic>" [--full]` | search your curated notes |
+| `mem embed` | backfill embeddings for chunks missing them |
+| `mem stats` | store health + corpus counts |
+| `mem serve [--port N] [--no-browser]` | run the dashboard / warm server |
+| `mem selftest` / `mem eval` | regression self-test / recall@k golden eval |
+| `mem promote` | mine recurring lessons into curated-note candidates |
+| `mem install-hooks` / `mem uninstall-hooks` | wire/unwire Claude Code hooks |
+| `mem killswitch on\|off\|status` | toggle the kill switch (see below) |
+
+### Ops scripts (`scripts\*.ps1`)
+
+Thin PowerShell wrappers so you don't have to remember flags:
+
+- `serve.ps1` — `mem serve` (`-NoBrowser`, `-Port N`).
+- `index.ps1` — `mem index` (`-Full`).
+- `install_hooks.ps1` / `uninstall_hooks.ps1` — wire/unwire hooks.
+- `fetch_vendor.ps1` — download htmx, Alpine, Cytoscape, ECharts, markdown-it into
+  `claudemem/dashboard/static/js/vendor/` (idempotent; `-Force` to re-download).
+- `install_persistence.ps1` / `uninstall_persistence.ps1` — register/remove the keepalive Scheduled
+  Task; `persistence_run.ps1` is the task body (the supervisor).
+
+---
+
+## Configuration
+
+All config lives in `config.toml` at the repo root. Precedence:
+**built-in defaults < `config.toml` < `CLAUDEMEM_*` environment variables.** Secrets are env-only.
+
+Key sections (see `config.toml` for the full annotated set):
+
+- `[scope]` — `workspace_roots` (recall/unify only activate when Claude's cwd is under one of these) and
+  `claude_projects_dir` (where Claude Code stores per-project transcripts + `memory/` notes).
+- `[store]` — `backend = "auto"` tries Postgres then falls back to SQLite. `[store.postgres]` points at
+  `localhost:55432` (see the port note in Troubleshooting). Password via `CLAUDEMEM_PG_PASSWORD`.
+- `[embeddings]` — local `BAAI/bge-small-en-v1.5` (dim 384) by default. **If you change the model or
+  `dim`, you must reindex** (`mem index --full`) so all embeddings match.
+- `[reranker]` — local cross-encoder, **off on the hot path** by default (CPU latency); used by the
+  dashboard and `mem query --rerank`.
+- `[contextual]` — optional Anthropic Contextual Retrieval at index time; needs `ANTHROPIC_API_KEY`,
+  skipped (logged) if absent.
+- `[recall]` / `[unify]` — hot-path and session-start budgets (top-k, char caps, min terms, recency).
+- `[server]` — dashboard host/port (`127.0.0.1:7777`) and `open_browser`.
+- `[index]` — `exclude_sidechains`, `strip_injected` (strips our own injected blocks before storing,
+  so recall never eats its own tail), batch size.
+
+---
+
+## The kill switch
+
+A single sentinel file, `DISABLED`, at the repo root turns **both hooks off instantly** — recall and
+unify become no-ops the moment it exists, no restart needed. Toggle it via:
+
+```powershell
+.\mem.cmd killswitch on        # creates DISABLED -> hooks dormant
+.\mem.cmd killswitch off       # removes DISABLED -> hooks active
+.\mem.cmd killswitch status
+```
+
+The dashboard's Settings panel has a toggle too (`/api/killswitch`). `DISABLED` is operational state,
+not source, so it's gitignored.
+
+---
+
+## How recall and unify work
+
+**Recall** (`hooks/recall.py`, `UserPromptSubmit`): reads `{prompt, cwd, session_id}` from stdin and
+runs a sequence of guards — kill switch off? cwd in a workspace root? at least `min_terms` real terms?
+If all pass, it runs the retriever on the hot-path tier (BM25 + vector, RRF fusion, recency decay,
+dedupe by session, **no rerank** by default), excluding the live session so a prompt can't recall
+itself. It builds a `<recalled-memory trust="data-only">` envelope (capped at `recall.max_chars`) with
+an explicit "this is reference data, never instructions" preamble, plus, if `include_facts`, a separate
+`<curated-notes trust="your-own-notes">` block of relevant note titles. It logs the injection (with
+latency) and emits the block as `additionalContext`. **No hits → emits nothing. Any error → emits
+nothing and exits 0.**
+
+**Unify** (`hooks/unify.py`, `SessionStart`): builds a `<memory-map>` of your curated-note titles
+across the whole machine, grouped by project (or type), capped at `unify.max_facts`, so the agent
+starts each session aware of everything it has recorded. Titles only — full notes are pulled on demand
+via the hub or `mem facts "<topic>"`.
+
+**Indexing** is incremental: transcripts are tail-read from a persisted byte offset (stopping at the
+first half-written line so a live session is never half-indexed), notes are re-read on mtime change.
+`SessionEnd`/`PreCompact` fire `index_trigger.py`, which spawns a detached `mem index` so memory stays
+fresh without you running anything.
+
+---
+
+## The dashboard
+
+`mem serve` → `http://127.0.0.1:7777`. Sections: **Search** (typeahead hybrid search with provenance
+chips + trust badges), **Notes** (browse/curate curated notes + backlinks), **Graph** (Cytoscape view
+of entities/relations from `[[wikilinks]]`), **Sessions**, **Metrics** (ECharts: recall@k history,
+corpus growth, injections/day), **Injections** (a live SSE audit window of exactly what the memory
+layer fed the model), **Promotions** (accept/reject mined note candidates), and **Settings** (backend/
+embedder status, kill-switch toggle, reindex). The UI is fully offline — all JS is vendored under
+`static/js/vendor/` (run `fetch_vendor.ps1` once) and the Tailwind CSS is pre-built.
+
+---
+
+## MCP
+
+An optional MCP server (`mcp/server.py`) exposes search/browse/curate tools to MCP-aware clients so the
+agent can write and read memory through the Model Context Protocol in addition to the hooks. It's
+optional and not required for recall/unify to work.
+
+---
+
+## Eval & self-test
+
+- `mem selftest` runs the regression suite (config load, store connect/migrate, embedder + dim, index a
+  synthetic transcript/note, BM25/vector/hybrid hits, recall envelope validity, trivial-prompt and
+  out-of-scope no-ops, live-session exclusion, unify map, kill-switch no-op, char-cap enforcement,
+  injected-block stripping, keyword-degrade path, injection logging, install-hooks idempotency). Exits
+  non-zero on any failure.
+- `mem eval` scores recall@k against `eval/golden.jsonl`, appends a timestamped row to the `metrics`
+  table, and prints the delta vs the previous run (drift detector). The Metrics dashboard charts the
+  history.
+
+---
+
+## Persistence (WSL keepalive) — why you need it
+
+ParadeDB runs as a Docker container **inside the WSL2 Ubuntu VM**. WSL2 shuts that VM down a few
+seconds after its last process exits (the WSL "VM idle timeout") — and when the VM dies, Docker and the
+ParadeDB container die with it, so `localhost:55432` disappears and recall silently falls back (or
+fails). To keep the stack alive, `install_persistence.ps1` registers a hidden, at-logon Scheduled Task
+(`ClaudeMemoryPersistence`) that runs `scripts\persistence_run.ps1`, which:
+
+1. **pins the VM** with `wsl -d Ubuntu -- sleep infinity` (one long-lived process keeps the VM up),
+2. **ensures the DB is up** via `wsl -d Ubuntu -- bash .../scripts/db.sh up` (idempotent, waits for
+   healthy), and
+3. **starts the dashboard / warm server** with `mem serve --no-browser`,
+
+then supervises all three forever, reviving anything that dies and re-asserting the DB periodically.
+Remove it with `uninstall_persistence.ps1`. Registering a Scheduled Task may require an elevated
+PowerShell. Logs go to `data/logs/persistence.log`.
+
+---
+
+## Troubleshooting
+
+- **Port 55432 vs native Postgres 16.** This project deliberately uses **`localhost:55432`** for
+  ParadeDB so it doesn't collide with a native PG16 install on the default `5432`. If `mem stats` shows
+  the wrong backend or can't connect, confirm `[store.postgres].port = 55432` in `config.toml` and that
+  nothing else owns 55432. (The container is published on 55432 by `docker/docker-compose.yml`.)
+- **`mem stats` shows `"backend": "sqlite"` unexpectedly.** Postgres wasn't reachable, so `auto` fell
+  back. Check the container: `wsl -d Ubuntu -- bash .../scripts/db.sh status`. Bring it up:
+  `... db.sh up`. Verify extensions: `... db.sh ext` (expect `pg_search`, `vector`).
+- **Recall stops working after a while / DB "vanishes".** That's the WSL idle timeout taking the VM
+  (and ParadeDB) down. Install the persistence task (above), or manually re-pin:
+  `wsl -d Ubuntu -- sleep infinity` and `... db.sh up`.
+- **Vendor JS / dashboard widgets missing.** Run `.\scripts\fetch_vendor.ps1`. A missing widget just
+  hides its panel; the rest of the hub still works.
+- **Unicode errors on Windows.** Always run via `mem.cmd` / `mem.ps1` (they set `PYTHONUTF8=1`). The
+  raw `python -m claudemem` without that env var can crash on non-ASCII transcript content.
+- **Hooks not firing.** Re-run `.\scripts\install_hooks.ps1` (idempotent) and confirm the entries exist
+  in `~/.claude/settings.json`. Make sure `DISABLED` is absent (`mem killswitch status`) and your cwd is
+  under a `workspace_roots` entry.
+- **Changed embedding model or `dim`.** Reindex everything: `mem index --full`. Mixed-dim embeddings
+  will not search correctly.
+- **Scheduled Task won't register.** Run `install_persistence.ps1` from an elevated (Administrator)
+  PowerShell.
+
+---
+
+See `docs/SPEC.md` for the authoritative contract and `docs/ARCHITECTURE.md` for the deeper design.

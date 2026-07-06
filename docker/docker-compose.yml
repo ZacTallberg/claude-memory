@@ -1,0 +1,49 @@
+name: claudemem
+
+# ParadeDB = PostgreSQL 17 + pg_search (Tantivy BM25) + pgvector (+ pgvectorscale when available).
+# Runs inside WSL2 Ubuntu's Docker engine; published to the host so Windows reaches it at localhost:5432.
+# Data lives in a named docker volume (fast, avoids /mnt/c bind-mount overhead for the DB files).
+
+services:
+  db:
+    image: paradedb/paradedb:latest
+    container_name: claudemem-db
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: claudemem
+      POSTGRES_PASSWORD: claudemem
+      POSTGRES_DB: claudemem
+      # Make psql init scripts fail loudly so a bad migration is visible.
+      POSTGRES_INITDB_ARGS: "--data-checksums"
+    ports:
+      # Host 55432 -> container 5432. Avoids the native Windows PostgreSQL-16 on 5432.
+      # Reachable from Windows at localhost:55432 via WSL2 localhost forwarding.
+      - "55432:5432"
+    volumes:
+      # PG18+ stores data in a major-version subdir under this single mount point.
+      - pgdata:/var/lib/postgresql
+      - ./init.sql:/docker-entrypoint-initdb.d/10-init.sql:ro
+    shm_size: "256mb"
+    command:
+      - "postgres"
+      - "-c"
+      - "shared_buffers=512MB"
+      - "-c"
+      - "effective_cache_size=2GB"
+      - "-c"
+      - "maintenance_work_mem=256MB"
+      - "-c"
+      - "work_mem=32MB"
+      - "-c"
+      - "max_connections=50"
+      - "-c"
+      - "max_parallel_workers_per_gather=4"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U claudemem -d claudemem"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+
+volumes:
+  pgdata:
+    name: claudemem_pgdata
