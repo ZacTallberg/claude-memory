@@ -47,10 +47,12 @@ _SENT_RE = re.compile(r"(?<=[.!?])\s+(?=[A-Z0-9\"'`])|\n+")
 # Assistant "status update" chatter that matches a cue phrase but is NOT a durable lesson.
 # These are progress narration, not feedback/decisions, so we drop them.
 _NOISE_RE = re.compile(
-    r"^\s*(let me|let'?s (?:do|run|add|make|update|look|check)|now (?:i|let|update|make|add|run|the)|"
-    r"i'?ll|i'?m going to|here'?s|memory saved|refresh|done[.! ]|fixed[.! ]|"
-    r"all (?:checks|green|tests)|next[,:]|step \d|\d+\.\s)"
-    r"|,\s+(?:let me|let'?s do|i'?ll|i'?m going to)\b",   # narration after a leading clause
+    r"^[\s\"'(\[]*(let me|let'?s (?:do|run|add|make|update|look|check)|now (?:i|let|update|make|add|run|the)|"
+    r"i'?ll|i'?m going to|i need to|i want to|i should|here'?s|memory saved|refresh|done[.! ]|fixed[.! ]|"
+    r"this (?:turn|session|pass|run|sprint) |this is a comprehensive|the workflow (?:completed|confirms)|"
+    r"which turns out|all (?:checks|green|tests)|next[,:]|step \d|\d+\.\s)"
+    r"|[,;:]\s+(?:let me|let'?s do|i'?ll|i'?m going to|i need to)\b"      # narration after a clause
+    r"|\s[—–-]\s*(?:let me|let'?s do|i'?ll|i'?m going to|i need to)\b",   # …or after a dash
     re.IGNORECASE,
 )
 # A sentence that's mostly code / paths / URLs / markup is poor note material.
@@ -81,6 +83,10 @@ _MIN_TERMS = 4
 # How many chunks to pull per cue query, and the overall cap on drafted candidates.
 _BM25_K = 60
 _CAP = 15
+# Score floor: without it, the fixed cap dredges the next-15-worst clusters from the corpus on
+# every run, refilling the review queue with dross forever. Above-floor ≈ strong-cue user-voiced
+# or multi-session lessons; the long tail of weak assistant observations never drafts.
+_MIN_SCORE = 1.0
 # Jaccard threshold for treating two lesson sentences as near-duplicates (same cluster).
 _DUP_THRESHOLD = 0.45
 # Keyword-overlap above this against an existing fact = "already captured" (not novel).
@@ -373,13 +379,28 @@ def mine_candidates(cfg: Config | None = None, store: Store | None = None,
 
     clusters = _cluster(lessons)
     fact_sets = _fact_term_sets(cfg, store)
+    # Existing candidates (any status) suppress re-drafting: a rejected candidate must not
+    # resurrect on the next mining run, and a pending one must not accumulate duplicates.
+    # Overlap coefficient of the canonical sentence vs the candidate text — jaccard against the
+    # cluster's term-union is far too weak to catch even an identical sentence.
+    cand_sets: list[set[str]] = []
+    try:
+        for c in store.list_promotions():
+            ts = set(extract_terms(f"{c.get('title', '')} {c.get('body', '')}"))
+            if ts:
+                cand_sets.append(ts)
+    except Exception as e:
+        log.warning("list_promotions failed during candidate dedup: %s", e)
 
     max_cue = max((_cue_strength(c) for c in CUE_PHRASES), default=1)
-    scored: list[tuple[float, _Cluster, float, float]] = []  # (score, cluster, support, novelty)
+    scored: list[tuple[float, _Cluster, float, float, str]] = []  # (score, cluster, support, novelty, type)
     for cl in clusters:
         novelty = _novelty(cl.terms, fact_sets)
         if novelty < (1.0 - _FACT_OVERLAP_DROP):
             continue  # essentially already captured as a fact
+        canon_terms = _canonical(cl).terms
+        if cand_sets and max((_overlap(canon_terms, cs) for cs in cand_sets), default=0.0) >= 0.7:
+            continue  # already drafted (pending/accepted/rejected) on a previous run
         support = float(cl.support)
         # The signal that actually predicts a durable, promotable rule is the *quality* of the
         # cue (imperatives like "always/never/from now on/you must" >> weak observations) and
@@ -390,17 +411,22 @@ def mine_candidates(cfg: Config | None = None, store: Store | None = None,
         if cl.has_user:
             quality = min(1.0, quality + 0.35)                 # strong nudge for user corrections
         score = (1.0 + math.log1p(support)) * (0.5 + 0.5 * novelty) * (0.2 + 0.8 * quality)
-        scored.append((score, cl, support, novelty))
+        ctype = _guess_type(_canonical(cl).cue, cl.terms)
+        if ctype == "feedback" and not cl.has_user:
+            # a "rule" no user ever voiced is usually assistant self-talk; demote it
+            ctype = "reference"
+            score *= 0.5
+        scored.append((score, cl, support, novelty, ctype))
 
+    scored = [s for s in scored if s[0] >= _MIN_SCORE]
     # Deterministic ordering: score desc, then support desc, then a stable text key.
     scored.sort(key=lambda x: (-x[0], -x[2], _canonical(x[1]).sentence.lower()))
 
     written = 0
-    for score, cl, support, novelty in scored[:cap]:
+    for score, cl, support, novelty, ctype in scored[:cap]:
         canonical = _canonical(cl)
         title = _title_from(canonical.sentence)
         body = _draft_body(cl)
-        ctype = _guess_type(canonical.cue, cl.terms)
         sample = cl.lessons[: min(8, len(cl.lessons))]
         support_meta = {
             "method": "keyword-cluster",

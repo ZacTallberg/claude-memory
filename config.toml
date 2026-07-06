@@ -35,7 +35,8 @@ hot_path = false            # CPU box: do NOT rerank on the prompt hot path by d
 candidates = 30             # fused candidates to rerank on the full/on-demand path
 
 [contextual]
-enabled = true              # Anthropic Contextual Retrieval at index time
+enabled = false             # Anthropic Contextual Retrieval at index time — needs ANTHROPIC_API_KEY
+                            # in the hook/index environment (none on this box); paid API per chunk
 model = "claude-haiku-4-5"
 enrich_notes = true         # always enrich curated notes (small, high value)
 enrich_transcripts = false  # off by default (volume); flip on or sample later

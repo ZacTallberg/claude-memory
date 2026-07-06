@@ -81,6 +81,18 @@ class Retriever:
 
         chunks = {c.id: c for c in self.store.get_chunks(list(fused.keys()))}
 
+        # Anti-memory: deliberately suppressed content (stale or wrong advice) never resurfaces.
+        try:
+            anti = self.store.list_anti_memory()
+        except Exception:
+            anti = []
+        if anti:
+            anti_ids = {a.get("chunk_id") for a in anti if a.get("chunk_id")}
+            anti_keys = [a["key"].lower() for a in anti if a.get("key") and len(a["key"]) >= 6]
+            chunks = {cid: ch for cid, ch in chunks.items()
+                      if cid not in anti_ids
+                      and not any(k in ch.content.lower() for k in anti_keys)}
+
         # recency-weighted fused score
         scored: list[tuple[int, float, float]] = []  # (id, weighted, fused_raw)
         for cid, f in fused.items():
