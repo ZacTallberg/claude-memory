@@ -28,9 +28,25 @@ def main() -> None:
                       timeout=4.0)
     if res and res.get("additionalContext"):
         emit_context(res["additionalContext"], EVENT)
+        _write_health(source="server", chars=len(res["additionalContext"]))
         return
 
     _local(cfg, session_id)
+
+
+def _write_health(**fields) -> None:
+    """Drop a tiny health beacon the statusline renders — memory delivery must never degrade
+    silently (the 2026-07-06 harness audit found both engines down with zero signal)."""
+    import json
+    import os
+    import time
+
+    try:
+        path = os.path.join(os.path.expanduser("~"), ".claude", "memory-health.json")
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump({"ts": int(time.time()), **fields}, f)
+    except Exception:
+        pass
 
 
 def _ensure_server(cfg) -> None:
@@ -70,6 +86,10 @@ def _local(cfg, session_id: str | None) -> None:
     except Exception:
         pending = 0
     text = format_unify(tmap, cfg, pending_promotions=pending)
+    total = sum(len(v) for v in tmap.values())
+    _write_health(source="local-fallback", backend=type(store).__name__,
+                  facts_total=total, facts_shown=min(total, cfg.unify.max_facts),
+                  chars=len(text))
     if not text:
         return
     try:

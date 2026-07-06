@@ -60,6 +60,7 @@ def format_unify(titles_map: dict, cfg: Config, pending_promotions: int = 0) -> 
     """titles_map: project -> list[Fact]. Emits a compact titles-only cross-folder map."""
     if not titles_map:
         return ""
+    total = sum(len(v) for v in titles_map.values())
     lines = ['<memory-map trust="your-own-notes">',
              "What you've recorded across this machine (titles only — pull a full note via the "
              'memory hub or `mem facts "<topic>"`).']
@@ -92,6 +93,9 @@ def format_unify(titles_map: dict, cfg: Config, pending_promotions: int = 0) -> 
                 lines.append(f"- [{f.type}] {f.title}")
                 count += 1
 
+    if count < total:
+        lines.append(f"TRUNCATED: {count}/{total} facts shown — {total - count} more exist; "
+                     'find them with `mem facts "<topic>"` (never assume this map is complete).')
     if pending_promotions:
         lines.append(f"{pending_promotions} auto-mined promotion candidate(s) await review — "
                      "accept/reject in the memory hub (http://127.0.0.1:7777).")
