@@ -1,0 +1,16 @@
+{
+  "permissions": {
+    "defaultMode": "bypassPermissions",
+    "deny": [
+      "Bash(rm -rf:*)",
+      "Bash(rm -fr:*)",
+      "Bash(mkfs:*)",
+      "Bash(dd:*)",
+      "PowerShell(Format-Volume:*)",
+      "PowerShell(Clear-Disk:*)",
+      "PowerShell(Remove-Item C:\\code:*)",
+      "PowerShell(Remove-Item -Recurse -Force C:\\:*)",
+      "WebFetch(domain:api.namecheap.com)"
+    ]
+  }
+}
