@@ -48,6 +48,20 @@ def call_server(path: str, payload: dict, timeout: float) -> dict | None:
         return None
 
 
+def write_health(**fields) -> None:
+    """Drop the tiny health beacon the statusline renders — memory delivery must never degrade silently
+    (the 2026-07-06 harness audit found both engines down with zero signal). Written by BOTH unify
+    (SessionStart) AND recall (every UserPromptSubmit) so a long-lived session keeps it fresh — the beacon
+    reflects that memory was actually DELIVERED recently, not merely that a session once started."""
+    import time
+    try:
+        path = os.path.join(os.path.expanduser("~"), ".claude", "memory-health.json")
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump({"ts": int(time.time()), **fields}, f)
+    except Exception:
+        pass
+
+
 def run_failsafe(fn) -> None:
     """Run a hook body; swallow everything; always exit 0 (never block the prompt)."""
     try:

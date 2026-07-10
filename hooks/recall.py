@@ -6,7 +6,7 @@ from __future__ import annotations
 
 import time
 
-from _common import call_server, emit_context, read_event, run_failsafe
+from _common import call_server, emit_context, read_event, run_failsafe, write_health
 
 EVENT = "UserPromptSubmit"
 
@@ -32,9 +32,13 @@ def main() -> None:
     # 1) Warm server path (full hybrid; server logs the injection).
     res = call_server("/api/recall", {"prompt": prompt, "cwd": cwd, "session_id": session_id},
                       timeout=4.0)
-    if res and res.get("additionalContext"):
-        emit_context(res["additionalContext"], EVENT)
-        return
+    if res is not None:
+        # The server answered — memory is healthy and delivering. Refresh the beacon EVERY prompt so a
+        # long-lived session never shows a false "mem stale" (the beacon used to age only from SessionStart).
+        write_health(source="server", chars=len(res.get("additionalContext") or ""))
+        if res.get("additionalContext"):
+            emit_context(res["additionalContext"], EVENT)
+            return
 
     # 2) Fallback: local keyword-only (no embedding model load).
     _local_keyword(cfg, prompt, session_id)
@@ -64,6 +68,8 @@ def _local_keyword(cfg, prompt: str, session_id: str | None) -> None:
                             latency_ms=int((time.time() - t0) * 1000))
     except Exception:
         pass
+    # Fell back to the local engine — still a healthy delivery; refresh the beacon (yellow "mem sq" state).
+    write_health(source="local-fallback", backend=type(store).__name__)
     if not text:
         return
     emit_context(text, EVENT)
