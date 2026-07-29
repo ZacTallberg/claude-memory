@@ -5,8 +5,10 @@ If sqlite-vec can't load, vector search returns [] and the retriever runs keywor
 from __future__ import annotations
 
 import json
+import os
 import sqlite3
 import threading
+from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Iterable, Sequence
@@ -17,6 +19,17 @@ from ..text import extract_terms
 from .base import Candidate, Chunk, Fact, Store
 
 log = get_logger(__name__)
+
+# Every store op serializes on one lock over one connection. An operation that hangs while
+# holding it used to block every other caller forever: the server stayed listening, answered
+# nothing, and accumulated 73 threads over 7 days while the port-only health check reported
+# healthy. A bounded wait turns that permanent deadlock into a fast, visible error that the
+# health probe can see and the supervisor can act on.
+LOCK_TIMEOUT_S = float(os.environ.get("CLAUDEMEM_LOCK_TIMEOUT_S", "20"))
+
+
+class StoreBusy(RuntimeError):
+    """The store lock was not acquired within LOCK_TIMEOUT_S."""
 
 
 def _iso(ts: datetime | None) -> str | None:
@@ -52,6 +65,15 @@ class SqliteStore(Store):
         self._vec = False
         self._lock = threading.RLock()
 
+    @contextmanager
+    def _locked(self):
+        if not self._lock.acquire(timeout=LOCK_TIMEOUT_S):
+            raise StoreBusy(f"store lock not acquired within {LOCK_TIMEOUT_S}s")
+        try:
+            yield
+        finally:
+            self._lock.release()
+
     def connect(self) -> None:
         if self._conn is not None:
             return
@@ -77,7 +99,7 @@ class SqliteStore(Store):
             self._conn = None
 
     def migrate(self) -> None:
-        with self._lock:
+        with self._locked():
             c = self._conn
             c.executescript("""
                 CREATE TABLE IF NOT EXISTS sources(id INTEGER PRIMARY KEY, path TEXT UNIQUE, kind TEXT,
@@ -120,13 +142,13 @@ class SqliteStore(Store):
 
     # ---- sources & indexing ----
     def get_source(self, path: str) -> dict | None:
-        with self._lock:
+        with self._locked():
             r = self._conn.execute("SELECT id,bytes_indexed,mtime,session_id FROM sources WHERE path=?",
                                    (path,)).fetchone()
             return dict(r) if r else None
 
     def upsert_source(self, *, path, kind, project, session_id, bytes_indexed, mtime, meta=None) -> int:
-        with self._lock:
+        with self._locked():
             cur = self._conn.execute("""INSERT INTO sources(path,kind,project,session_id,bytes_indexed,
                     mtime,last_indexed,meta) VALUES (?,?,?,?,?,?,datetime('now'),?)
                     ON CONFLICT(path) DO UPDATE SET kind=excluded.kind, project=excluded.project,
@@ -138,14 +160,14 @@ class SqliteStore(Store):
             return r["id"]
 
     def set_bytes_indexed(self, source_id: int, n: int) -> None:
-        with self._lock:
+        with self._locked():
             self._conn.execute("UPDATE sources SET bytes_indexed=?, last_indexed=datetime('now') WHERE id=?",
                                (n, source_id))
             self._conn.commit()
 
     def add_chunks(self, source_id: int, chunks: list[dict]) -> list[int]:
         ids: list[int] = []
-        with self._lock:
+        with self._locked():
             for ch in chunks:
                 blurb = ch.get("context_blurb")
                 search_text = ((blurb + " ") if blurb else "") + ch["content"]
@@ -166,7 +188,7 @@ class SqliteStore(Store):
         if not rows or not self._vec:
             return
         import sqlite_vec
-        with self._lock:
+        with self._locked():
             for cid, vec in rows:
                 self._conn.execute("DELETE FROM chunks_vec WHERE rowid=?", (cid,))
                 self._conn.execute("INSERT INTO chunks_vec(rowid,embedding) VALUES (?,?)",
@@ -176,13 +198,13 @@ class SqliteStore(Store):
     def chunks_missing_embeddings(self, limit: int) -> list[Chunk]:
         if not self._vec:
             return []
-        with self._lock:
+        with self._locked():
             rows = self._conn.execute("""SELECT * FROM chunks WHERE id NOT IN
                     (SELECT rowid FROM chunks_vec) ORDER BY id LIMIT ?""", (limit,)).fetchall()
             return [self._row_to_chunk(r) for r in rows]
 
     def delete_source(self, path: str) -> None:
-        with self._lock:
+        with self._locked():
             r = self._conn.execute("SELECT id FROM sources WHERE path=?", (path,)).fetchone()
             if r:
                 sid = r["id"]
@@ -214,7 +236,7 @@ class SqliteStore(Store):
         expr = _fts_query(query)
         if not expr:
             return []
-        with self._lock:
+        with self._locked():
             rows = self._conn.execute(
                 "SELECT rowid, bm25(chunks_fts) AS r FROM chunks_fts WHERE chunks_fts MATCH ? "
                 "ORDER BY r LIMIT ?", (expr, k * 4)).fetchall()
@@ -232,7 +254,7 @@ class SqliteStore(Store):
         if not qvec or not self._vec:
             return []
         import sqlite_vec
-        with self._lock:
+        with self._locked():
             rows = self._conn.execute(
                 "SELECT rowid, distance FROM chunks_vec WHERE embedding MATCH ? ORDER BY distance LIMIT ?",
                 (sqlite_vec.serialize_float32(qvec), k * 4)).fetchall()
@@ -258,7 +280,7 @@ class SqliteStore(Store):
         if not ids:
             return []
         ph = ",".join("?" * len(ids))
-        with self._lock:
+        with self._locked():
             rows = self._conn.execute(f"SELECT * FROM chunks WHERE id IN ({ph})", ids).fetchall()
             return [self._row_to_chunk(r) for r in rows]
 
@@ -266,7 +288,7 @@ class SqliteStore(Store):
     def upsert_fact(self, *, path, project, name, title, description, type, tags, origin_session_id,
                     body, embedding, mtime, meta=None) -> int:
         search_text = " ".join([title or "", description or "", body or ""])
-        with self._lock:
+        with self._locked():
             self._conn.execute("""INSERT INTO facts(path,project,name,title,description,type,tags,
                     origin_session_id,body,search_text,mtime,meta) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)
                     ON CONFLICT(path) DO UPDATE SET project=excluded.project, name=excluded.name,
@@ -303,13 +325,13 @@ class SqliteStore(Store):
         if cl:
             q += " WHERE " + " AND ".join(cl)
         q += " ORDER BY project, type, title"
-        with self._lock:
+        with self._locked():
             return [self._row_to_fact(r) for r in self._conn.execute(q, params)]
 
     def search_facts(self, query, k, *, qvec=None) -> list[Fact]:
         expr = _fts_query(query)
         out: dict[int, Fact] = {}
-        with self._lock:
+        with self._locked():
             if expr:
                 rows = self._conn.execute("SELECT rowid FROM facts_fts WHERE facts_fts MATCH ? "
                                           "ORDER BY bm25(facts_fts) LIMIT ?", (expr, k)).fetchall()
@@ -330,12 +352,12 @@ class SqliteStore(Store):
         return list(out.values())
 
     def get_fact(self, fact_id: int) -> Fact | None:
-        with self._lock:
+        with self._locked():
             r = self._conn.execute("SELECT * FROM facts WHERE id=?", (fact_id,)).fetchone()
             return self._row_to_fact(r) if r else None
 
     def delete_fact(self, path: str) -> None:
-        with self._lock:
+        with self._locked():
             r = self._conn.execute("SELECT id FROM facts WHERE path=?", (path,)).fetchone()
             if r:
                 self._conn.execute("DELETE FROM facts_fts WHERE rowid=?", (r["id"],))
@@ -352,7 +374,7 @@ class SqliteStore(Store):
 
     # ---- graph ----
     def replace_graph(self, nodes, edges) -> None:
-        with self._lock:
+        with self._locked():
             self._conn.execute("DELETE FROM graph_edges;")
             self._conn.execute("DELETE FROM graph_nodes;")
             for n in nodes:
@@ -364,7 +386,7 @@ class SqliteStore(Store):
             self._conn.commit()
 
     def graph(self) -> dict:
-        with self._lock:
+        with self._locked():
             nodes = [{"id": r["id"], "label": r["label"], "type": r["type"], "group": r["grp"]}
                      for r in self._conn.execute("SELECT * FROM graph_nodes")]
             edges = [{"source": r["source"], "target": r["target"], "kind": r["kind"]}
@@ -373,14 +395,14 @@ class SqliteStore(Store):
 
     # ---- promotion ----
     def add_promotion_candidate(self, *, title, body, type, support, score) -> int:
-        with self._lock:
+        with self._locked():
             cur = self._conn.execute("INSERT INTO promotion_candidates(title,body,type,support,score) "
                                      "VALUES (?,?,?,?,?)", (title, body, type, json.dumps(support), score))
             self._conn.commit()
             return cur.lastrowid
 
     def list_promotions(self, status=None) -> list[dict]:
-        with self._lock:
+        with self._locked():
             if status:
                 rows = self._conn.execute("SELECT * FROM promotion_candidates WHERE status=? ORDER BY score DESC",
                                           (status,)).fetchall()
@@ -389,26 +411,26 @@ class SqliteStore(Store):
             return [dict(r) for r in rows]
 
     def update_promotion(self, pid, status) -> None:
-        with self._lock:
+        with self._locked():
             self._conn.execute("UPDATE promotion_candidates SET status=? WHERE id=?", (status, pid))
             self._conn.commit()
 
     # ---- anti-memory ----
     def add_anti_memory(self, *, key, reason, chunk_id=None) -> int:
-        with self._lock:
+        with self._locked():
             cur = self._conn.execute("INSERT INTO anti_memory(key,reason,chunk_id) VALUES (?,?,?)",
                                      (key, reason, chunk_id))
             self._conn.commit()
             return cur.lastrowid
 
     def list_anti_memory(self) -> list[dict]:
-        with self._lock:
+        with self._locked():
             return [dict(r) for r in self._conn.execute("SELECT * FROM anti_memory ORDER BY ts DESC")]
 
     # ---- observability ----
     def log_injection(self, *, hook, session_id, prompt_excerpt, n_recalled, n_facts, chars,
                       latency_ms, details=None) -> None:
-        with self._lock:
+        with self._locked():
             self._conn.execute("""INSERT INTO injections(hook,session_id,prompt_excerpt,n_recalled,
                     n_facts,chars,latency_ms,details) VALUES (?,?,?,?,?,?,?,?)""",
                     (hook, session_id, prompt_excerpt, n_recalled, n_facts, chars, latency_ms,
@@ -416,24 +438,24 @@ class SqliteStore(Store):
             self._conn.commit()
 
     def recent_injections(self, limit=50) -> list[dict]:
-        with self._lock:
+        with self._locked():
             return [dict(r) for r in self._conn.execute(
                 "SELECT * FROM injections ORDER BY ts DESC LIMIT ?", (limit,))]
 
     def record_metric(self, metric, value, *, run_id=None, details=None) -> None:
-        with self._lock:
+        with self._locked():
             self._conn.execute("INSERT INTO metrics(metric,value,run_id,details) VALUES (?,?,?,?)",
                                (metric, value, run_id, json.dumps(details or {})))
             self._conn.commit()
 
     def metric_series(self, metric) -> list[dict]:
-        with self._lock:
+        with self._locked():
             return [dict(r) for r in self._conn.execute(
                 "SELECT ts,value,run_id,details FROM metrics WHERE metric=? ORDER BY ts", (metric,))]
 
     # ---- misc ----
     def counts(self) -> dict:
-        with self._lock:
+        with self._locked():
             def n(q):
                 return self._conn.execute(q).fetchone()[0]
             return {"sources": n("SELECT count(*) FROM sources"),
@@ -443,11 +465,11 @@ class SqliteStore(Store):
                     "injections": n("SELECT count(*) FROM injections")}
 
     def kv_get(self, key: str) -> dict | None:
-        with self._lock:
+        with self._locked():
             r = self._conn.execute("SELECT value FROM kv WHERE key=?", (key,)).fetchone()
             return json.loads(r["value"]) if r else None
 
     def kv_set(self, key: str, value: dict) -> None:
-        with self._lock:
+        with self._locked():
             self._conn.execute("INSERT OR REPLACE INTO kv(key,value) VALUES (?,?)", (key, json.dumps(value)))
             self._conn.commit()

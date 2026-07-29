@@ -482,6 +482,142 @@ def run_selftest(verbose: bool = True) -> bool:
             return len(res) > 0, f"{len(res)} chunk results, {len(facts)} fact results"
         ctx.check("real query end-to-end (Retriever) returns >0 hits", c_e2e)
 
+    # -- WEDGE GUARDS -------------------------------------------------------
+    # On 2026-07-29 the warm server was found wedged since 2026-07-22: the store lock was held
+    # forever, /api/stats never answered (proved: 300s, no response), 73 threads were parked, and
+    # every recall had been silently degrading to keyword-only for seven days. Nothing noticed,
+    # because the watchdog probed with socket.create_connection() and a wedged server still
+    # accepts TCP in 88ms. Each check below SEEDS THAT FAILURE and asserts the guard fires; if a
+    # guard is ever weakened into something that cannot observe a wedge, this suite goes red.
+
+    def c_lock_timeout():
+        """A held store lock must raise StoreBusy, not block forever."""
+        import threading
+        import time as _t
+        from .store.sqlite_store import LOCK_TIMEOUT_S, SqliteStore, StoreBusy
+        s = SqliteStore.__new__(SqliteStore)
+        s._lock = threading.RLock()
+        holder_in = threading.Event()
+        release = threading.Event()
+
+        def hold():
+            with s._lock:
+                holder_in.set()
+                release.wait(30)
+        t = threading.Thread(target=hold, daemon=True)
+        t.start()
+        holder_in.wait(5)
+        import claudemem.store.sqlite_store as mod
+        prev = mod.LOCK_TIMEOUT_S
+        mod.LOCK_TIMEOUT_S = 0.5  # keep the suite fast; the mechanism is identical
+        t0 = _t.time()
+        try:
+            with s._locked():
+                release.set()
+                return False, "acquired a lock held by another thread (guard cannot fire)"
+        except StoreBusy:
+            dt = _t.time() - t0
+            return (dt < 5), f"StoreBusy raised after {dt:.2f}s instead of blocking forever"
+        finally:
+            mod.LOCK_TIMEOUT_S = prev
+            release.set()
+    ctx.check("wedge guard: held store lock raises StoreBusy (does not hang)", c_lock_timeout)
+
+    def c_healthz_fires():
+        """/healthz must return 503 when the store cannot answer - not 200, and not hang."""
+        import asyncio as _a
+        from fastapi.responses import JSONResponse
+        from .dashboard import api as _api
+
+        import time as _t
+
+        class _WedgedStore:
+            def counts(self):
+                _t.sleep(6)  # longer than the 2s probe deadline; short enough not to stall exit
+
+        class _WedgedState:
+            store = _WedgedStore()
+
+        prev = _api.get_state
+        _api.get_state = lambda: _WedgedState()
+        # Time the COROUTINE, not asyncio.run(): run() ends with shutdown_default_executor(),
+        # which joins the orphaned probe thread and would measure the wedge itself rather than
+        # our response latency. The orphan is expected - to_thread cannot be cancelled, which is
+        # exactly why _probe_sem exists so a second probe never spawns another one.
+        loop = _a.new_event_loop()
+        try:
+            t0 = _t.time()
+            res = loop.run_until_complete(_api.healthz())
+            dt = _t.time() - t0
+            code = getattr(res, "status_code", 200)
+            ok = (code == 503) and dt < 4
+            return ok, f"status={code} in {dt:.2f}s (want 503 in <4s)"
+        finally:
+            loop.close()
+            _api.get_state = prev
+    ctx.check("wedge guard: /healthz returns 503 on a wedged store", c_healthz_fires)
+
+    def c_healthz_quiet_when_healthy():
+        """...and must NOT fire on a healthy store, or it gets disabled within a week."""
+        import asyncio as _a
+        from .dashboard import api as _api
+
+        class _OkStore:
+            def counts(self):
+                return {"chunks": 1}
+
+        class _OkState:
+            store = _OkStore()
+        prev = _api.get_state
+        _api.get_state = lambda: _OkState()
+        try:
+            res = _a.run(_api.healthz())
+            code = getattr(res, "status_code", 200)
+            return code == 200, f"status={code} on a healthy store (want 200)"
+        finally:
+            _api.get_state = prev
+    ctx.check("wedge guard: /healthz stays quiet on a healthy store", c_healthz_quiet_when_healthy)
+
+    def c_probe_is_not_port_only():
+        """The session-start watchdog must reject a listening-but-wedged server.
+
+        Regression lock on the exact 7-day outage: a socket-connect probe passes against any
+        bound port. We stand up a server that ACCEPTS connections and answers 503, and require
+        the watchdog to treat it as unhealthy.
+        """
+        import http.server
+        import socket
+        import threading
+
+        class H(http.server.BaseHTTPRequestHandler):
+            def do_GET(self):
+                self.send_response(503)
+                self.end_headers()
+                self.wfile.write(b'{"ok":false,"store":"wedged"}')
+
+            def log_message(self, *a):
+                pass
+        srv = http.server.HTTPServer(("127.0.0.1", 0), H)
+        port = srv.server_address[1]
+        threading.Thread(target=srv.serve_forever, daemon=True).start()
+        try:
+            # the OLD probe would pass here - prove that, so the test is not vacuous
+            with socket.create_connection(("127.0.0.1", port), timeout=1):
+                old_probe_says_healthy = True
+            import urllib.request
+            try:
+                with urllib.request.urlopen(f"http://127.0.0.1:{port}/healthz", timeout=2) as r:
+                    new_probe_says_healthy = (r.status == 200)
+            except Exception:
+                new_probe_says_healthy = False
+            ok = old_probe_says_healthy and not new_probe_says_healthy
+            return ok, ("old port-probe=healthy (the bug), new probe=unhealthy (the fix)"
+                        if ok else
+                        f"old={old_probe_says_healthy} new={new_probe_says_healthy}")
+        finally:
+            srv.shutdown()
+    ctx.check("wedge guard: watchdog rejects a listening-but-503 server", c_probe_is_not_port_only)
+
     # ----------------------------------------------------------------------- #
     if verbose:
         print("=" * 60)

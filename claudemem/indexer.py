@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Callable
 
 from . import facts as facts_mod
@@ -25,6 +26,7 @@ class IndexStats:
     units: int = 0
     chunks_added: int = 0
     notes: int = 0
+    notes_pruned: int = 0
     embedded: int = 0
     errors: int = 0
 
@@ -105,6 +107,29 @@ def index(cfg: Config, store: Store, *, full: bool = False, progress: Progress =
         except Exception as e:
             stats.errors += 1
             log.exception("note index failed: %s (%s)", nd.path, e)
+
+    # --- prune facts whose note file is gone ---
+    # upsert_fact never removes anything, so deleted/renamed notes lingered in the index forever
+    # and kept appearing in <memory-map> and <curated-notes> (found 2026-07-29: 201 files on disk
+    # vs 206 rows). Deleting purely on "absent from `notes`" would be dangerous - a config or
+    # scope change shrinks that set without a single file being removed - so absence from the
+    # scan is only a CANDIDATE, and the row is dropped only when the path is genuinely missing
+    # from disk. Deterministic signal, not inference.
+    try:
+        if notes:  # never prune off an empty scan; that is a failed scan, not an empty corpus
+            seen = {nd.path for nd in notes}
+            for f in store.list_facts():
+                if f.path in seen:
+                    continue
+                if Path(f.path).exists():
+                    log.warning("fact %s is out of scan scope but still on disk; keeping", f.path)
+                    continue
+                store.delete_fact(f.path)
+                stats.notes_pruned += 1
+            if stats.notes_pruned:
+                _emit(progress, f"pruned {stats.notes_pruned} facts whose note file was deleted")
+    except Exception as e:
+        log.exception("fact prune failed: %s", e)
 
     # --- graph from wikilinks ---
     try:

@@ -96,8 +96,28 @@ function Start-Server {
 }
 
 function Test-Server {
-  try { return (Invoke-WebRequest -Uri "http://127.0.0.1:7777/api/stats" -UseBasicParsing -TimeoutSec 3).StatusCode -eq 200 }
+  # Probe /healthz, not /api/stats. /healthz answers on a short internal deadline and returns 503
+  # when the store is wedged, so "listening but useless" is distinguishable from "healthy".
+  # TimeoutSec was 3, which a server still loading its embedding model cannot meet; that is how
+  # this supervisor declared a live server dead 3 times in 90 seconds on 2026-07-22.
+  try { return (Invoke-WebRequest -Uri "http://127.0.0.1:7777/healthz" -UseBasicParsing -TimeoutSec 5).StatusCode -eq 200 }
   catch { return $false }
+}
+
+function Stop-PortHolder {
+  # A wedged server keeps port 7777 bound. Starting a replacement without clearing it yields a
+  # process that cannot bind and exits at once - which is exactly what happened on 2026-07-22:
+  # three servers spawned in 90 seconds, all dead on arrival, the wedged original left serving
+  # nothing for the next seven days. Clear the port before claiming it.
+  try {
+    $conns = Get-NetTCPConnection -LocalPort 7777 -State Listen -ErrorAction Stop
+    foreach ($c in $conns) {
+      Write-Log "clearing port-7777 holder pid=$($c.OwningProcess) before restart"
+      try { Stop-Process -Id $c.OwningProcess -Force -ErrorAction Stop }
+      catch { Write-Log "  kill failed: $($_.Exception.Message)" }
+    }
+    Start-Sleep -Seconds 2
+  } catch { }
 }
 
 $pin = $null
@@ -108,9 +128,15 @@ if ($needDb) {
   Write-Log "backend=sqlite: skipping WSL pin + ParadeDB; supervising the dashboard server only"
 }
 if (Test-Server) { Write-Log "a dashboard server is already up; not starting a second one"; $srv = $null }
-else { $srv = Start-Server }
+else { Stop-PortHolder; $srv = Start-Server }
 
 # --- Supervise forever: revive anything that dies, re-assert the DB periodically. ---
+# Strike-based, with a warmup grace. A single failed probe is not evidence of death: models load
+# lazily, and the old one-strike rule turned a slow start into a restart storm.
+$WarmupSeconds = 90
+$StrikesToRestart = 3
+$strikes = 0
+$startedAt = Get-Date
 $lastDbCheck = Get-Date
 while ($true) {
   Start-Sleep -Seconds 15
@@ -119,9 +145,23 @@ while ($true) {
     Write-Log "WSL pin gone; restarting"
     $pin = Start-WslPin
   }
-  if (-not (Test-Server)) {
-    Write-Log "dashboard server not responding; (re)starting"
-    $srv = Start-Server
+
+  $elapsed = ((Get-Date) - $startedAt).TotalSeconds
+  if (Test-Server) {
+    if ($strikes -gt 0) { Write-Log "server healthy again (was at $strikes strike(s))" }
+    $strikes = 0
+  } elseif ($elapsed -lt $WarmupSeconds) {
+    Write-Log "server not answering yet; inside ${WarmupSeconds}s warmup grace, no strike"
+  } else {
+    $strikes = $strikes + 1
+    Write-Log "server health probe failed ($strikes/$StrikesToRestart)"
+    if ($strikes -ge $StrikesToRestart) {
+      Write-Log "restarting dashboard server after $strikes consecutive failures"
+      Stop-PortHolder
+      $srv = Start-Server
+      $startedAt = Get-Date
+      $strikes = 0
+    }
   }
   if ($needDb -and ((Get-Date) - $lastDbCheck).TotalSeconds -ge 120) {
     Ensure-Db

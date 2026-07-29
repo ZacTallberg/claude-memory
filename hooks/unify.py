@@ -7,6 +7,10 @@ from _common import call_server, emit_context, read_event, run_failsafe, write_h
 
 EVENT = "SessionStart"
 
+# Kept short: this runs on the session-start path, and a slow health probe would tax every
+# session to diagnose a server that the supervisor is going to restart anyway.
+_HEALTH_TIMEOUT_S = 2.0
+
 
 def main() -> None:
     ev = read_event()
@@ -35,18 +39,29 @@ def main() -> None:
 
 
 def _ensure_server(cfg) -> None:
-    """Every session start doubles as a watchdog: if the warm server is down, re-arm the
+    """Every session start doubles as a watchdog: if the warm server is unhealthy, re-arm the
     persistence supervisor (detached; the supervisor is a singleton via a named mutex).
-    The current session still uses the local fallback — the server warms for the next one."""
-    import os
-    import socket
-    import subprocess
+    The current session still uses the local fallback — the server warms for the next one.
 
+    This MUST probe for a real answer, not an open port. The original check was
+    `socket.create_connection(...)`, which returns as soon as something is listening. On
+    2026-07-29 a server that had been wedged since 2026-07-22 — store lock held, 73 threads
+    parked, /api/stats not answering in 300s — still accepted TCP in 88ms, so this watchdog
+    reported it healthy on every single session start for seven days while every recall
+    silently degraded to keyword-only. A guard that cannot observe the failure it exists to
+    catch is worse than no guard: it manufactures confidence.
+    """
+    import os
+    import subprocess
+    import urllib.request
+
+    url = f"http://{cfg.server.host}:{cfg.server.port}/healthz"
     try:
-        with socket.create_connection((cfg.server.host, cfg.server.port), timeout=0.3):
-            return
-    except OSError:
-        pass
+        with urllib.request.urlopen(url, timeout=_HEALTH_TIMEOUT_S) as r:
+            if r.status == 200:
+                return
+    except Exception:
+        pass  # unreachable, wedged, 503, or too slow -> all mean "re-arm the supervisor"
     from claudemem.config import ROOT
     runner = str(ROOT / "scripts" / "persistence_run.ps1")
     flags = (0x00000008 | 0x00000200) if os.name == "nt" else 0  # DETACHED | NEW_PROCESS_GROUP

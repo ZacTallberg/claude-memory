@@ -3,23 +3,63 @@
 from __future__ import annotations
 
 import asyncio
+import os
 import threading
 import time
 from collections import deque
 
 from fastapi import APIRouter, Query, Request
-from fastapi.responses import HTMLResponse
+from fastapi.responses import HTMLResponse, JSONResponse
 from sse_starlette.sse import EventSourceResponse
 
 from claudemem.indexer import index as run_index
+from claudemem.log import get_logger
 from claudemem.paths import killed, set_killed
 from claudemem.recall_format import format_recall, format_unify
 from claudemem.text import human_age, meaningful_term_count, snippet
+
+log = get_logger(__name__)
 
 from .render import md_to_html
 from .state import get_state
 
 router = APIRouter()
+
+# ---- hook-request admission control ----
+# The hooks give up after ~4s and fall back to keyword-only, but `asyncio.to_thread` cannot be
+# cancelled: the thread ran to completion regardless. Every abandoned prompt therefore leaked a
+# worker that still contended for the store lock, so latency grew with the number of prompts ever
+# abandoned (measured p90 107s, max 240s) until the server answered nothing at all. Bounding
+# admission caps the damage, and a server-side deadline stops us computing an answer no client is
+# still waiting for.
+HOOK_CONCURRENCY = int(os.environ.get("CLAUDEMEM_HOOK_CONCURRENCY", "4"))
+HOOK_DEADLINE_S = float(os.environ.get("CLAUDEMEM_HOOK_DEADLINE_S", "12"))
+_hook_sem = asyncio.Semaphore(HOOK_CONCURRENCY)
+_shed = {"recall": 0, "unify": 0}
+
+
+async def _bounded(kind: str, work, empty: dict) -> dict:
+    """Run `work` in a thread under an admission cap and a wall-clock deadline.
+
+    Returns `empty` instead of blocking when saturated or too slow — the caller's fallback is
+    keyword-only recall, which is strictly better than a hang. Shedding is counted, never silent.
+    """
+    if _hook_sem.locked() and _hook_sem._value <= 0:  # noqa: SLF001 - cheap saturation probe
+        _shed[kind] += 1
+        log.warning("%s shed: %d concurrent requests already in flight", kind, HOOK_CONCURRENCY)
+        return {**empty, "shed": True}
+    async with _hook_sem:
+        try:
+            return await asyncio.wait_for(asyncio.to_thread(work), timeout=HOOK_DEADLINE_S)
+        except asyncio.TimeoutError:
+            _shed[kind] += 1
+            log.warning("%s exceeded %.1fs deadline; returning empty", kind, HOOK_DEADLINE_S)
+            return {**empty, "timeout": True}
+        except Exception as e:
+            _shed[kind] += 1
+            log.warning("%s failed: %s: %s", kind, type(e).__name__, e)
+            return {**empty, "error": type(e).__name__}
+
 
 # ---- index progress broker (for SSE) ----
 _progress: deque[str] = deque(maxlen=1000)
@@ -79,7 +119,8 @@ async def api_recall(req: Request):
         return {"additionalContext": text, "n_recalled": len(results), "n_facts": len(facts),
                 "latency_ms": latency}
 
-    return await asyncio.to_thread(work)
+    return await _bounded("recall", work,
+                          {"additionalContext": "", "n_recalled": 0, "n_facts": 0})
 
 
 @router.post("/api/unify")
@@ -105,7 +146,7 @@ async def api_unify(req: Request):
                 pass
         return {"additionalContext": text}
 
-    return await asyncio.to_thread(work)
+    return await _bounded("unify", work, {"additionalContext": ""})
 
 
 # ================= search =================
@@ -193,6 +234,39 @@ async def api_metrics():
     for m in ("chunks", "chunks_embedded", "facts", "sources", "recall_at_k"):
         out[m] = [{"ts": str(r["ts"]), "value": r["value"]} for r in st.store.metric_series(m)]
     return out
+
+
+_probe_sem = asyncio.Semaphore(1)
+
+
+@router.get("/healthz")
+async def healthz():
+    """Liveness + store responsiveness, for the hook watchdog and the supervisor.
+
+    The previous probe was `socket.create_connection(...)` — it only proved something was bound to
+    the port. A server whose store lock was held forever kept accepting TCP, so the watchdog
+    called it healthy for seven days while every recall silently fell back to keyword-only.
+    This endpoint answers on a short deadline and NEVER blocks on the store, so:
+        200            = event loop alive and the store answers promptly
+        503            = alive but the store is wedged or erroring  -> restart me
+        no response    = event loop itself is wedged                -> restart me
+    """
+    out = {"ok": True, "shed": dict(_shed),
+           "inflight": max(0, HOOK_CONCURRENCY - _hook_sem._value)}  # noqa: SLF001
+    if _probe_sem.locked():
+        # A previous probe is still stuck in the store: that is itself the wedge signal, and
+        # spawning another thread to confirm it would be part of the problem.
+        out.update(ok=False, store="wedged (prior probe still blocked)")
+        return JSONResponse(out, status_code=503)
+    async with _probe_sem:
+        try:
+            await asyncio.wait_for(asyncio.to_thread(lambda: get_state().store.counts()), timeout=2.0)
+            out["store"] = "ok"
+        except asyncio.TimeoutError:
+            out.update(ok=False, store="wedged (store did not answer in 2s)")
+        except Exception as e:
+            out.update(ok=False, store=f"error: {type(e).__name__}: {e}")
+    return out if out["ok"] else JSONResponse(out, status_code=503)
 
 
 @router.get("/api/stats")
