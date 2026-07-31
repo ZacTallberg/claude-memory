@@ -209,7 +209,9 @@ optional and not required for recall/unify to work.
   synthetic transcript/note, BM25/vector/hybrid hits, recall envelope validity, trivial-prompt and
   out-of-scope no-ops, live-session exclusion, unify map, kill-switch no-op, char-cap enforcement,
   injected-block stripping, keyword-degrade path, injection logging, install-hooks idempotency). Exits
-  non-zero on any failure.
+  non-zero on any failure. On a fresh install with nothing indexed yet, corpus-dependent checks SKIP
+  with a "corpus empty — run `mem index`" reason rather than failing: no hits from an empty store is
+  correct behavior, not a defect.
 - `mem eval` scores recall@k against `eval/golden.jsonl`, appends a timestamped row to the `metrics`
   table, and prints the delta vs the previous run (drift detector). The Metrics dashboard charts the
   history.

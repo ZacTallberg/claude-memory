@@ -25,9 +25,16 @@ def _cmd(script: str) -> str:
     return f'"{_py()}" "{str(_HOOKS_DIR / script).replace(chr(92), "/")}"'
 
 
+_OUR_SCRIPTS = ("recall.py", "unify.py", "index_trigger.py")
+
+
 def _is_ours(entry: dict) -> bool:
+    # Recognition must survive the repo living under ANY directory name. Matching the literal
+    # substring "claude-memory/hooks/" meant a clone under another name never recognized its own
+    # entries and stacked a duplicate on every install.
     for h in entry.get("hooks", []):
-        if "claude-memory/hooks/" in (h.get("command", "").replace("\\", "/")):
+        cmd = (h.get("command", "")).replace("\\", "/").rstrip('"')
+        if any(cmd.endswith(f"/hooks/{s}") for s in _OUR_SCRIPTS):
             return True
     return False
 

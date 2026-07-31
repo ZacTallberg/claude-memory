@@ -161,6 +161,17 @@ def run_selftest(verbose: bool = True) -> bool:
         return bool(h.get("ok")), f"backend={h.get('backend')} ok={h.get('ok')} bm25={h.get('bm25')} vector={h.get('vector')}"
     ctx.check("store connects + migrates (health ok)", c_store_health)
 
+    # Corpus-dependent checks skip (not fail) on an empty store: a fresh install has indexed
+    # nothing yet, and "no hits" is then correct behavior, not a defect.
+    _counts: dict = {}
+    if store is not None:
+        try:
+            _counts = store.counts()
+        except Exception:
+            pass
+    n_chunks, n_facts = _counts.get("chunks", 0), _counts.get("facts", 0)
+    empty_skip = "corpus empty (install is fine — run `mem index` to populate)"
+
     # -- embedder loads with correct dim ------------------------------------
     from .providers.embeddings import get_embedding_provider, NullEmbeddingProvider
     embedder = get_embedding_provider(cfg)
@@ -264,6 +275,8 @@ def run_selftest(verbose: bool = True) -> bool:
     real_q = "memory recall hook index retriever postgres embedding"
     if store is None:
         ctx.skip("BM25 search returns hits", "store unavailable")
+    elif n_chunks == 0:
+        ctx.skip("BM25 search returns hits", empty_skip)
     else:
         def c_bm25():
             hits = store.search_bm25(real_q, cfg.recall.bm25_k)
@@ -275,6 +288,8 @@ def run_selftest(verbose: bool = True) -> bool:
         ctx.skip("vector search returns hits", "store unavailable")
     elif not embed_ok:
         ctx.skip("vector search returns hits", "embedder unavailable")
+    elif n_chunks == 0:
+        ctx.skip("vector search returns hits", empty_skip)
     else:
         def c_vec():
             qv = embedder.embed_query(real_q)
@@ -285,6 +300,8 @@ def run_selftest(verbose: bool = True) -> bool:
     # -- hybrid fuse returns hits (real DB) ---------------------------------
     if store is None:
         ctx.skip("hybrid search returns hits", "store unavailable")
+    elif n_chunks == 0:
+        ctx.skip("hybrid search returns hits", empty_skip)
     else:
         def c_hybrid():
             from .retriever import Retriever
@@ -297,6 +314,8 @@ def run_selftest(verbose: bool = True) -> bool:
     # -- degrade-to-keyword: NullEmbeddingProvider still retrieves ----------
     if store is None:
         ctx.skip("degrade-to-keyword path", "store unavailable")
+    elif n_chunks == 0:
+        ctx.skip("degrade-to-keyword path", empty_skip)
     else:
         def c_degrade():
             from .retriever import Retriever
@@ -352,8 +371,12 @@ def run_selftest(verbose: bool = True) -> bool:
     ctx.check("unify formats a <memory-map> of titles", c_unify_format)
 
     # -- recall hook subprocess: in-scope -> valid additionalContext JSON ---
+    # cwd must derive from config: a hardcoded path is out-of-scope the moment a user sets
+    # different workspace_roots, and the hook then correctly emits nothing.
+    in_scope_cwd = cfg.scope.workspace_roots[0]
+
     def c_recall_hook():
-        event = {"prompt": real_q, "cwd": "C:/code/claude-memory", "session_id": "selftest-live"}
+        event = {"prompt": real_q, "cwd": in_scope_cwd, "session_id": "selftest-live"}
         out = _run_hook("recall.py", event)
         if not out.strip():
             return False, "hook emitted nothing for an in-scope, term-rich prompt"
@@ -364,11 +387,14 @@ def run_selftest(verbose: bool = True) -> bool:
                 and len(hso["additionalContext"]) > 0
                 and len(hso["additionalContext"]) <= 10000,
                 f"additionalContext len={len(hso.get('additionalContext',''))}")
-    ctx.check("recall hook (subprocess) emits valid additionalContext envelope", c_recall_hook)
+    if n_chunks == 0 and n_facts == 0:
+        ctx.skip("recall hook (subprocess) emits valid additionalContext envelope", empty_skip)
+    else:
+        ctx.check("recall hook (subprocess) emits valid additionalContext envelope", c_recall_hook)
 
     # -- trivial prompt -> no output ----------------------------------------
     def c_recall_trivial():
-        event = {"prompt": "hi the a", "cwd": "C:/code/claude-memory", "session_id": "selftest-live"}
+        event = {"prompt": "hi the a", "cwd": in_scope_cwd, "session_id": "selftest-live"}
         out = _run_hook("recall.py", event)
         return out.strip() == "", "no output for sub-min_terms prompt"
     ctx.check("recall hook: trivial prompt -> no output", c_recall_trivial)
@@ -382,7 +408,7 @@ def run_selftest(verbose: bool = True) -> bool:
 
     # -- unify hook subprocess: emits a <memory-map> ------------------------
     def c_unify_hook():
-        event = {"cwd": "C:/code/claude-memory", "session_id": "selftest-live", "source": "startup"}
+        event = {"cwd": in_scope_cwd, "session_id": "selftest-live", "source": "startup"}
         out = _run_hook("unify.py", event)
         if not out.strip():
             return False, "unify emitted nothing (expected a memory-map from populated facts)"
@@ -390,7 +416,10 @@ def run_selftest(verbose: bool = True) -> bool:
         ac = env.get("hookSpecificOutput", {}).get("additionalContext", "")
         return ("<memory-map" in ac and env["hookSpecificOutput"]["hookEventName"] == "SessionStart",
                 f"additionalContext len={len(ac)}")
-    ctx.check("unify hook (subprocess) emits a <memory-map>", c_unify_hook)
+    if n_facts == 0:
+        ctx.skip("unify hook (subprocess) emits a <memory-map>", empty_skip)
+    else:
+        ctx.check("unify hook (subprocess) emits a <memory-map>", c_unify_hook)
 
     # -- kill switch: DISABLED -> both hooks emit nothing -------------------
     def c_killswitch():
@@ -473,6 +502,8 @@ def run_selftest(verbose: bool = True) -> bool:
     # -- real query end-to-end via Retriever returns >0 distinct hits -------
     if store is None:
         ctx.skip("real query end-to-end returns hits", "store unavailable")
+    elif n_chunks == 0:
+        ctx.skip("real query end-to-end returns hits", empty_skip)
     else:
         def c_e2e():
             from .retriever import Retriever

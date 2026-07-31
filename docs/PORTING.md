@@ -124,7 +124,10 @@ Wire it via `~/.claude/settings.json` → `"statusLine": {"type": "command", "co
 ## 8. Verify (all of it, before trusting it)
 
 ```powershell
-.\mem.cmd selftest                          # expect PASS=30 FAIL=0 — includes 5 wedge guards
+.\mem.cmd selftest                          # expect FAIL=0 — includes 5 wedge guards.
+                                            # Before data lands (step 4 skipped, index not run),
+                                            # corpus-dependent checks SKIP with "corpus empty";
+                                            # after migration expect zero corpus skips.
 .\mem.cmd stats                             # backend=sqlite, chunk/fact counts match the old box
 curl.exe -s http://127.0.0.1:7777/healthz   # {"ok": true, "store": "ok"}
 ```
