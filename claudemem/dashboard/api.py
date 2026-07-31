@@ -237,36 +237,66 @@ async def api_metrics():
 
 
 _probe_sem = asyncio.Semaphore(1)
+_last_store_ok = {"ts": time.time()}
+
+# A BUSY store is not a WEDGED store. The first version of this endpoint failed on any single
+# probe that exceeded 2s, and a probe that merely queued behind an in-flight recall does that
+# routinely - so the supervisor restarted a perfectly healthy server every ~3 minutes, and each
+# restart dropped the models and made the next probe slower still. The failure being guarded
+# against lasted SEVEN DAYS; the signal must therefore be SUSTAINED unresponsiveness, never one
+# slow sample. Over-firing is not a stricter guard, it is a guard someone turns off.
+PROBE_DEADLINE_S = float(os.environ.get("CLAUDEMEM_PROBE_DEADLINE_S", "8"))
+# Chosen against the failure being guarded, not against a stopwatch. The real wedge lasted SEVEN
+# DAYS, so catching it in three minutes is ample; meanwhile this workstation routinely runs down
+# to ~200MB free with several agent sessions open, and the OS pages the embedding model out (the
+# server's working set was observed collapsing 323MB -> 21MB). A recall then pays a page-in cost
+# of seconds. Restarting for that is actively harmful - it drops the models and guarantees the
+# next request is slow too. The threshold must sit above the worst LEGITIMATE stall.
+WEDGE_AFTER_S = float(os.environ.get("CLAUDEMEM_WEDGE_AFTER_S", "180"))
 
 
 @router.get("/healthz")
 async def healthz():
     """Liveness + store responsiveness, for the hook watchdog and the supervisor.
 
-    The previous probe was `socket.create_connection(...)` — it only proved something was bound to
-    the port. A server whose store lock was held forever kept accepting TCP, so the watchdog
-    called it healthy for seven days while every recall silently fell back to keyword-only.
-    This endpoint answers on a short deadline and NEVER blocks on the store, so:
-        200            = event loop alive and the store answers promptly
-        503            = alive but the store is wedged or erroring  -> restart me
-        no response    = event loop itself is wedged                -> restart me
+    The original probe was `socket.create_connection(...)`, which only proved something was bound
+    to the port. A server whose store lock was held forever kept accepting TCP in 88ms, so the
+    watchdog called it healthy for seven days while every recall silently fell back to
+    keyword-only. This endpoint reports:
+        200  = event loop alive, and the store has answered within WEDGE_AFTER_S
+               (including "busy" / "slow" - transient contention is normal, not a fault)
+        503  = the store has not completed a single operation in WEDGE_AFTER_S, or it errored
+               -> genuinely wedged, restart me
+        none = the event loop itself is wedged -> restart me
     """
+    now = time.time()
     out = {"ok": True, "shed": dict(_shed),
            "inflight": max(0, HOOK_CONCURRENCY - _hook_sem._value)}  # noqa: SLF001
+    since_ok = now - _last_store_ok["ts"]
+
     if _probe_sem.locked():
-        # A previous probe is still stuck in the store: that is itself the wedge signal, and
-        # spawning another thread to confirm it would be part of the problem.
-        out.update(ok=False, store="wedged (prior probe still blocked)")
+        # A probe is already inside the store. Don't spawn another thread to ask the same
+        # question - just report, and let the elapsed-time rule below decide if it is a wedge.
+        out["store"] = f"busy (probe in flight, {since_ok:.0f}s since last ok)"
+    else:
+        async with _probe_sem:
+            try:
+                await asyncio.wait_for(asyncio.to_thread(lambda: get_state().store.counts()),
+                                       timeout=PROBE_DEADLINE_S)
+                _last_store_ok["ts"] = time.time()
+                since_ok = 0.0
+                out["store"] = "ok"
+            except asyncio.TimeoutError:
+                out["store"] = f"slow (no answer in {PROBE_DEADLINE_S:.0f}s)"
+            except Exception as e:
+                # A raising store is unambiguous - report it at once, no patience required.
+                out.update(ok=False, store=f"error: {type(e).__name__}: {e}")
+                return JSONResponse(out, status_code=503)
+
+    if since_ok > WEDGE_AFTER_S:
+        out.update(ok=False, store=f"WEDGED: no successful store op in {since_ok:.0f}s")
         return JSONResponse(out, status_code=503)
-    async with _probe_sem:
-        try:
-            await asyncio.wait_for(asyncio.to_thread(lambda: get_state().store.counts()), timeout=2.0)
-            out["store"] = "ok"
-        except asyncio.TimeoutError:
-            out.update(ok=False, store="wedged (store did not answer in 2s)")
-        except Exception as e:
-            out.update(ok=False, store=f"error: {type(e).__name__}: {e}")
-    return out if out["ok"] else JSONResponse(out, status_code=503)
+    return out
 
 
 @router.get("/api/stats")

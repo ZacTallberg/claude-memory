@@ -533,13 +533,18 @@ def run_selftest(verbose: bool = True) -> bool:
 
         class _WedgedStore:
             def counts(self):
-                _t.sleep(6)  # longer than the 2s probe deadline; short enough not to stall exit
+                _t.sleep(6)  # never answers within the probe deadline
 
         class _WedgedState:
             store = _WedgedStore()
 
         prev = _api.get_state
+        prev_deadline, prev_wedge = _api.PROBE_DEADLINE_S, _api.WEDGE_AFTER_S
+        prev_ok = _api._last_store_ok["ts"]
         _api.get_state = lambda: _WedgedState()
+        _api.PROBE_DEADLINE_S = 1.0
+        _api.WEDGE_AFTER_S = 1.0
+        _api._last_store_ok["ts"] = _t.time() - 600  # sustained: 10 min with no successful op
         # Time the COROUTINE, not asyncio.run(): run() ends with shutdown_default_executor(),
         # which joins the orphaned probe thread and would measure the wedge itself rather than
         # our response latency. The orphan is expected - to_thread cannot be cancelled, which is
@@ -555,7 +560,48 @@ def run_selftest(verbose: bool = True) -> bool:
         finally:
             loop.close()
             _api.get_state = prev
-    ctx.check("wedge guard: /healthz returns 503 on a wedged store", c_healthz_fires)
+            _api.PROBE_DEADLINE_S, _api.WEDGE_AFTER_S = prev_deadline, prev_wedge
+            _api._last_store_ok["ts"] = prev_ok
+    ctx.check("wedge guard: /healthz returns 503 on a SUSTAINED wedge", c_healthz_fires)
+
+    def c_healthz_tolerates_busy():
+        """A momentarily slow store must NOT be reported as wedged.
+
+        Regression lock on a self-inflicted outage (2026-07-29): the first version of /healthz
+        503'd on any probe slower than 2s. A probe that merely queued behind an in-flight recall
+        does that routinely, so the supervisor restarted a healthy server every ~3 minutes and
+        each restart dropped the models, making the next probe slower still. An over-firing guard
+        is not a stricter guard - it is an outage with a health check attached.
+        """
+        import time as _t
+        import asyncio as _a
+        from .dashboard import api as _api
+
+        class _SlowStore:
+            def counts(self):
+                _t.sleep(2)  # slower than the deadline, but the store IS alive
+
+        class _SlowState:
+            store = _SlowStore()
+        prev = _api.get_state
+        prev_deadline, prev_wedge = _api.PROBE_DEADLINE_S, _api.WEDGE_AFTER_S
+        prev_ok = _api._last_store_ok["ts"]
+        _api.get_state = lambda: _SlowState()
+        _api.PROBE_DEADLINE_S = 0.5      # force the slow path
+        _api.WEDGE_AFTER_S = 45.0        # but it answered recently, so it is not a wedge
+        _api._last_store_ok["ts"] = _t.time()
+        loop = _a.new_event_loop()
+        try:
+            res = loop.run_until_complete(_api.healthz())
+            code = getattr(res, "status_code", 200)
+            store = res.get("store") if isinstance(res, dict) else "?"
+            return code == 200, f"status={code} store={store!r} (want 200: busy != wedged)"
+        finally:
+            loop.close()
+            _api.get_state = prev
+            _api.PROBE_DEADLINE_S, _api.WEDGE_AFTER_S = prev_deadline, prev_wedge
+            _api._last_store_ok["ts"] = prev_ok
+    ctx.check("wedge guard: /healthz tolerates a transiently SLOW store", c_healthz_tolerates_busy)
 
     def c_healthz_quiet_when_healthy():
         """...and must NOT fire on a healthy store, or it gets disabled within a week."""
