@@ -5,4 +5,5 @@ Local agent-memory layer for Claude Code on Windows: hybrid recall (`hooks/recal
 Hard rules:
 - Hooks must stay FAIL-SAFE: hard timeout, exit 0 on any error. A slow or broken memory layer must never block or crash a user prompt or session start.
 - Delivery health must never be silent: keep the TRUNCATED marker on capped memory maps and the health beacon (`~/.claude/memory-health.json`, written by unify, rendered by the statusline). Never remove or bypass them.
-- Run the test suite in `tests/` before changing anything under `hooks/`.
+- Run `mem selftest` (all checks must pass) before changing anything under `hooks/` — it is the
+  test suite; `tests/` is empty.

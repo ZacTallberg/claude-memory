@@ -37,10 +37,10 @@ claudemem package
   ├─ retriever.py   hybrid search: BM25 + vector ─▶ RRF fuse ─▶ recency ─▶ dedupe ─▶ (rerank)
   ├─ indexer.py     scan ─▶ chunk ─▶ (enrich) ─▶ embed ─▶ upsert  (incremental, tail-read)
   ├─ providers/     local fastembed (ONNX, CPU) + optional cross-encoder reranker
-  └─ store/         Store DAO  ─▶  ParadeDB (primary)  |  SQLite+FTS5+vec (fallback)
-                                      │
-ParadeDB (Postgres) in WSL2 Docker ◀─┘   localhost:55432
-  · pg_search (Tantivy BM25)  · pgvector (HNSW)
+  └─ store/         Store DAO  ─▶  SQLite+FTS5+sqlite-vec (PINNED)  |  ParadeDB (optional)
+                                                                        │
+                       ParadeDB (Postgres) in WSL2 Docker, localhost:55432
+                       · pg_search (Tantivy BM25) · pgvector (HNSW) — only if re-pinned
 
 Dashboard (mem serve): FastAPI + HTMX + Alpine + Cytoscape + ECharts, warm models, shares store/retriever.
 ```
@@ -52,16 +52,18 @@ hook can stay fast.
 
 ## Quickstart
 
-Prerequisites: Windows 11, Python 3.12, WSL2 with Ubuntu + Docker (ParadeDB runs there), Node not
-required at runtime (the dashboard CSS is pre-built and JS is vendored).
+Prerequisites: Windows 11, Python 3.12. Node not required at runtime (the dashboard CSS is
+pre-built and JS is vendored). WSL2 + Docker are needed **only** for the optional ParadeDB
+backend — the pinned default is sqlite and needs neither. Porting to a new machine? Follow
+`docs/PORTING.md` instead — step ordering there is load-bearing.
 
 ```powershell
 # 0. (one time) create + activate a venv and install the package editable
 py -3.12 -m venv .venv
 .\.venv\Scripts\python.exe -m pip install -e .
 
-# 1. bring ParadeDB up (runs db.sh inside WSL Ubuntu; waits for healthy)
-wsl -d Ubuntu -- bash /mnt/c/code/claude-memory/scripts/db.sh up
+# 1. (ONLY if you re-pin [store].backend = "postgres") bring ParadeDB up
+# wsl -d Ubuntu -- bash /mnt/c/code/claude-memory/scripts/db.sh up
 
 # 2. (one time) fetch the vendored dashboard JS (offline-first)
 .\scripts\fetch_vendor.ps1
@@ -124,8 +126,10 @@ Key sections (see `config.toml` for the full annotated set):
 
 - `[scope]` — `workspace_roots` (recall/unify only activate when Claude's cwd is under one of these) and
   `claude_projects_dir` (where Claude Code stores per-project transcripts + `memory/` notes).
-- `[store]` — `backend = "auto"` tries Postgres then falls back to SQLite. `[store.postgres]` points at
-  `localhost:55432` (see the port note in Troubleshooting). Password via `CLAUDEMEM_PG_PASSWORD`.
+- `[store]` — `backend` is **pinned to `"sqlite"`**. `"auto"` forked the store into two diverging
+  copies whenever ParadeDB flapped (repaired outage — see `docs/CONTEXT.md`); keep it pinned to one
+  backend. `[store.postgres]` points at `localhost:55432` for the optional ParadeDB path
+  (password via `CLAUDEMEM_PG_PASSWORD`).
 - `[embeddings]` — local `BAAI/bge-small-en-v1.5` (dim 384) by default. **If you change the model or
   `dim`, you must reindex** (`mem index --full`) so all embeddings match.
 - `[reranker]` — local cross-encoder, **off on the hot path** by default (CPU latency); used by the
@@ -212,22 +216,26 @@ optional and not required for recall/unify to work.
 
 ---
 
-## Persistence (WSL keepalive) — why you need it
+## Persistence (the supervisor) — why you need it
 
-ParadeDB runs as a Docker container **inside the WSL2 Ubuntu VM**. WSL2 shuts that VM down a few
-seconds after its last process exits (the WSL "VM idle timeout") — and when the VM dies, Docker and the
-ParadeDB container die with it, so `localhost:55432` disappears and recall silently falls back (or
-fails). To keep the stack alive, `install_persistence.ps1` registers a hidden, at-logon Scheduled Task
-(`ClaudeMemoryPersistence`) that runs `scripts\persistence_run.ps1`, which:
+Recall depends on the **warm server** staying alive: it holds the embedder and store hot so the
+hook can answer in well under its timeout. `install_persistence.ps1` registers an at-logon
+Scheduled Task (`ClaudeMemoryPersistence`) running `scripts\persistence_run.ps1` (a named-mutex
+singleton), which starts `mem serve --no-browser` and supervises it forever: it probes `/healthz`
+for a **real 200** (never just an open port — a wedged server still accepts TCP), gives a starting
+server 90s warm-up grace, restarts only after 3 strikes, and clears the port holder first. Every
+Claude Code session start is also a watchdog: `hooks/unify.py` re-arms the supervisor when 7777 is
+closed.
 
-1. **pins the VM** with `wsl -d Ubuntu -- sleep infinity` (one long-lived process keeps the VM up),
-2. **ensures the DB is up** via `wsl -d Ubuntu -- bash .../scripts/db.sh up` (idempotent, waits for
-   healthy), and
-3. **starts the dashboard / warm server** with `mem serve --no-browser`,
+Only when `[store].backend != "sqlite"` does the supervisor also manage the ParadeDB legs: WSL2
+kills its VM seconds after the last process exits, taking Docker and `localhost:55432` with it, so
+the supervisor then pins the VM (`wsl -d Ubuntu -- sleep infinity`) and re-asserts the DB via
+`db.sh up`.
 
-then supervises all three forever, reviving anything that dies and re-asserting the DB periodically.
-Remove it with `uninstall_persistence.ps1`. Registering a Scheduled Task may require an elevated
-PowerShell. Logs go to `data/logs/persistence.log`.
+Remove with `uninstall_persistence.ps1`. Registering a Scheduled Task requires an elevated
+PowerShell — and the installer verifies registration, because an access-denied
+`Register-ScheduledTask` once printed success while installing nothing. Logs:
+`data/logs/persistence.log`.
 
 ---
 
@@ -237,9 +245,10 @@ PowerShell. Logs go to `data/logs/persistence.log`.
   ParadeDB so it doesn't collide with a native PG16 install on the default `5432`. If `mem stats` shows
   the wrong backend or can't connect, confirm `[store.postgres].port = 55432` in `config.toml` and that
   nothing else owns 55432. (The container is published on 55432 by `docker/docker-compose.yml`.)
-- **`mem stats` shows `"backend": "sqlite"` unexpectedly.** Postgres wasn't reachable, so `auto` fell
-  back. Check the container: `wsl -d Ubuntu -- bash .../scripts/db.sh status`. Bring it up:
-  `... db.sh up`. Verify extensions: `... db.sh ext` (expect `pg_search`, `vector`).
+- **`mem stats` shows `"backend": "sqlite"`.** That's correct — sqlite is the pinned backend. Only
+  when you've deliberately re-pinned to postgres does sqlite indicate a fallen-back ParadeDB; then
+  check the container: `wsl -d Ubuntu -- bash .../scripts/db.sh status` / `... db.sh up` / verify
+  extensions with `... db.sh ext` (expect `pg_search`, `vector`). Never set `backend = "auto"`.
 - **Recall stops working after a while / DB "vanishes".** That's the WSL idle timeout taking the VM
   (and ParadeDB) down. Install the persistence task (above), or manually re-pin:
   `wsl -d Ubuntu -- sleep infinity` and `... db.sh up`.
@@ -257,4 +266,7 @@ PowerShell. Logs go to `data/logs/persistence.log`.
 
 ---
 
-See `docs/SPEC.md` for the authoritative contract and `docs/ARCHITECTURE.md` for the deeper design.
+See `docs/SPEC.md` for the authoritative contract, `docs/ARCHITECTURE.md` for the deeper design,
+`docs/CONTEXT.md` for the implementation history + design invariants + operating doctrine,
+`docs/PORTING.md` to bring the system up on a new machine, and `docs/OPTIMIZATIONS.md` for the
+current assessment and prioritized backlog.
