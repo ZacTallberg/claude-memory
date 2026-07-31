@@ -1,9 +1,13 @@
 [project]
 name = "claudemem"
 version = "0.1.0"
-description = "Local best-of-breed agent-memory layer for Claude Code (ParadeDB hybrid recall + dashboard)."
+description = "Local best-of-breed agent-memory layer for Claude Code (hybrid BM25+vector recall + dashboard)."
 requires-python = ">=3.12"
 readme = "docs/README.md"
+dynamic = ["dependencies"]
+
+[tool.setuptools.dynamic]
+dependencies = { file = ["requirements.txt"] }
 
 [build-system]
 requires = ["setuptools>=68"]

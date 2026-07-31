@@ -131,7 +131,9 @@ _DEFAULTS: dict = {
         "claude_projects_dir": str(Path.home() / ".claude" / "projects").replace("\\", "/"),
     },
     "store": {
-        "backend": "auto",
+        # "auto" forks the store into diverging copies when the primary flaps (repaired outage —
+        # docs/CONTEXT.md); the safe default is one pinned backend, even with no config.toml present.
+        "backend": "sqlite",
         "postgres": {"host": "localhost", "port": 55432, "dbname": "claudemem", "user": "claudemem"},
         "sqlite": {"path": "data/claudemem.db"},
     },
