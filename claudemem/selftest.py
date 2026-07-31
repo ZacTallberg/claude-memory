@@ -462,9 +462,10 @@ def run_selftest(verbose: bool = True) -> bool:
                 hooks_install.SETTINGS = orig_settings  # never leave it pointed at the temp file
         h = data.get("hooks", {})
         ups = h.get("UserPromptSubmit", [])
-        ours = [e for e in ups if any("claude-memory/hooks/" in
-                                      x.get("command", "").replace("\\", "/")
-                                      for x in e.get("hooks", []))]
+        # Detect our entries with the production matcher — a hardcoded "claude-memory/hooks/"
+        # here counted zero entries whenever the repo directory had another name, calling a
+        # correct install non-idempotent.
+        ours = [e for e in ups if hooks_install._is_ours(e)]
         foreign_kept = any("other-tool.py" in x.get("command", "")
                            for e in ups for x in e.get("hooks", []))
         events_ok = all(k in h for k in ("UserPromptSubmit", "SessionStart", "SessionEnd", "PreCompact"))
@@ -491,8 +492,10 @@ def run_selftest(verbose: bool = True) -> bool:
             finally:
                 hooks_install.SETTINGS = orig_settings
         h = data.get("hooks", {})
-        ours_left = any("claude-memory/hooks/" in x.get("command", "").replace("\\", "/")
-                        for e in h.get("UserPromptSubmit", []) for x in e.get("hooks", []))
+        # Same production matcher as above: the hardcoded substring made this check pass
+        # VACUOUSLY in a differently-named clone — it could not see the leftovers it guards
+        # against, because it was looking for the wrong path shape.
+        ours_left = any(hooks_install._is_ours(e) for e in h.get("UserPromptSubmit", []))
         foreign_kept = any("other-tool.py" in x.get("command", "")
                            for e in h.get("UserPromptSubmit", []) for x in e.get("hooks", []))
         return (not ours_left and foreign_kept and data.get("model") == "opus",
