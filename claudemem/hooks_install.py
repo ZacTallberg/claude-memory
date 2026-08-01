@@ -78,6 +78,22 @@ def _save(data: dict) -> None:
 
 
 def install() -> str:
+    # A wired-looking dead layer is the failure mode fail-safe hooks cannot surface: if the
+    # interpreter the hook commands reference cannot EXECUTE (e.g. an exe-blocking group
+    # policy on venvs outside an allowlisted root), every hook dies silently forever.
+    # Prove execution once, loudly, at install time.
+    import subprocess
+    try:
+        proc = subprocess.run([_py().replace("/", "\\"), "-c", "pass"],
+                              capture_output=True, timeout=15)
+        if proc.returncode != 0:
+            raise OSError(proc.stderr.decode(errors="replace")[:200])
+    except Exception as exc:
+        raise SystemExit(
+            f"REFUSING to install hooks: the hook interpreter {_py()} cannot execute "
+            f"({exc}). If your machine blocks executables outside approved roots "
+            f"(corp group policy), move this clone + venv under an approved path "
+            f"(e.g. C:\code) and re-run.") from exc
     data = _load()
     hooks = data.setdefault("hooks", {})
     desired = _desired()
