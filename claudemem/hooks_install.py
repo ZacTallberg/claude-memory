@@ -93,7 +93,7 @@ def install() -> str:
             f"REFUSING to install hooks: the hook interpreter {_py()} cannot execute "
             f"({exc}). If your machine blocks executables outside approved roots "
             f"(corp group policy), move this clone + venv under an approved path "
-            f"(e.g. C:\code) and re-run.") from exc
+            f"(e.g. C:\\code) and re-run.") from exc
     data = _load()
     hooks = data.setdefault("hooks", {})
     desired = _desired()
