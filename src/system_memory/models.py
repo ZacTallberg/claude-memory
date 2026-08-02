@@ -119,6 +119,7 @@ class RecallScope(BaseModel):
     project_ids: tuple[str, ...] = ()
     providers: tuple[str, ...] = ()
     session_ids: tuple[str, ...] = ()
+    exclude_session_ids: tuple[str, ...] = ()
     roles: tuple[Role, ...] = ()
     hard_filter: bool = False
 

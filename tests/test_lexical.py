@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from datetime import UTC, datetime
+
 from .conftest import make_event
 
 
@@ -144,3 +146,33 @@ def test_activation_fails_closed_if_corpus_changes_during_build(store):
             "SELECT status FROM search_generations WHERE id=?", (generation,)
         ).fetchone()["status"]
     assert status == "failed"
+
+
+def test_search_can_exclude_current_session_and_respect_historical_time(store):
+    old = store.ingest(
+        make_event(
+            event_key="old-state",
+            session_id="old-session",
+            content="The deployment color was amber.",
+        )
+    )
+    current = store.ingest(
+        make_event(
+            event_key="current-state",
+            session_id="current-session",
+            content="The deployment color is now amber.",
+        ).model_copy(update={"occurred_at": datetime(2026, 8, 3, tzinfo=UTC)})
+    )
+    generation = store.create_search_generation(
+        corpus_sha256=store.event_corpus_sha256(), chunker_version="event-v1"
+    )
+    store.index_events([old.event_id, current.event_id], generation)
+    store.activate_generation(generation)
+
+    historical = store.lexical_search(
+        "deployment color amber",
+        exclude_session_ids=("current-session",),
+        as_of="2026-08-02T23:59:59.000000Z",
+    )
+
+    assert [result.session_id for result in historical] == ["old-session"]

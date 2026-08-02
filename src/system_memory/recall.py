@@ -51,7 +51,9 @@ class RecallEngine:
             hard_project_ids=request.scope.project_ids if hard else (),
             hard_providers=request.scope.providers if hard else (),
             hard_session_ids=request.scope.session_ids if hard else (),
+            exclude_session_ids=request.scope.exclude_session_ids,
             hard_roles=tuple(role.value for role in request.scope.roles) if hard else (),
+            as_of=utc_iso(request.as_of) if request.as_of else None,
         )
         lexical_ms = (time.perf_counter() - lexical_started) * 1000
 
@@ -80,9 +82,11 @@ class RecallEngine:
                         hard_project_ids=request.scope.project_ids if hard else (),
                         hard_providers=request.scope.providers if hard else (),
                         hard_session_ids=request.scope.session_ids if hard else (),
+                        exclude_session_ids=request.scope.exclude_session_ids,
                         hard_roles=(
                             tuple(role.value for role in request.scope.roles) if hard else ()
                         ),
+                        as_of=utc_iso(request.as_of) if request.as_of else None,
                     )
                     vector_hits = [
                         hit for hit in vector_hits if hit.vector_score >= self.vector_min_similarity

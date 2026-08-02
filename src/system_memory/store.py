@@ -811,7 +811,9 @@ class MemoryStore:
         hard_project_ids: tuple[str, ...] = (),
         hard_providers: tuple[str, ...] = (),
         hard_session_ids: tuple[str, ...] = (),
+        exclude_session_ids: tuple[str, ...] = (),
         hard_roles: tuple[str, ...] = (),
+        as_of: str | None = None,
     ) -> list[SearchHit]:
         fts_query, exact_terms = self._fts_query(query)
         if not fts_query:
@@ -836,10 +838,17 @@ class MemoryStore:
                 placeholders = ",".join("?" for _ in hard_session_ids)
                 where += f" AND d.session_id IN ({placeholders})"
                 parameters.extend(hard_session_ids)
+            if exclude_session_ids:
+                placeholders = ",".join("?" for _ in exclude_session_ids)
+                where += f" AND (d.session_id IS NULL OR d.session_id NOT IN ({placeholders}))"
+                parameters.extend(exclude_session_ids)
             if hard_roles:
                 placeholders = ",".join("?" for _ in hard_roles)
                 where += f" AND d.role IN ({placeholders})"
                 parameters.extend(hard_roles)
+            if as_of:
+                where += " AND (d.occurred_at IS NULL OR d.occurred_at<=?)"
+                parameters.append(as_of)
             parameters.append(max(limit * 4, limit))
             rows = connection.execute(
                 f"""SELECT d.*, bm25(search_documents_fts,5.0,1.0) AS rank

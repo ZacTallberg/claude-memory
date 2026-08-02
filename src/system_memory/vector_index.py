@@ -67,7 +67,9 @@ class VectorIndex:
         hard_project_ids: tuple[str, ...] = (),
         hard_providers: tuple[str, ...] = (),
         hard_session_ids: tuple[str, ...] = (),
+        exclude_session_ids: tuple[str, ...] = (),
         hard_roles: tuple[str, ...] = (),
+        as_of: str | None = None,
     ) -> list[SearchHit]:
         query = np.asarray(query_vector, dtype=np.float32)
         if query.ndim != 1 or query.shape[0] != self.matrix.shape[1]:
@@ -90,8 +92,18 @@ class VectorIndex:
             eligible &= np.asarray(
                 [doc.session_id in hard_session_ids for doc in self.documents], dtype=bool
             )
+        if exclude_session_ids:
+            eligible &= np.asarray(
+                [doc.session_id not in exclude_session_ids for doc in self.documents],
+                dtype=bool,
+            )
         if hard_roles:
             eligible &= np.asarray([doc.role in hard_roles for doc in self.documents], dtype=bool)
+        if as_of:
+            eligible &= np.asarray(
+                [doc.occurred_at is None or doc.occurred_at <= as_of for doc in self.documents],
+                dtype=bool,
+            )
         indexes = np.flatnonzero(eligible)
         if not len(indexes):
             return []
