@@ -281,6 +281,7 @@ class MemoryStore:
                     "redacted during ingestion",
                 ),
             )
+        MemoryStore._index_live_event(connection, prepared, metadata)
 
         return IngestResult(
             event_id=prepared.event_id,
@@ -289,6 +290,52 @@ class MemoryStore:
             inserted=inserted,
             redaction_count=len(prepared.findings),
             content_sha256=prepared.body_hash,
+        )
+
+    @staticmethod
+    def _index_live_event(
+        connection: sqlite3.Connection,
+        prepared: _PreparedEvent,
+        metadata: dict[str, Any],
+    ) -> None:
+        incoming = prepared.incoming
+        title = f"{incoming.provider} {incoming.role.value} · {prepared.occurred_at}"
+        fields = [
+            title,
+            prepared.body,
+            incoming.provider,
+            incoming.project_id or "",
+            incoming.task_id or "",
+            incoming.session_id,
+            incoming.role.value,
+            incoming.authority.value,
+            prepared.safe_worktree or "",
+            incoming.commit_sha or "",
+        ]
+        search_text = "\n".join(item for item in fields if item)
+        live_id = document_id("live", "event", prepared.event_id, prepared.body_hash)
+        connection.execute(
+            """INSERT OR IGNORE INTO live_documents(
+                   id,memory_type,ref_id,provider,project_id,task_id,session_id,role,authority,
+                   occurred_at,title,body,search_text,content_sha256,metadata
+               ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+            (
+                live_id,
+                "event",
+                prepared.event_id,
+                incoming.provider,
+                incoming.project_id,
+                incoming.task_id,
+                incoming.session_id,
+                incoming.role.value,
+                incoming.authority.value,
+                prepared.occurred_at,
+                title,
+                prepared.body,
+                search_text,
+                prepared.body_hash,
+                json.dumps(metadata, ensure_ascii=False, sort_keys=True),
+            ),
         )
 
     def backfill_archive_references(self, *, batch_size: int = 250) -> int:
@@ -833,6 +880,17 @@ class MemoryStore:
             "UPDATE search_generations SET status='active',activated_at=? WHERE id=?",
             (utc_iso(), generation),
         )
+        connection.execute(
+            """DELETE FROM live_documents
+                 WHERE EXISTS (
+                    SELECT 1 FROM search_documents d
+                     WHERE d.generation_id=?
+                       AND d.memory_type=live_documents.memory_type
+                       AND d.ref_id=live_documents.ref_id
+                       AND d.content_sha256=live_documents.content_sha256
+                 )""",
+            (generation,),
+        )
 
     def lexical_search(
         self,
@@ -854,46 +912,66 @@ class MemoryStore:
             active = connection.execute(
                 "SELECT id FROM search_generations WHERE status='active'"
             ).fetchone()
-            if not active:
-                return []
-            parameters: list[Any] = [fts_query, active["id"]]
-            where = "search_documents_fts MATCH ? AND d.generation_id=?"
-            if hard_project_ids:
-                placeholders = ",".join("?" for _ in hard_project_ids)
-                where += f" AND d.project_id IN ({placeholders})"
-                parameters.extend(hard_project_ids)
-            if hard_providers:
-                placeholders = ",".join("?" for _ in hard_providers)
-                where += f" AND d.provider IN ({placeholders})"
-                parameters.extend(hard_providers)
-            if hard_session_ids:
-                placeholders = ",".join("?" for _ in hard_session_ids)
-                where += f" AND d.session_id IN ({placeholders})"
-                parameters.extend(hard_session_ids)
-            if exclude_session_ids:
-                placeholders = ",".join("?" for _ in exclude_session_ids)
-                where += f" AND (d.session_id IS NULL OR d.session_id NOT IN ({placeholders}))"
-                parameters.extend(exclude_session_ids)
-            if hard_roles:
-                placeholders = ",".join("?" for _ in hard_roles)
-                where += f" AND d.role IN ({placeholders})"
-                parameters.extend(hard_roles)
-            if as_of:
-                where += " AND (d.occurred_at IS NULL OR d.occurred_at<=?)"
-                parameters.append(as_of)
-            parameters.append(max(limit * 4, limit))
-            rows = connection.execute(
-                f"""SELECT d.*, bm25(search_documents_fts,5.0,1.0) AS rank
-                    FROM search_documents_fts
-                    JOIN search_documents d ON d.row_id=search_documents_fts.rowid
-                    WHERE {where}
-                    ORDER BY rank
-                    LIMIT ?""",
-                parameters,
-            ).fetchall()
+            rows: list[sqlite3.Row] = []
+
+            def filtered_where(parameters: list[Any]) -> str:
+                where = ""
+                if hard_project_ids:
+                    placeholders = ",".join("?" for _ in hard_project_ids)
+                    where += f" AND d.project_id IN ({placeholders})"
+                    parameters.extend(hard_project_ids)
+                if hard_providers:
+                    placeholders = ",".join("?" for _ in hard_providers)
+                    where += f" AND d.provider IN ({placeholders})"
+                    parameters.extend(hard_providers)
+                if hard_session_ids:
+                    placeholders = ",".join("?" for _ in hard_session_ids)
+                    where += f" AND d.session_id IN ({placeholders})"
+                    parameters.extend(hard_session_ids)
+                if exclude_session_ids:
+                    placeholders = ",".join("?" for _ in exclude_session_ids)
+                    where += f" AND (d.session_id IS NULL OR d.session_id NOT IN ({placeholders}))"
+                    parameters.extend(exclude_session_ids)
+                if hard_roles:
+                    placeholders = ",".join("?" for _ in hard_roles)
+                    where += f" AND d.role IN ({placeholders})"
+                    parameters.extend(hard_roles)
+                if as_of:
+                    where += " AND (d.occurred_at IS NULL OR d.occurred_at<=?)"
+                    parameters.append(as_of)
+                return where
+
+            lane_limit = max(limit * 4, limit)
+            if active:
+                parameters: list[Any] = [fts_query, active["id"]]
+                where = filtered_where(parameters)
+                parameters.append(lane_limit)
+                rows.extend(
+                    connection.execute(
+                        f"""SELECT d.*, bm25(search_documents_fts,5.0,1.0) AS rank
+                              FROM search_documents_fts
+                              JOIN search_documents d ON d.row_id=search_documents_fts.rowid
+                             WHERE search_documents_fts MATCH ? AND d.generation_id=? {where}
+                             ORDER BY rank LIMIT ?""",
+                        parameters,
+                    ).fetchall()
+                )
+            parameters = [fts_query]
+            where = filtered_where(parameters)
+            parameters.append(lane_limit)
+            rows.extend(
+                connection.execute(
+                    f"""SELECT d.*, bm25(live_documents_fts,5.0,1.0) AS rank
+                          FROM live_documents_fts
+                          JOIN live_documents d ON d.row_id=live_documents_fts.rowid
+                         WHERE live_documents_fts MATCH ? {where}
+                         ORDER BY rank LIMIT ?""",
+                    parameters,
+                ).fetchall()
+            )
 
         lowered_query = query.casefold()
-        hits: list[SearchHit] = []
+        by_ref: dict[tuple[str, str, str], SearchHit] = {}
         for row in rows:
             exact = sum(
                 0.12 for term in exact_terms if term.casefold() in row["search_text"].casefold()
@@ -904,26 +982,29 @@ class MemoryStore:
                 0.15 if current_project_id and row["project_id"] == current_project_id else 0.0
             )
             lexical = 1.0 / (1.0 + max(0.0, float(row["rank"])))
-            hits.append(
-                SearchHit(
-                    document_id=row["id"],
-                    memory_type=row["memory_type"],
-                    ref_id=row["ref_id"],
-                    provider=row["provider"],
-                    project_id=row["project_id"],
-                    task_id=row["task_id"],
-                    session_id=row["session_id"],
-                    role=row["role"],
-                    authority=row["authority"],
-                    occurred_at=row["occurred_at"],
-                    title=row["title"],
-                    body=row["body"],
-                    content_sha256=row["content_sha256"],
-                    lexical_score=lexical,
-                    exact_score=exact,
-                    project_boost=project_boost,
-                )
+            hit = SearchHit(
+                document_id=row["id"],
+                memory_type=row["memory_type"],
+                ref_id=row["ref_id"],
+                provider=row["provider"],
+                project_id=row["project_id"],
+                task_id=row["task_id"],
+                session_id=row["session_id"],
+                role=row["role"],
+                authority=row["authority"],
+                occurred_at=row["occurred_at"],
+                title=row["title"],
+                body=row["body"],
+                content_sha256=row["content_sha256"],
+                lexical_score=lexical,
+                exact_score=exact,
+                project_boost=project_boost,
             )
+            key = (hit.memory_type, hit.ref_id, hit.content_sha256)
+            current = by_ref.get(key)
+            if current is None or hit.score > current.score:
+                by_ref[key] = hit
+        hits = list(by_ref.values())
         hits.sort(key=lambda item: (-item.score, item.document_id))
         return hits[:limit]
 
@@ -933,6 +1014,10 @@ class MemoryStore:
                 "SELECT id FROM search_generations WHERE status='active'"
             ).fetchone()
         return row["id"] if row else None
+
+    def live_document_count(self) -> int:
+        with self.database.read() as connection:
+            return int(connection.execute("SELECT COUNT(*) FROM live_documents").fetchone()[0])
 
     def record_retrieval(
         self,
@@ -973,7 +1058,14 @@ class MemoryStore:
 
     def counts(self) -> dict[str, int]:
         with self.database.read() as connection:
-            names = ("sources", "episodes", "memory_events", "claim_revisions", "search_documents")
+            names = (
+                "sources",
+                "episodes",
+                "memory_events",
+                "claim_revisions",
+                "search_documents",
+                "live_documents",
+            )
             return {
                 name: int(connection.execute(f"SELECT COUNT(*) FROM {name}").fetchone()[0])
                 for name in names

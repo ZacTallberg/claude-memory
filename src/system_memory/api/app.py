@@ -147,12 +147,15 @@ def create_app(
     def readyz() -> dict[str, object]:
         health = context.store.database.health()
         generation = context.store.active_generation_id()
+        live_documents = context.store.live_document_count()
+        usable = bool(generation or live_documents)
         return {
-            "ok": bool(health["ok"] and generation),
+            "ok": bool(health["ok"] and usable),
             "database": health["quick_check"],
             "schema_version": health["schema_version"],
             "active_generation_id": generation,
-            "available_modes": ["keyword_only"] if generation else [],
+            "available_modes": ["keyword_only"] if usable else [],
+            "live_documents": live_documents,
         }
 
     @app.get("/healthz")

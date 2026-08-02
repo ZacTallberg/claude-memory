@@ -348,4 +348,53 @@ ALTER TABLE memory_events ADD COLUMN archive_ref TEXT;
 CREATE INDEX IF NOT EXISTS memory_events_archive_ref_idx ON memory_events(archive_ref);
 """,
     ),
+    Migration(
+        5,
+        "transactional_live_lexical_overlay",
+        r"""
+CREATE TABLE IF NOT EXISTS live_documents (
+    row_id INTEGER PRIMARY KEY AUTOINCREMENT,
+    id TEXT NOT NULL UNIQUE,
+    memory_type TEXT NOT NULL,
+    ref_id TEXT NOT NULL,
+    provider TEXT,
+    project_id TEXT,
+    task_id TEXT,
+    session_id TEXT,
+    role TEXT,
+    authority TEXT NOT NULL,
+    occurred_at TEXT,
+    title TEXT NOT NULL,
+    body TEXT NOT NULL,
+    search_text TEXT NOT NULL,
+    content_sha256 TEXT NOT NULL,
+    metadata TEXT NOT NULL DEFAULT '{}',
+    UNIQUE(memory_type, ref_id, content_sha256)
+);
+CREATE INDEX IF NOT EXISTS live_documents_project_idx ON live_documents(project_id);
+CREATE INDEX IF NOT EXISTS live_documents_session_idx ON live_documents(session_id);
+
+CREATE VIRTUAL TABLE IF NOT EXISTS live_documents_fts USING fts5(
+    title,
+    search_text,
+    content='live_documents',
+    content_rowid='row_id',
+    tokenize='unicode61 remove_diacritics 2'
+);
+CREATE TRIGGER IF NOT EXISTS live_documents_ai AFTER INSERT ON live_documents BEGIN
+    INSERT INTO live_documents_fts(rowid, title, search_text)
+    VALUES (new.row_id, new.title, new.search_text);
+END;
+CREATE TRIGGER IF NOT EXISTS live_documents_ad AFTER DELETE ON live_documents BEGIN
+    INSERT INTO live_documents_fts(live_documents_fts, rowid, title, search_text)
+    VALUES ('delete', old.row_id, old.title, old.search_text);
+END;
+CREATE TRIGGER IF NOT EXISTS live_documents_au AFTER UPDATE ON live_documents BEGIN
+    INSERT INTO live_documents_fts(live_documents_fts, rowid, title, search_text)
+    VALUES ('delete', old.row_id, old.title, old.search_text);
+    INSERT INTO live_documents_fts(rowid, title, search_text)
+    VALUES (new.row_id, new.title, new.search_text);
+END;
+""",
+    ),
 )

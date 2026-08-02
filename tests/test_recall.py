@@ -78,3 +78,15 @@ def test_context_budget_is_enforced(store):
     )
     assert result.evidence
     assert len(result.evidence[0].text) < 512
+
+
+def test_lexical_recall_is_fresh_before_any_generation_rebuild(store):
+    fresh = store.ingest(
+        make_event(content="A just-authored cross-agent phrase: silver heliograph.")
+    )
+
+    result = RecallEngine(store).recall(RecallQuery(query="silver heliograph"))
+
+    assert result.mode == "keyword_only"
+    assert result.generation_id is None
+    assert [item.ref_id for item in result.evidence] == [fresh.event_id]

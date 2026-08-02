@@ -176,3 +176,25 @@ def test_search_can_exclude_current_session_and_respect_historical_time(store):
     )
 
     assert [result.session_id for result in historical] == ["old-session"]
+
+
+def test_new_event_is_searchable_through_transactional_live_overlay(store):
+    baseline = store.ingest(make_event(content="A baseline memory about cedar trees."))
+    generation = store.create_search_generation(
+        corpus_sha256=store.event_corpus_sha256(), chunker_version="event-v1"
+    )
+    store.index_event(baseline.event_id, generation)
+    store.activate_generation(generation)
+    assert store.live_document_count() == 0
+
+    fresh = store.ingest(
+        make_event(
+            event_key="fresh-overlay-event",
+            session_id="fresh-session",
+            content="The newly chosen signal word is heliotrope.",
+        )
+    )
+
+    assert store.live_document_count() == 1
+    results = store.lexical_search("signal word heliotrope")
+    assert [result.ref_id for result in results] == [fresh.event_id]

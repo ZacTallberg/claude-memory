@@ -116,7 +116,7 @@ def test_secrets_are_also_redacted_from_provenance_metadata(store):
 def test_database_reports_full_durability_and_integrity(store):
     health = store.database.health()
     assert health["ok"] is True
-    assert health["schema_version"] == 4
+    assert health["schema_version"] == 5
     with store.database.read() as connection:
         assert connection.execute("PRAGMA foreign_keys").fetchone()[0] == 1
         assert connection.execute("PRAGMA synchronous").fetchone()[0] == 2
