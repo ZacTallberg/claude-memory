@@ -9,7 +9,7 @@ from pathlib import Path
 from .api import create_app
 from .archive import CanonicalArchive
 from .auth import CredentialStore
-from .backup import BackupManager
+from .backup import BackupManager, repository_revision
 from .database import Database
 from .evaluation import load_cases, run_evaluation, validate_gold64, write_schema
 from .legacy_v1 import LegacyV1Importer
@@ -17,6 +17,7 @@ from .raw_transcripts import RawTranscriptImporter
 from .recall import RecallEngine
 from .settings import Settings
 from .store import MemoryStore
+from .supervisor import Supervisor, SupervisorConfig
 
 
 def _settings(args: argparse.Namespace) -> Settings:
@@ -223,6 +224,17 @@ def command_restore(args: argparse.Namespace) -> int:
     return 0
 
 
+def command_supervise(args: argparse.Namespace) -> int:
+    settings = _settings(args)
+    build_id = repository_revision(Path(__file__).resolve().parents[2]) or "working-tree"
+    supervisor = Supervisor(
+        SupervisorConfig(root=settings.root, port=args.port or settings.port),
+        build_id=build_id,
+    )
+    supervisor.run()
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="system-memory")
     parser.add_argument("--root", help="installation root (defaults to current directory)")
@@ -292,6 +304,12 @@ def build_parser() -> argparse.ArgumentParser:
     restore.add_argument("snapshot")
     restore.add_argument("target")
     restore.set_defaults(handler=command_restore)
+
+    supervise = subparsers.add_parser(
+        "supervise", help="run Supervisor V2 with exact PID and nonce ownership"
+    )
+    supervise.add_argument("--port", type=int, default=None)
+    supervise.set_defaults(handler=command_supervise)
     return parser
 
 

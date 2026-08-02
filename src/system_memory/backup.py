@@ -71,7 +71,7 @@ class BackupManager:
             receipts = staging / "receipts"
             receipts.mkdir()
             self._write_source_inventory(database_target, receipts / "source-inventory.json")
-            code_revision = self._git_revision()
+            code_revision = repository_revision(self.repository_root)
             lock_sha256 = self._copy_lockfile(receipts)
             runtime_receipt = {
                 "schema_version": counts["schema_version"],
@@ -184,25 +184,6 @@ class BackupManager:
         destination = receipts / "uv.lock"
         shutil.copy2(source, destination)
         return _sha256(destination)
-
-    def _git_revision(self) -> str | None:
-        if not self.repository_root:
-            return None
-        git = self.repository_root / ".git"
-        head = git / "HEAD"
-        if not head.is_file():
-            return None
-        value = head.read_text(encoding="utf-8").strip()
-        if value.startswith("ref: "):
-            reference = git / value.removeprefix("ref: ")
-            if not reference.is_file():
-                return None
-            value = reference.read_text(encoding="utf-8").strip()
-        return (
-            value
-            if len(value) == 40 and all(char in "0123456789abcdef" for char in value)
-            else None
-        )
 
     @staticmethod
     def _file_receipts(root: Path) -> dict[str, FileReceipt]:
@@ -360,3 +341,19 @@ def _sha256(path: Path) -> str:
         for block in iter(lambda: stream.read(1024 * 1024), b""):
             digest.update(block)
     return digest.hexdigest()
+
+
+def repository_revision(repository_root: Path | None) -> str | None:
+    if not repository_root:
+        return None
+    git = repository_root.resolve() / ".git"
+    head = git / "HEAD"
+    if not head.is_file():
+        return None
+    value = head.read_text(encoding="utf-8").strip()
+    if value.startswith("ref: "):
+        reference = git / value.removeprefix("ref: ")
+        if not reference.is_file():
+            return None
+        value = reference.read_text(encoding="utf-8").strip()
+    return value if len(value) == 40 and all(char in "0123456789abcdef" for char in value) else None

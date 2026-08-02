@@ -2,9 +2,11 @@ from __future__ import annotations
 
 import os
 import secrets
+import signal
+from collections.abc import Callable
 from typing import Annotated
 
-from fastapi import Depends, FastAPI, HTTPException, Request, status
+from fastapi import BackgroundTasks, Depends, FastAPI, HTTPException, Request, status
 from fastapi.middleware.trustedhost import TrustedHostMiddleware
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from pydantic import BaseModel
@@ -27,7 +29,13 @@ class StatsResponse(BaseModel):
 
 
 class AppContext:
-    def __init__(self, settings: Settings, store: MemoryStore, nonce: str) -> None:
+    def __init__(
+        self,
+        settings: Settings,
+        store: MemoryStore,
+        nonce: str,
+        shutdown_callback: Callable[[], None],
+    ) -> None:
         self.settings = settings
         self.store = store
         self.credentials = CredentialStore(store.database)
@@ -37,6 +45,7 @@ class AppContext:
             abstention_min_score=settings.abstention_min_score,
         )
         self.nonce = nonce
+        self.shutdown_callback = shutdown_callback
 
 
 _bearer = HTTPBearer(auto_error=False)
@@ -47,6 +56,7 @@ def create_app(
     *,
     store: MemoryStore | None = None,
     instance_nonce: str | None = None,
+    shutdown_callback: Callable[[], None] | None = None,
 ) -> FastAPI:
     cfg = settings or Settings()
     memory = store or MemoryStore(
@@ -56,7 +66,18 @@ def create_app(
     version = memory.initialize()
     if version < 1:
         raise RuntimeError("database migration did not initialize canonical memory")
-    context = AppContext(cfg, memory, instance_nonce or secrets.token_urlsafe(24))
+
+    def default_shutdown() -> None:
+        os.kill(os.getpid(), signal.SIGINT)
+
+    context = AppContext(
+        cfg,
+        memory,
+        instance_nonce
+        or os.environ.get("SYSTEM_MEMORY_INSTANCE_NONCE")
+        or secrets.token_urlsafe(24),
+        shutdown_callback or default_shutdown,
+    )
 
     app = FastAPI(
         title="System Memory",
@@ -115,7 +136,12 @@ def create_app(
 
     @app.get("/livez")
     def livez() -> dict[str, object]:
-        return {"ok": True, "pid": os.getpid(), "nonce": context.nonce, "build": "0.1.0"}
+        return {
+            "ok": True,
+            "pid": os.getpid(),
+            "nonce": context.nonce,
+            "build": os.environ.get("SYSTEM_MEMORY_BUILD_ID", "0.1.0"),
+        }
 
     @app.get("/readyz")
     def readyz() -> dict[str, object]:
@@ -172,5 +198,14 @@ def create_app(
     ) -> RecallResult:
         require_scope(actor, "recall")
         return context.recall.recall(query)
+
+    @app.post("/v1/admin/shutdown")
+    def shutdown(
+        background: BackgroundTasks,
+        actor: Credential = authenticated_actor,
+    ) -> dict[str, bool]:
+        require_scope(actor, "admin:shutdown")
+        background.add_task(context.shutdown_callback)
+        return {"ok": True}
 
     return app

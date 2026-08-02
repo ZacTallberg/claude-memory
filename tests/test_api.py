@@ -9,7 +9,7 @@ from system_memory.settings import Settings
 from .conftest import make_event
 
 
-def client_and_tokens(store, tmp_path):
+def client_and_tokens(store, tmp_path, *, shutdown_callback=None):
     credentials = CredentialStore(store.database)
     _, admin = credentials.create(actor_id="admin", label="admin", scopes={"*"})
     _, worker = credentials.create(
@@ -18,7 +18,12 @@ def client_and_tokens(store, tmp_path):
         scopes={"read", "recall", "ingest:self"},
     )
     settings = Settings(root=tmp_path, port=7788, request_body_limit=2_000)
-    app = create_app(settings, store=store, instance_nonce="test-instance")
+    app = create_app(
+        settings,
+        store=store,
+        instance_nonce="test-instance",
+        shutdown_callback=shutdown_callback,
+    )
     return TestClient(app), admin, worker
 
 
@@ -97,3 +102,17 @@ def test_ready_and_recall_report_actual_available_mode(store, tmp_path):
     )
     assert recalled.status_code == 200
     assert recalled.json()["mode"] == "keyword_only"
+
+
+def test_authenticated_shutdown_is_deferred_and_admin_only(store, tmp_path):
+    called = []
+    client, admin, worker = client_and_tokens(
+        store, tmp_path, shutdown_callback=lambda: called.append(True)
+    )
+
+    denied = client.post("/v1/admin/shutdown", headers=bearer(worker))
+    allowed = client.post("/v1/admin/shutdown", headers=bearer(admin))
+
+    assert denied.status_code == 403
+    assert allowed.status_code == 200
+    assert called == [True]
