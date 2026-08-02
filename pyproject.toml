@@ -37,6 +37,7 @@ dev = [
 
 [project.scripts]
 system-memory = "system_memory.cli:main"
+system-memory-mcp = "system_memory.mcp_server:main"
 
 [build-system]
 requires = ["hatchling==1.27.0"]

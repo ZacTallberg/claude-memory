@@ -243,6 +243,38 @@ def command_repair_archive_refs(args: argparse.Namespace) -> int:
     return 0
 
 
+def command_credential_create(args: argparse.Namespace) -> int:
+    settings = _settings(args)
+    memory = _store(settings)
+    credential, token = CredentialStore(memory.database).create(
+        actor_id=args.actor_id,
+        label=args.label,
+        scopes=set(args.scopes),
+    )
+    token_path = Path(args.token_path).resolve()
+    _write_private(token_path, token)
+    print(
+        json.dumps(
+            {
+                "ok": True,
+                "credential_id": credential.credential_id,
+                "actor_id": credential.actor_id,
+                "scopes": sorted(credential.scopes),
+                "token_path": str(token_path),
+            }
+        )
+    )
+    return 0
+
+
+def command_credential_revoke(args: argparse.Namespace) -> int:
+    settings = _settings(args)
+    memory = _store(settings)
+    revoked = CredentialStore(memory.database).revoke(args.credential_id)
+    print(json.dumps({"ok": revoked, "credential_id": args.credential_id}))
+    return 0 if revoked else 1
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="system-memory")
     parser.add_argument("--root", help="installation root (defaults to current directory)")
@@ -324,6 +356,19 @@ def build_parser() -> argparse.ArgumentParser:
         help="verify and replace legacy absolute archive paths with portable references",
     )
     archive_refs.set_defaults(handler=command_repair_archive_refs)
+
+    credential = subparsers.add_parser(
+        "credential-create", help="create one scoped provider credential and private token file"
+    )
+    credential.add_argument("actor_id")
+    credential.add_argument("token_path")
+    credential.add_argument("--label", required=True)
+    credential.add_argument("--scopes", nargs="+", default=["read", "recall", "ingest:self"])
+    credential.set_defaults(handler=command_credential_create)
+
+    revoke = subparsers.add_parser("credential-revoke", help="revoke one provider credential")
+    revoke.add_argument("credential_id")
+    revoke.set_defaults(handler=command_credential_revoke)
     return parser
 
 
