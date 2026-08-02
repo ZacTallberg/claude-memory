@@ -235,6 +235,14 @@ def command_supervise(args: argparse.Namespace) -> int:
     return 0
 
 
+def command_repair_archive_refs(args: argparse.Namespace) -> int:
+    settings = _settings(args)
+    memory = _store(settings)
+    repaired = memory.backfill_archive_references()
+    print(json.dumps({"ok": True, "archive_references_repaired": repaired}))
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="system-memory")
     parser.add_argument("--root", help="installation root (defaults to current directory)")
@@ -310,6 +318,12 @@ def build_parser() -> argparse.ArgumentParser:
     )
     supervise.add_argument("--port", type=int, default=None)
     supervise.set_defaults(handler=command_supervise)
+
+    archive_refs = subparsers.add_parser(
+        "repair-archive-refs",
+        help="verify and replace legacy absolute archive paths with portable references",
+    )
+    archive_refs.set_defaults(handler=command_repair_archive_refs)
     return parser
 
 

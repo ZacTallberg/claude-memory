@@ -132,3 +132,28 @@ def test_archive_references_are_portable_and_cannot_escape(store):
     assert json.loads(row["metadata"])["archive_ref"] == row["archive_ref"]
     assert store.archive.verify_event(row["archive_ref"], result.event_id, result.content_sha256)
     assert not store.archive.verify_event("../outside.json", result.event_id, result.content_sha256)
+
+
+def test_legacy_absolute_archive_path_is_verified_and_backfilled(store):
+    result = store.ingest(make_event(event_key="legacy-absolute-archive"))
+    with store.database.read() as connection:
+        row = connection.execute(
+            "SELECT archive_ref,metadata FROM memory_events WHERE id=?", (result.event_id,)
+        ).fetchone()
+    absolute = str(store.archive.resolve_reference(row["archive_ref"]))
+    metadata = json.loads(row["metadata"])
+    metadata.pop("archive_ref")
+    metadata["archive_path"] = absolute
+    with store.database.write() as connection:
+        connection.execute(
+            "UPDATE memory_events SET archive_ref=NULL,metadata=? WHERE id=?",
+            (json.dumps(metadata), result.event_id),
+        )
+
+    assert store.backfill_archive_references() == 1
+    with store.database.read() as connection:
+        repaired = connection.execute(
+            "SELECT archive_ref,metadata FROM memory_events WHERE id=?", (result.event_id,)
+        ).fetchone()
+    assert repaired["archive_ref"] == row["archive_ref"]
+    assert "archive_path" not in json.loads(repaired["metadata"])
