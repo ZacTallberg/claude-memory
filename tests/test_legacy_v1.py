@@ -134,3 +134,25 @@ def test_legacy_import_report_never_contains_memory_bodies(store, tmp_path):
     assert "Available source memory" not in serialized
     assert "Recovered missing-source memory" not in serialized
     assert len(report.source_database_sha256) == 64
+
+
+def test_legacy_import_can_import_facts_without_lossy_chunks(store, tmp_path):
+    database = legacy_database(tmp_path)
+
+    report = LegacyV1Importer(store).import_database(database, only_facts=True)
+
+    assert report.only_facts is True
+    assert report.chunk_rows_seen == 0
+    assert report.facts_seen == 1
+    assert report.fact_events_inserted == 1
+    assert report.source_files_present == 0
+    assert report.source_files_missing == 0
+    with store.database.read() as connection:
+        rows = connection.execute(
+            """SELECT e.provider,s.kind AS source_kind
+                 FROM memory_events e JOIN sources s ON s.id=e.source_id
+                 ORDER BY e.provider"""
+        ).fetchall()
+    assert [(row["provider"], row["source_kind"]) for row in rows] == [
+        ("legacy-curated", "legacy-v1-fact")
+    ]

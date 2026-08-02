@@ -19,6 +19,7 @@ class LegacyImportReport(BaseModel):
     source_database: str
     source_database_sha256: str
     only_missing_sources: bool
+    only_facts: bool = False
     chunk_rows_seen: int = 0
     chunk_events_inserted: int = 0
     chunk_events_existing: int = 0
@@ -60,6 +61,7 @@ class LegacyV1Importer:
         database_path: Path,
         *,
         only_missing_sources: bool = False,
+        only_facts: bool = False,
         include_facts: bool = True,
         progress_every: int = 1_000,
         on_progress=None,
@@ -67,10 +69,15 @@ class LegacyV1Importer:
         database = database_path.resolve()
         if not database.is_file() or database.stat().st_size <= 0:
             raise FileNotFoundError(database)
+        if only_facts and only_missing_sources:
+            raise ValueError("only_facts and only_missing_sources are mutually exclusive")
+        if only_facts and not include_facts:
+            raise ValueError("only_facts requires include_facts")
         report = LegacyImportReport(
             source_database=str(database),
             source_database_sha256=_sha256(database),
             only_missing_sources=only_missing_sources,
+            only_facts=only_facts,
         )
         providers: Counter[str] = Counter()
         losses: Counter[str] = Counter()
@@ -81,22 +88,23 @@ class LegacyV1Importer:
         connection.row_factory = sqlite3.Row
         try:
             sources: dict[int, dict[str, Any]] = {}
-            for row in connection.execute("SELECT * FROM sources ORDER BY id"):
-                metadata = _json(row["meta"])
-                path = Path(row["path"]) if row["path"] else None
-                present = bool(path and path.is_file())
-                if present:
-                    report.source_files_present += 1
-                else:
-                    report.source_files_missing += 1
-                sources[int(row["id"])] = {
-                    "path": str(path) if path else None,
-                    "present": present,
-                    "provider": str(metadata.get("provider") or "legacy-unknown"),
-                    "session_id": row["session_id"],
-                    "project_hint": row["project"],
-                    "meta": metadata,
-                }
+            if not only_facts:
+                for row in connection.execute("SELECT * FROM sources ORDER BY id"):
+                    metadata = _json(row["meta"])
+                    path = Path(row["path"]) if row["path"] else None
+                    present = bool(path and path.is_file())
+                    if present:
+                        report.source_files_present += 1
+                    else:
+                        report.source_files_missing += 1
+                    sources[int(row["id"])] = {
+                        "path": str(path) if path else None,
+                        "present": present,
+                        "provider": str(metadata.get("provider") or "legacy-unknown"),
+                        "session_id": row["session_id"],
+                        "project_hint": row["project"],
+                        "meta": metadata,
+                    }
 
             seen: set[tuple[Any, ...]] = set()
             pending_chunks: list[IngestEvent] = []
@@ -112,89 +120,96 @@ class LegacyV1Importer:
                         report.chunk_events_existing += 1
                 pending_chunks.clear()
 
-            query = """SELECT c.* FROM chunks c ORDER BY c.source_id,c.ts,c.id"""
-            for row in connection.execute(query):
-                source = sources[int(row["source_id"])]
-                if only_missing_sources and source["present"]:
-                    continue
-                report.chunk_rows_seen += 1
-                body_hash = content_hash(row["content"] or "")
-                duplicate_key = (
-                    row["source_id"],
-                    row["session_id"],
-                    row["role"],
-                    row["ts"],
-                    body_hash,
-                )
-                if duplicate_key in seen:
-                    report.exact_duplicates_skipped += 1
-                    continue
-                seen.add(duplicate_key)
-                if int(row["id"]) in imported_chunk_ids:
-                    report.chunk_events_existing += 1
-                    continue
+            if not only_facts:
+                query = """SELECT c.* FROM chunks c ORDER BY c.source_id,c.ts,c.id"""
+                for row in connection.execute(query):
+                    source = sources[int(row["source_id"])]
+                    if only_missing_sources and source["present"]:
+                        continue
+                    report.chunk_rows_seen += 1
+                    body_hash = content_hash(row["content"] or "")
+                    duplicate_key = (
+                        row["source_id"],
+                        row["session_id"],
+                        row["role"],
+                        row["ts"],
+                        body_hash,
+                    )
+                    if duplicate_key in seen:
+                        report.exact_duplicates_skipped += 1
+                        continue
+                    seen.add(duplicate_key)
+                    if int(row["id"]) in imported_chunk_ids:
+                        report.chunk_events_existing += 1
+                        continue
 
-                provider = source["provider"]
-                providers[provider] += 1
-                loss_flags = [
-                    "legacy_chunked",
-                    "legacy_ordinal_unreliable",
-                    "agent_lineage_missing",
-                ]
-                if source["present"]:
-                    loss_flags.append("raw_source_available")
-                else:
-                    loss_flags.extend(("source_missing", "legacy_recovered"))
-                losses.update(loss_flags)
-                role = Role.USER if row["role"] == "user" else Role.ASSISTANT
-                authority = (
-                    Authority.USER_AUTHORED if role == Role.USER else Authority.ASSISTANT_SYNTHESIS
-                )
-                identity = stable_id(
-                    "legacychunk",
-                    source["path"] or f"source-{row['source_id']}",
-                    row["session_id"],
-                    row["role"],
-                    row["ts"],
-                    body_hash,
-                )
-                occurred = datetime.fromisoformat(str(row["ts"]).replace("Z", "+00:00"))
-                incoming = IngestEvent(
-                    provider=provider,
-                    source_kind="legacy-v1-chunk",
-                    source_locator=(
-                        f"legacy-v1://{report.source_database_sha256}/source/{row['source_id']}"
-                    ),
-                    provider_event_id=identity,
-                    agent_id=f"legacy:{provider}:unknown-agent",
-                    session_id=row["session_id"],
-                    project_id=None,
-                    role=role,
-                    authority=authority,
-                    kind=EventKind.LEGACY_RECOVERED,
-                    occurred_at=occurred,
-                    content=row["content"] or "",
-                    visibility="private",
-                    trust="legacy",
-                    loss_flags=tuple(loss_flags),
-                    metadata={
-                        "legacy_source_path": source["path"],
-                        "legacy_source_present": source["present"],
-                        "legacy_project_hint": row["project"],
-                        "legacy_cwd_hint": row["cwd"],
-                        "legacy_chunk_id": row["id"],
-                        "legacy_ordinal": row["ordinal"],
-                        "legacy_kind": row["kind"],
-                        "legacy_context_blurb": row["context_blurb"],
-                    },
-                )
-                pending_chunks.append(incoming)
-                if len(pending_chunks) >= 250:
-                    flush_chunks()
-                if on_progress and progress_every and report.chunk_rows_seen % progress_every == 0:
-                    on_progress(report)
+                    provider = source["provider"]
+                    providers[provider] += 1
+                    loss_flags = [
+                        "legacy_chunked",
+                        "legacy_ordinal_unreliable",
+                        "agent_lineage_missing",
+                    ]
+                    if source["present"]:
+                        loss_flags.append("raw_source_available")
+                    else:
+                        loss_flags.extend(("source_missing", "legacy_recovered"))
+                    losses.update(loss_flags)
+                    role = Role.USER if row["role"] == "user" else Role.ASSISTANT
+                    authority = (
+                        Authority.USER_AUTHORED
+                        if role == Role.USER
+                        else Authority.ASSISTANT_SYNTHESIS
+                    )
+                    identity = stable_id(
+                        "legacychunk",
+                        source["path"] or f"source-{row['source_id']}",
+                        row["session_id"],
+                        row["role"],
+                        row["ts"],
+                        body_hash,
+                    )
+                    occurred = datetime.fromisoformat(str(row["ts"]).replace("Z", "+00:00"))
+                    incoming = IngestEvent(
+                        provider=provider,
+                        source_kind="legacy-v1-chunk",
+                        source_locator=(
+                            f"legacy-v1://{report.source_database_sha256}/source/{row['source_id']}"
+                        ),
+                        provider_event_id=identity,
+                        agent_id=f"legacy:{provider}:unknown-agent",
+                        session_id=row["session_id"],
+                        project_id=None,
+                        role=role,
+                        authority=authority,
+                        kind=EventKind.LEGACY_RECOVERED,
+                        occurred_at=occurred,
+                        content=row["content"] or "",
+                        visibility="private",
+                        trust="legacy",
+                        loss_flags=tuple(loss_flags),
+                        metadata={
+                            "legacy_source_path": source["path"],
+                            "legacy_source_present": source["present"],
+                            "legacy_project_hint": row["project"],
+                            "legacy_cwd_hint": row["cwd"],
+                            "legacy_chunk_id": row["id"],
+                            "legacy_ordinal": row["ordinal"],
+                            "legacy_kind": row["kind"],
+                            "legacy_context_blurb": row["context_blurb"],
+                        },
+                    )
+                    pending_chunks.append(incoming)
+                    if len(pending_chunks) >= 250:
+                        flush_chunks()
+                    if (
+                        on_progress
+                        and progress_every
+                        and report.chunk_rows_seen % progress_every == 0
+                    ):
+                        on_progress(report)
 
-            flush_chunks()
+                flush_chunks()
 
             if include_facts and not only_missing_sources:
                 self._import_facts(

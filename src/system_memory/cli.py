@@ -117,6 +117,7 @@ def command_import_v1(args: argparse.Namespace) -> int:
     report = LegacyV1Importer(memory).import_database(
         Path(args.database),
         only_missing_sources=args.only_missing_sources,
+        only_facts=args.only_facts,
         include_facts=not args.skip_facts,
         progress_every=args.progress_every,
         on_progress=progress,
@@ -152,8 +153,10 @@ def build_parser() -> argparse.ArgumentParser:
         "import-v1", help="import a stabilized claude-memory SQLite snapshot"
     )
     importer.add_argument("database")
-    importer.add_argument("--only-missing-sources", action="store_true")
-    importer.add_argument("--skip-facts", action="store_true")
+    import_mode = importer.add_mutually_exclusive_group()
+    import_mode.add_argument("--only-missing-sources", action="store_true")
+    import_mode.add_argument("--only-facts", action="store_true")
+    import_mode.add_argument("--skip-facts", action="store_true")
     importer.add_argument("--progress-every", type=int, default=1_000)
     importer.set_defaults(handler=command_import_v1)
 
