@@ -54,7 +54,7 @@ def test_ingest_is_idempotent_and_archive_precedes_canonical_commit(store):
     assert source["cursor"] == 100
     assert row["content_sha256"] == content_hash(row["content"])
     assert store.archive.verify_event(
-        path=Path(metadata["archive_path"]),
+        path=metadata["archive_ref"],
         event_id=first.event_id,
         payload_hash=row["content_sha256"],
     )
@@ -84,7 +84,8 @@ def test_secrets_are_redacted_in_database_and_archive(store):
             "SELECT content,metadata FROM memory_events WHERE id=?", (result.event_id,)
         ).fetchone()
         tombstones = connection.execute("SELECT COUNT(*) FROM secret_tombstones").fetchone()[0]
-    archive_text = Path(json.loads(row["metadata"])["archive_path"]).read_text(encoding="utf-8")
+    archive_ref = json.loads(row["metadata"])["archive_ref"]
+    archive_text = store.archive.resolve_reference(archive_ref).read_text(encoding="utf-8")
     assert synthetic not in row["content"]
     assert synthetic not in archive_text
     assert "[REDACTED_SECRET:openai-token]" in row["content"]
@@ -115,7 +116,19 @@ def test_secrets_are_also_redacted_from_provenance_metadata(store):
 def test_database_reports_full_durability_and_integrity(store):
     health = store.database.health()
     assert health["ok"] is True
-    assert health["schema_version"] == 3
+    assert health["schema_version"] == 4
     with store.database.read() as connection:
         assert connection.execute("PRAGMA foreign_keys").fetchone()[0] == 1
         assert connection.execute("PRAGMA synchronous").fetchone()[0] == 2
+
+
+def test_archive_references_are_portable_and_cannot_escape(store):
+    result = store.ingest(make_event(event_key="portable-archive"))
+    with store.database.read() as connection:
+        row = connection.execute(
+            "SELECT archive_ref,metadata FROM memory_events WHERE id=?", (result.event_id,)
+        ).fetchone()
+    assert row["archive_ref"] and not Path(row["archive_ref"]).is_absolute()
+    assert json.loads(row["metadata"])["archive_ref"] == row["archive_ref"]
+    assert store.archive.verify_event(row["archive_ref"], result.event_id, result.content_sha256)
+    assert not store.archive.verify_event("../outside.json", result.event_id, result.content_sha256)

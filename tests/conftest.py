@@ -16,7 +16,7 @@ def store(tmp_path):
         Database(tmp_path / "system-memory.db"),
         CanonicalArchive(tmp_path / "archive"),
     )
-    assert memory.initialize() == 3
+    assert memory.initialize() == 4
     return memory
 
 

@@ -340,4 +340,12 @@ CREATE INDEX IF NOT EXISTS embedding_vectors_generation_idx
     ON embedding_vectors(generation_id);
 """,
     ),
+    Migration(
+        4,
+        "portable_archive_references",
+        r"""
+ALTER TABLE memory_events ADD COLUMN archive_ref TEXT;
+CREATE INDEX IF NOT EXISTS memory_events_archive_ref_idx ON memory_events(archive_ref);
+""",
+    ),
 )

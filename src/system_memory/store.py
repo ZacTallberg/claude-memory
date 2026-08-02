@@ -68,7 +68,7 @@ class _PreparedEvent:
     event_id: str
     occurred_at: str
     prepared_at: str
-    archive_path: str
+    archive_ref: str
 
 
 class MemoryStore:
@@ -161,14 +161,14 @@ class MemoryStore:
             event_id=evt_id,
             occurred_at=occurred,
             prepared_at=now,
-            archive_path=str(archive_path),
+            archive_ref=self.archive.reference(archive_path),
         )
 
     @staticmethod
     def _persist_event(connection: sqlite3.Connection, prepared: _PreparedEvent) -> IngestResult:
         incoming = prepared.incoming
         metadata = dict(prepared.safe_metadata)
-        metadata["archive_path"] = prepared.archive_path
+        metadata["archive_ref"] = prepared.archive_ref
         connection.execute(
             """INSERT INTO sources(
                        id,kind,provider,locator,locator_hash,content_hash,cursor,loss_flags,
@@ -189,7 +189,7 @@ class MemoryStore:
                 None,
                 incoming.source_offset_end or 0,
                 json.dumps(incoming.loss_flags),
-                json.dumps({"latest_archive": prepared.archive_path}, sort_keys=True),
+                json.dumps({"latest_archive_ref": prepared.archive_ref}, sort_keys=True),
                 prepared.prepared_at,
                 prepared.prepared_at,
             ),
@@ -233,8 +233,8 @@ class MemoryStore:
                            parent_session_id,project_id,task_id,hub_instance_id,worktree,commit_sha,
                            role,authority,kind,occurred_at,ingested_at,content,content_sha256,
                            source_offset_start,source_offset_end,visibility,trust,normalizer_version,
-                           loss_flags,metadata
-                       ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                           loss_flags,metadata,archive_ref
+                       ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
                 (
                     prepared.event_id,
                     prepared.source_id,
@@ -263,6 +263,7 @@ class MemoryStore:
                     NORMALIZER_VERSION,
                     json.dumps(incoming.loss_flags),
                     json.dumps(metadata, ensure_ascii=False, sort_keys=True),
+                    prepared.archive_ref,
                 ),
             )
             inserted = True
@@ -288,6 +289,43 @@ class MemoryStore:
             redaction_count=len(prepared.findings),
             content_sha256=prepared.body_hash,
         )
+
+    def backfill_archive_references(self) -> int:
+        """Replace legacy machine-specific archive paths with portable validated refs."""
+        with self.database.read() as connection:
+            rows = connection.execute(
+                """SELECT id,source_id,content_sha256,metadata
+                     FROM memory_events WHERE archive_ref IS NULL ORDER BY id"""
+            ).fetchall()
+        prepared: list[tuple[str, str, str, dict[str, Any]]] = []
+        for row in rows:
+            metadata = json.loads(row["metadata"] or "{}")
+            supplied = metadata.get("archive_ref") or metadata.get("archive_path")
+            if not supplied:
+                raise EvidenceError(f"event has no archive reference: {row['id']}")
+            resolved = self.archive.resolve_reference(supplied)
+            if not self.archive.verify_event(resolved, row["id"], row["content_sha256"]):
+                raise EvidenceError(f"event archive failed verification: {row['id']}")
+            reference = self.archive.reference(resolved)
+            metadata.pop("archive_path", None)
+            metadata["archive_ref"] = reference
+            prepared.append((reference, row["id"], row["source_id"], metadata))
+        if not prepared:
+            return 0
+        latest_by_source: dict[str, str] = {}
+        with self.database.write() as connection:
+            for reference, event, source, metadata in prepared:
+                connection.execute(
+                    "UPDATE memory_events SET archive_ref=?,metadata=? WHERE id=?",
+                    (reference, json.dumps(metadata, ensure_ascii=False, sort_keys=True), event),
+                )
+                latest_by_source[source] = reference
+            for source, reference in latest_by_source.items():
+                connection.execute(
+                    "UPDATE sources SET metadata=? WHERE id=?",
+                    (json.dumps({"latest_archive_ref": reference}, sort_keys=True), source),
+                )
+        return len(prepared)
 
     def close_episode(self, episode: str, *, ended_at: datetime | None = None) -> bool:
         with self.database.write() as connection:

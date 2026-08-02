@@ -23,6 +23,21 @@ class CanonicalArchive:
         digest = content_hash(f"{event_id}:{payload_hash}")
         return self.root / "events" / digest[:2] / f"{digest}.json"
 
+    def reference(self, path: Path) -> str:
+        resolved = path.resolve()
+        if self.root not in resolved.parents:
+            raise ValueError("archive path is outside the canonical archive root")
+        return resolved.relative_to(self.root).as_posix()
+
+    def resolve_reference(self, reference: str | Path) -> Path:
+        supplied = Path(reference)
+        resolved = (
+            supplied.resolve() if supplied.is_absolute() else (self.root / supplied).resolve()
+        )
+        if self.root not in resolved.parents:
+            raise ValueError("archive reference escapes the canonical archive root")
+        return resolved
+
     def put_event(self, event_id: str, payload: dict[str, Any]) -> Path:
         encoded = (canonical_json(payload) + "\n").encode("utf-8")
         payload_hash = content_hash(payload["content"])
@@ -53,9 +68,12 @@ class CanonicalArchive:
                 temp.unlink()
         return target
 
-    def verify_event(self, path: Path, event_id: str, payload_hash: str) -> bool:
-        resolved = path.resolve()
-        if self.root not in resolved.parents or not resolved.is_file():
+    def verify_event(self, path: str | Path, event_id: str, payload_hash: str) -> bool:
+        try:
+            resolved = self.resolve_reference(path)
+        except ValueError:
+            return False
+        if not resolved.is_file():
             return False
         try:
             payload = json.loads(resolved.read_text(encoding="utf-8"))
