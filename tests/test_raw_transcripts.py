@@ -99,6 +99,14 @@ def test_claude_reparse_keeps_authored_text_and_sidechains_only(store, tmp_path)
                     ),
                 },
             },
+            {
+                "type": "user",
+                "uuid": "user-1",
+                "sessionId": "claude-session",
+                "timestamp": "2026-08-01T10:00:00Z",
+                "cwd": "C:/a/resumed/worktree",
+                "message": {"role": "user", "content": "The user's own declaration."},
+            },
         ],
         incomplete={
             "type": "user",
@@ -118,6 +126,7 @@ def test_claude_reparse_keeps_authored_text_and_sidechains_only(store, tmp_path)
     assert report.reasoning_records_skipped == 1
     assert report.tool_records_skipped == 2
     assert report.sidechain_events == 1
+    assert report.exact_provider_duplicates_skipped == 1
     assert "The user's own declaration." in bodies
     assert "Visible assistant synthesis." in bodies
     assert "Worker-authored synthesis." in bodies
@@ -128,6 +137,40 @@ def test_claude_reparse_keeps_authored_text_and_sidechains_only(store, tmp_path)
     assert "Incomplete final record" not in bodies
     sidechain = next(row for row in rows if row["content"] == "Worker-authored synthesis.")
     assert sidechain["agent_id"] == "claude-worker:claude-session"
+
+
+def test_provider_identity_reuse_with_changed_content_is_versioned(store, tmp_path):
+    transcript = tmp_path / "claude-edited.jsonl"
+    _write_jsonl(
+        transcript,
+        [
+            {
+                "type": "user",
+                "uuid": "reused-id",
+                "sessionId": "edited-session",
+                "timestamp": "2026-08-01T10:00:00Z",
+                "message": {"role": "user", "content": "Original rendering."},
+            },
+            {
+                "type": "user",
+                "uuid": "reused-id",
+                "sessionId": "edited-session",
+                "timestamp": "2026-08-01T10:00:00Z",
+                "message": {"role": "user", "content": "Edited rendering."},
+            },
+        ],
+    )
+    database = _inventory(tmp_path, [(transcript, "claude")])
+
+    report = RawTranscriptImporter(store).import_sources(database)
+    rows = _rows(store)
+
+    assert report.events_inserted == 2
+    assert report.provider_identity_revisions == 1
+    assert {row["content"] for row in rows} == {"Original rendering.", "Edited rendering."}
+    revised = next(row for row in rows if row["content"] == "Edited rendering.")
+    assert ":revision:" in revised["provider_event_id"]
+    assert "provider_identity_reused" in json.loads(revised["metadata"])
 
 
 def test_codex_reparse_preserves_worker_lineage_and_delegation_authority(store, tmp_path):

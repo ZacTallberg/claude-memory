@@ -10,9 +10,11 @@ from typing import Any
 
 from pydantic import BaseModel, Field
 
+from .clock import utc_iso
+from .ids import content_hash
 from .models import Authority, EventKind, IngestEvent, Role
-from .normalize import strip_injected_blocks
-from .store import MemoryStore
+from .normalize import normalize_authored_text, strip_injected_blocks
+from .store import IdentityConflict, MemoryStore
 
 _CODEX_WRAPPER = re.compile(
     r"<(?P<outer>codex_delegation|codex_internal_context)\b[^>]*>.*?"
@@ -44,6 +46,8 @@ class RawImportReport(BaseModel):
     reasoning_records_skipped: int = 0
     tool_records_skipped: int = 0
     non_authored_records_skipped: int = 0
+    exact_provider_duplicates_skipped: int = 0
+    provider_identity_revisions: int = 0
     sidechain_events: int = 0
     provider_counts: dict[str, int] = Field(default_factory=dict)
     failure_types: dict[str, int] = Field(default_factory=dict)
@@ -133,8 +137,10 @@ class RawTranscriptImporter:
                     events = self._parse_claude(path, report)
                 else:
                     events = self._parse_codex(path, report)
-                for start in range(0, len(events), 250):
-                    for result in self.store.ingest_batch(events[start : start + 250]):
+                events = self._deduplicate_provider_events(events, report)
+                pending = self._exclude_existing(events, report)
+                for start in range(0, len(pending), 250):
+                    for result in self.store.ingest_batch(pending[start : start + 250]):
                         report.redactions += result.redaction_count
                         if result.inserted:
                             report.events_inserted += 1
@@ -148,6 +154,72 @@ class RawTranscriptImporter:
         report.provider_counts = dict(sorted(providers.items()))
         report.failure_types = dict(sorted(failures.items()))
         return report
+
+    @staticmethod
+    def _deduplicate_provider_events(
+        events: list[IngestEvent], report: RawImportReport
+    ) -> list[IngestEvent]:
+        """Collapse repeated transcript history and version genuine provider-ID reuse."""
+        seen: dict[tuple[str, str, str, str], set[str]] = {}
+        unique: list[IngestEvent] = []
+        for event in events:
+            identity = (
+                event.provider_event_id or "",
+                event.role.value,
+                event.kind.value,
+                utc_iso(event.occurred_at),
+            )
+            body_hash = content_hash(normalize_authored_text(event.content).text)
+            bodies = seen.setdefault(identity, set())
+            if body_hash in bodies:
+                report.exact_provider_duplicates_skipped += 1
+                continue
+            if bodies:
+                original = event.provider_event_id or "provider-event-missing"
+                metadata = dict(event.metadata)
+                metadata.update(
+                    {
+                        "provider_identity_reused": True,
+                        "original_provider_event_id": event.provider_event_id,
+                    }
+                )
+                event = event.model_copy(
+                    update={
+                        "provider_event_id": f"{original}:revision:{body_hash[:16]}",
+                        "loss_flags": (*event.loss_flags, "provider_identity_reused"),
+                        "metadata": metadata,
+                    }
+                )
+                report.provider_identity_revisions += 1
+            bodies.add(body_hash)
+            unique.append(event)
+        return unique
+
+    def _exclude_existing(
+        self, events: list[IngestEvent], report: RawImportReport
+    ) -> list[IngestEvent]:
+        if not events:
+            return []
+        first = events[0]
+        existing = self.store.source_event_hashes(
+            source_kind=first.source_kind,
+            provider=first.provider,
+            source_locator=first.source_locator,
+        )
+        pending: list[IngestEvent] = []
+        for event in events:
+            body_hash = content_hash(normalize_authored_text(event.content).text)
+            known_hash = existing.get(event.provider_event_id or "")
+            if known_hash == body_hash:
+                report.events_existing += 1
+                continue
+            if known_hash is not None:
+                raise IdentityConflict(
+                    "existing provider event has different canonical content: "
+                    f"{event.provider_event_id}"
+                )
+            pending.append(event)
+        return pending
 
     def _parse_claude(self, path: Path, report: RawImportReport) -> list[IngestEvent]:
         events: list[IngestEvent] = []

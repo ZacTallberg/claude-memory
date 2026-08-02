@@ -923,6 +923,24 @@ class MemoryStore:
                 fact_ids.add(metadata["legacy_fact_id"])
         return chunk_ids, fact_ids
 
+    def source_event_hashes(
+        self,
+        *,
+        source_kind: str,
+        provider: str,
+        source_locator: str,
+    ) -> dict[str, str]:
+        """Return provider identities already committed for one canonical source."""
+        safe_locator, _ = redact_secrets(source_locator)
+        src_id = source_id(source_kind, provider, safe_locator)
+        with self.database.read() as connection:
+            rows = connection.execute(
+                """SELECT provider_event_id,content_sha256 FROM memory_events
+                     WHERE source_id=? AND provider_event_id IS NOT NULL""",
+                (src_id,),
+            ).fetchall()
+        return {row["provider_event_id"]: row["content_sha256"] for row in rows}
+
     @staticmethod
     def _key(value: str) -> str:
         return " ".join(value.casefold().split())
