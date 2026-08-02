@@ -476,50 +476,116 @@ class MemoryStore:
         return generation
 
     def index_event(self, event: str, generation: str) -> str:
+        return self.index_events([event], generation)[0]
+
+    def index_events(self, events: list[str], generation: str) -> list[str]:
+        if not events:
+            return []
+        document_ids: list[str] = []
         with self.database.write() as connection:
             target = connection.execute(
                 "SELECT * FROM search_generations WHERE id=?", (generation,)
             ).fetchone()
             if not target or target["status"] != "building":
                 raise ValueError("event documents can only be added to a building generation")
-            row = connection.execute("SELECT * FROM memory_events WHERE id=?", (event,)).fetchone()
-            if not row:
-                raise ValueError("event does not exist")
-            doc_id = document_id("event", event, row["content_sha256"])
-            title = f"{row['provider']} {row['role']} · {row['occurred_at']}"
-            search_text = self._search_text(title, row["content"], row)
-            connection.execute(
-                """INSERT OR IGNORE INTO search_documents(
+            for event in events:
+                row = connection.execute(
+                    "SELECT * FROM memory_events WHERE id=?", (event,)
+                ).fetchone()
+                if not row:
+                    raise ValueError(f"event does not exist: {event}")
+                doc_id = document_id(generation, "event", event, row["content_sha256"])
+                title = f"{row['provider']} {row['role']} · {row['occurred_at']}"
+                search_text = self._search_text(title, row["content"], row)
+                connection.execute(
+                    """INSERT OR IGNORE INTO search_documents(
                        id,generation_id,memory_type,ref_id,provider,project_id,task_id,session_id,
                        role,authority,occurred_at,title,body,search_text,content_sha256,metadata
                    ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
-                (
-                    doc_id,
-                    generation,
-                    "event",
-                    event,
-                    row["provider"],
-                    row["project_id"],
-                    row["task_id"],
-                    row["session_id"],
-                    row["role"],
-                    row["authority"],
-                    row["occurred_at"],
-                    title,
-                    row["content"],
-                    search_text,
-                    row["content_sha256"],
-                    row["metadata"],
-                ),
-            )
-            if target["embedding_manifest_json"]:
-                connection.execute(
-                    """INSERT OR IGNORE INTO embedding_queue(
+                    (
+                        doc_id,
+                        generation,
+                        "event",
+                        event,
+                        row["provider"],
+                        row["project_id"],
+                        row["task_id"],
+                        row["session_id"],
+                        row["role"],
+                        row["authority"],
+                        row["occurred_at"],
+                        title,
+                        row["content"],
+                        search_text,
+                        row["content_sha256"],
+                        row["metadata"],
+                    ),
+                )
+                if target["embedding_manifest_json"]:
+                    connection.execute(
+                        """INSERT OR IGNORE INTO embedding_queue(
                            document_id,generation_id,priority,attempts,available_at
                        ) VALUES (?,?,100,0,?)""",
-                    (doc_id, generation, utc_iso()),
-                )
-        return doc_id
+                        (doc_id, generation, utc_iso()),
+                    )
+                document_ids.append(doc_id)
+        return document_ids
+
+    def event_corpus_sha256(self) -> str:
+        """Hash every field that changes an event's searchable rendering or ranking facets."""
+        with self.database.read() as connection:
+            return self._event_corpus_sha256(connection)
+
+    @staticmethod
+    def _event_corpus_sha256(connection: sqlite3.Connection) -> str:
+        digest = hashlib.sha256(b"system-memory:event-corpus:v1\n")
+        rows = connection.execute(
+            """SELECT id,provider,project_id,task_id,session_id,role,authority,occurred_at,
+                      content_sha256,metadata
+                 FROM memory_events ORDER BY id"""
+        )
+        for row in rows:
+            payload = dict(row)
+            digest.update(
+                json.dumps(
+                    payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+                ).encode("utf-8")
+            )
+            digest.update(b"\n")
+        return digest.hexdigest()
+
+    def index_all_events(
+        self,
+        generation: str,
+        *,
+        batch_size: int = 1_000,
+        on_progress=None,
+    ) -> int:
+        """Populate a building generation in bounded, restart-safe transactions."""
+        batch_size = max(1, min(batch_size, 5_000))
+        indexed = 0
+        cursor = ""
+        while True:
+            with self.database.read() as connection:
+                rows = connection.execute(
+                    """SELECT e.id
+                         FROM memory_events e
+                         LEFT JOIN search_documents d
+                           ON d.generation_id=? AND d.memory_type='event'
+                          AND d.ref_id=e.id AND d.content_sha256=e.content_sha256
+                         WHERE e.id>? AND d.id IS NULL
+                         ORDER BY e.id LIMIT ?""",
+                    (generation, cursor, batch_size),
+                ).fetchall()
+            if not rows:
+                break
+            event_ids = [row["id"] for row in rows]
+            self.index_events(event_ids, generation)
+            indexed += len(event_ids)
+            cursor = event_ids[-1]
+            if on_progress:
+                on_progress(indexed)
+        return indexed
 
     def embedding_manifest(self, generation: str) -> EmbeddingManifest | None:
         with self.database.read() as connection:
@@ -626,48 +692,77 @@ class MemoryStore:
             )
         return {"documents": documents, "vectors": vectors, "pending": pending}
 
-    def activate_generation(self, generation: str) -> None:
+    def activate_generation(
+        self, generation: str, *, expected_event_corpus_sha256: str | None = None
+    ) -> None:
+        failure: str | None = None
         with self.database.write() as connection:
             row = connection.execute(
-                "SELECT status,embedding_manifest_json FROM search_generations WHERE id=?",
+                """SELECT status,embedding_manifest_json,corpus_sha256
+                     FROM search_generations WHERE id=?""",
                 (generation,),
             ).fetchone()
             if not row or row["status"] not in ("building", "active"):
                 raise ValueError("generation is not activatable")
-            count = int(
+            if expected_event_corpus_sha256:
+                actual_corpus = self._event_corpus_sha256(connection)
+                if (
+                    row["corpus_sha256"] != expected_event_corpus_sha256
+                    or actual_corpus != expected_event_corpus_sha256
+                ):
+                    connection.execute(
+                        "UPDATE search_generations SET status='failed' WHERE id=?",
+                        (generation,),
+                    )
+                    failure = (
+                        "event corpus changed while the generation was building; "
+                        "the incomplete generation was not activated"
+                    )
+            if not failure:
+                self._activate_generation_in_transaction(connection, generation, row)
+        if failure:
+            raise ValueError(failure)
+
+    @staticmethod
+    def _activate_generation_in_transaction(
+        connection: sqlite3.Connection,
+        generation: str,
+        row: sqlite3.Row,
+    ) -> None:
+        count = int(
+            connection.execute(
+                "SELECT COUNT(*) FROM search_documents WHERE generation_id=?", (generation,)
+            ).fetchone()[0]
+        )
+        if count == 0:
+            raise ValueError("cannot activate an empty search generation")
+        manifest = row["embedding_manifest_json"]
+        if manifest:
+            vectors = int(
                 connection.execute(
-                    "SELECT COUNT(*) FROM search_documents WHERE generation_id=?", (generation,)
+                    "SELECT COUNT(*) FROM embedding_vectors WHERE generation_id=?",
+                    (generation,),
                 ).fetchone()[0]
             )
-            if count == 0:
-                raise ValueError("cannot activate an empty search generation")
-            manifest = row["embedding_manifest_json"]
-            if manifest:
-                vectors = int(
-                    connection.execute(
-                        "SELECT COUNT(*) FROM embedding_vectors WHERE generation_id=?",
-                        (generation,),
-                    ).fetchone()[0]
-                )
-                pending = int(
-                    connection.execute(
-                        "SELECT COUNT(*) FROM embedding_queue WHERE generation_id=?",
-                        (generation,),
-                    ).fetchone()[0]
-                )
-                if vectors != count or pending:
-                    raise ValueError(
-                        "cannot activate an incomplete embedding generation: "
-                        f"documents={count} vectors={vectors} pending={pending}"
-                    )
-            connection.execute(
-                "UPDATE search_generations SET status='retired' WHERE status='active' AND id<>?",
-                (generation,),
+            pending = int(
+                connection.execute(
+                    "SELECT COUNT(*) FROM embedding_queue WHERE generation_id=?",
+                    (generation,),
+                ).fetchone()[0]
             )
-            connection.execute(
-                "UPDATE search_generations SET status='active',activated_at=? WHERE id=?",
-                (utc_iso(), generation),
-            )
+            if vectors != count or pending:
+                raise ValueError(
+                    "cannot activate an incomplete embedding generation: "
+                    f"documents={count} vectors={vectors} pending={pending}"
+                )
+        connection.execute(
+            "UPDATE search_generations SET status='retired' WHERE status='active' AND id<>?",
+            (generation,),
+        )
+        connection.execute(
+            "UPDATE search_generations SET status='active',activated_at=? WHERE id=?",
+            (utc_iso(), generation),
+        )
 
     def lexical_search(
         self,

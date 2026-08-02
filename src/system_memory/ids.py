@@ -56,5 +56,6 @@ def event_id(
     return stable_id("evt", provider, source, identity, role, kind, occurred_at)
 
 
-def document_id(memory_type: str, ref_id: str, rendering_hash: str) -> str:
-    return stable_id("doc", memory_type, ref_id, rendering_hash)
+def document_id(generation_id: str, memory_type: str, ref_id: str, rendering_hash: str) -> str:
+    """Identify one immutable rendering inside one independently replaceable index."""
+    return stable_id("doc", generation_id, memory_type, ref_id, rendering_hash)

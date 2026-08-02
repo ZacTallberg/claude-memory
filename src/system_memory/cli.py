@@ -134,6 +134,46 @@ def command_import_raw(args: argparse.Namespace) -> int:
     return 0
 
 
+def command_build_lexical(args: argparse.Namespace) -> int:
+    settings = _settings(args)
+    memory = _store(settings)
+    corpus_sha256 = memory.event_corpus_sha256()
+    generation = memory.create_search_generation(
+        corpus_sha256=corpus_sha256,
+        chunker_version="event-v1",
+        lexical_config={"tokenizer": "unicode61 remove_diacritics 2"},
+        code_revision=args.code_revision,
+        lock_sha256=args.lock_sha256,
+    )
+
+    def progress(indexed: int) -> None:
+        print(
+            json.dumps({"progress": True, "generation_id": generation, "indexed": indexed}),
+            file=sys.stderr,
+            flush=True,
+        )
+
+    indexed = memory.index_all_events(
+        generation,
+        batch_size=args.batch_size,
+        on_progress=progress,
+    )
+    memory.activate_generation(generation, expected_event_corpus_sha256=corpus_sha256)
+    status = memory.embedding_status(generation)
+    print(
+        json.dumps(
+            {
+                "generation_id": generation,
+                "corpus_sha256": corpus_sha256,
+                "indexed_now": indexed,
+                **status,
+            },
+            indent=2,
+        )
+    )
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="system-memory")
     parser.add_argument("--root", help="installation root (defaults to current directory)")
@@ -165,6 +205,14 @@ def build_parser() -> argparse.ArgumentParser:
     )
     raw_importer.add_argument("database")
     raw_importer.set_defaults(handler=command_import_raw)
+
+    lexical = subparsers.add_parser(
+        "build-lexical", help="build and atomically activate a lexical event index generation"
+    )
+    lexical.add_argument("--batch-size", type=int, default=1_000)
+    lexical.add_argument("--code-revision")
+    lexical.add_argument("--lock-sha256")
+    lexical.set_defaults(handler=command_build_lexical)
     return parser
 
 
