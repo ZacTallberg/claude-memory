@@ -4,6 +4,7 @@ import hashlib
 import json
 import re
 import sqlite3
+import time
 from dataclasses import dataclass
 from datetime import datetime
 from typing import Any
@@ -290,42 +291,73 @@ class MemoryStore:
             content_sha256=prepared.body_hash,
         )
 
-    def backfill_archive_references(self) -> int:
+    def backfill_archive_references(self, *, batch_size: int = 250) -> int:
         """Replace legacy machine-specific archive paths with portable validated refs."""
-        with self.database.read() as connection:
-            rows = connection.execute(
-                """SELECT id,source_id,content_sha256,metadata
-                     FROM memory_events WHERE archive_ref IS NULL ORDER BY id"""
-            ).fetchall()
-        prepared: list[tuple[str, str, str, dict[str, Any]]] = []
-        for row in rows:
-            metadata = json.loads(row["metadata"] or "{}")
-            supplied = metadata.get("archive_ref") or metadata.get("archive_path")
-            if not supplied:
-                raise EvidenceError(f"event has no archive reference: {row['id']}")
-            resolved = self.archive.resolve_reference(supplied)
-            if not self.archive.verify_event(resolved, row["id"], row["content_sha256"]):
-                raise EvidenceError(f"event archive failed verification: {row['id']}")
-            reference = self.archive.reference(resolved)
-            metadata.pop("archive_path", None)
-            metadata["archive_ref"] = reference
-            prepared.append((reference, row["id"], row["source_id"], metadata))
-        if not prepared:
-            return 0
-        latest_by_source: dict[str, str] = {}
-        with self.database.write() as connection:
-            for reference, event, source, metadata in prepared:
-                connection.execute(
-                    "UPDATE memory_events SET archive_ref=?,metadata=? WHERE id=?",
-                    (reference, json.dumps(metadata, ensure_ascii=False, sort_keys=True), event),
+        batch_size = max(1, min(batch_size, 2_000))
+        repaired = 0
+        while True:
+            with self.database.read() as connection:
+                rows = connection.execute(
+                    """SELECT id,source_id,content_sha256,metadata
+                         FROM memory_events WHERE archive_ref IS NULL ORDER BY id LIMIT ?""",
+                    (batch_size,),
+                ).fetchall()
+            if not rows:
+                return repaired
+            prepared: list[tuple[str, str, str, dict[str, Any]]] = []
+            for row in rows:
+                metadata = json.loads(row["metadata"] or "{}")
+                supplied = metadata.get("archive_ref") or metadata.get("archive_path")
+                if not supplied:
+                    raise EvidenceError(f"event has no archive reference: {row['id']}")
+                reference = self._verified_archive_reference(
+                    supplied, row["id"], row["content_sha256"]
                 )
-                latest_by_source[source] = reference
-            for source, reference in latest_by_source.items():
-                connection.execute(
-                    "UPDATE sources SET metadata=? WHERE id=?",
-                    (json.dumps({"latest_archive_ref": reference}, sort_keys=True), source),
-                )
-        return len(prepared)
+                metadata.pop("archive_path", None)
+                metadata["archive_ref"] = reference
+                prepared.append((reference, row["id"], row["source_id"], metadata))
+            latest_by_source: dict[str, str] = {}
+            with self.database.write() as connection:
+                for reference, event, source, metadata in prepared:
+                    connection.execute(
+                        "UPDATE memory_events SET archive_ref=?,metadata=? WHERE id=?",
+                        (
+                            reference,
+                            json.dumps(metadata, ensure_ascii=False, sort_keys=True),
+                            event,
+                        ),
+                    )
+                    latest_by_source[source] = reference
+                for source, reference in latest_by_source.items():
+                    connection.execute(
+                        "UPDATE sources SET metadata=? WHERE id=?",
+                        (
+                            json.dumps({"latest_archive_ref": reference}, sort_keys=True),
+                            source,
+                        ),
+                    )
+            repaired += len(prepared)
+
+    def _verified_archive_reference(
+        self,
+        supplied: str,
+        event_id_value: str,
+        content_sha256: str,
+        *,
+        attempts: int = 5,
+    ) -> str:
+        last_error: OSError | None = None
+        for attempt in range(attempts):
+            try:
+                resolved = self.archive.resolve_reference(supplied)
+                if self.archive.verify_event(resolved, event_id_value, content_sha256):
+                    return self.archive.reference(resolved)
+            except OSError as error:
+                last_error = error
+            if attempt + 1 < attempts:
+                time.sleep(0.05 * (2**attempt))
+        detail = f" after transient I/O retries ({type(last_error).__name__})" if last_error else ""
+        raise EvidenceError(f"event archive failed verification: {event_id_value}{detail}")
 
     def close_episode(self, episode: str, *, ended_at: datetime | None = None) -> bool:
         with self.database.write() as connection:
