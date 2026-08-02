@@ -10,8 +10,10 @@ from .api import create_app
 from .archive import CanonicalArchive
 from .auth import CredentialStore
 from .database import Database
+from .evaluation import load_cases, run_evaluation, validate_gold64, write_schema
 from .legacy_v1 import LegacyV1Importer
 from .raw_transcripts import RawTranscriptImporter
+from .recall import RecallEngine
 from .settings import Settings
 from .store import MemoryStore
 
@@ -174,6 +176,30 @@ def command_build_lexical(args: argparse.Namespace) -> int:
     return 0
 
 
+def command_evaluate(args: argparse.Namespace) -> int:
+    settings = _settings(args)
+    memory = _store(settings)
+    cases = load_cases(Path(args.cases))
+    if args.validate_gold64:
+        validate_gold64(cases)
+    selected = [case for case in cases if case.split == args.split]
+    if args.split == "test" and not args.allow_sealed:
+        raise ValueError("sealed test cases require --allow-sealed")
+    if not selected:
+        raise ValueError(f"case file contains no {args.split} cases")
+    summary = run_evaluation(RecallEngine(memory), selected)
+    print(summary.model_dump_json(indent=2))
+    return 0
+
+
+def command_eval_schema(args: argparse.Namespace) -> int:
+    output = Path(args.output).resolve()
+    output.parent.mkdir(parents=True, exist_ok=True)
+    write_schema(output)
+    print(json.dumps({"ok": True, "schema": str(output)}))
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="system-memory")
     parser.add_argument("--root", help="installation root (defaults to current directory)")
@@ -213,6 +239,19 @@ def build_parser() -> argparse.ArgumentParser:
     lexical.add_argument("--code-revision")
     lexical.add_argument("--lock-sha256")
     lexical.set_defaults(handler=command_build_lexical)
+
+    evaluate = subparsers.add_parser(
+        "evaluate", help="run evidence-group retrieval evaluation against an active generation"
+    )
+    evaluate.add_argument("cases")
+    evaluate.add_argument("--split", choices=("dev", "test"), default="dev")
+    evaluate.add_argument("--allow-sealed", action="store_true")
+    evaluate.add_argument("--validate-gold64", action="store_true")
+    evaluate.set_defaults(handler=command_evaluate)
+
+    schema = subparsers.add_parser("eval-schema", help="write the evaluation case JSON schema")
+    schema.add_argument("output")
+    schema.set_defaults(handler=command_eval_schema)
     return parser
 
 
