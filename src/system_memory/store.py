@@ -16,6 +16,7 @@ from .database import Database
 from .ids import content_hash, document_id, episode_id, event_id, source_id, stable_id
 from .models import ClaimOperation, ClaimProposal, EmbeddingManifest, IngestEvent, IngestResult
 from .normalize import NORMALIZER_VERSION, normalize_authored_text
+from .security import redact_secrets, sanitize_structure
 
 
 class IdentityConflict(RuntimeError):
@@ -66,8 +67,14 @@ class MemoryStore:
         if normalized.dropped:
             raise ValueError("event contains no memory-eligible authored content")
 
+        safe_locator, locator_findings = redact_secrets(incoming.source_locator)
+        safe_metadata, metadata_findings = sanitize_structure(incoming.metadata)
+        safe_worktree, worktree_findings = redact_secrets(incoming.worktree or "")
+        all_findings = (
+            normalized.secret_findings + locator_findings + metadata_findings + worktree_findings
+        )
         body_hash = content_hash(normalized.text)
-        src_id = source_id(incoming.source_kind, incoming.provider, incoming.source_locator)
+        src_id = source_id(incoming.source_kind, incoming.provider, safe_locator)
         ep_id = episode_id(
             incoming.provider,
             incoming.agent_id,
@@ -106,12 +113,12 @@ class MemoryStore:
             "content_sha256": body_hash,
             "normalizer_version": NORMALIZER_VERSION,
             "loss_flags": list(incoming.loss_flags),
-            "metadata": incoming.metadata,
+            "metadata": safe_metadata,
         }
         # Archive first. A crash can leave an unreferenced immutable blob, but can never
         # commit a canonical event whose archive payload does not already exist.
         archive_path = self.archive.put_event(evt_id, archive_payload)
-        metadata = dict(incoming.metadata)
+        metadata = dict(safe_metadata)
         metadata["archive_path"] = str(archive_path)
 
         inserted = False
@@ -131,8 +138,8 @@ class MemoryStore:
                     src_id,
                     incoming.source_kind,
                     incoming.provider,
-                    incoming.source_locator,
-                    content_hash(incoming.source_locator),
+                    safe_locator,
+                    content_hash(safe_locator),
                     None,
                     incoming.source_offset_end or 0,
                     json.dumps(incoming.loss_flags),
@@ -193,7 +200,7 @@ class MemoryStore:
                         incoming.project_id,
                         incoming.task_id,
                         incoming.hub_instance_id,
-                        incoming.worktree,
+                        safe_worktree or None,
                         incoming.commit_sha,
                         incoming.role.value,
                         incoming.authority.value,
@@ -212,7 +219,7 @@ class MemoryStore:
                     ),
                 )
                 inserted = True
-            for finding in normalized.secret_findings:
+            for finding in all_findings:
                 connection.execute(
                     """INSERT OR IGNORE INTO secret_tombstones(
                            fingerprint,kind,source_id,created_at,reason
@@ -225,7 +232,7 @@ class MemoryStore:
             source_id=src_id,
             episode_id=ep_id,
             inserted=inserted,
-            redaction_count=len(normalized.secret_findings),
+            redaction_count=len(all_findings),
             content_sha256=body_hash,
         )
 

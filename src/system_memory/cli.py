@@ -10,6 +10,7 @@ from .api import create_app
 from .archive import CanonicalArchive
 from .auth import CredentialStore
 from .database import Database
+from .legacy_v1 import LegacyV1Importer
 from .settings import Settings
 from .store import MemoryStore
 
@@ -94,6 +95,35 @@ def command_serve(args: argparse.Namespace) -> int:
     return 0
 
 
+def command_import_v1(args: argparse.Namespace) -> int:
+    settings = _settings(args)
+    memory = _store(settings)
+
+    def progress(report):
+        print(
+            json.dumps(
+                {
+                    "progress": True,
+                    "chunk_rows_seen": report.chunk_rows_seen,
+                    "inserted": report.chunk_events_inserted,
+                    "duplicates": report.exact_duplicates_skipped,
+                }
+            ),
+            file=sys.stderr,
+            flush=True,
+        )
+
+    report = LegacyV1Importer(memory).import_database(
+        Path(args.database),
+        only_missing_sources=args.only_missing_sources,
+        include_facts=not args.skip_facts,
+        progress_every=args.progress_every,
+        on_progress=progress,
+    )
+    print(report.model_dump_json(indent=2))
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="system-memory")
     parser.add_argument("--root", help="installation root (defaults to current directory)")
@@ -108,6 +138,15 @@ def build_parser() -> argparse.ArgumentParser:
     serve = subparsers.add_parser("serve", help="run the authenticated loopback API")
     serve.add_argument("--port", type=int, default=None)
     serve.set_defaults(handler=command_serve)
+
+    importer = subparsers.add_parser(
+        "import-v1", help="import a stabilized claude-memory SQLite snapshot"
+    )
+    importer.add_argument("database")
+    importer.add_argument("--only-missing-sources", action="store_true")
+    importer.add_argument("--skip-facts", action="store_true")
+    importer.add_argument("--progress-every", type=int, default=1_000)
+    importer.set_defaults(handler=command_import_v1)
     return parser
 
 

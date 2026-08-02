@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import re
 from dataclasses import dataclass
+from typing import Any
 
 
 @dataclass(frozen=True)
@@ -96,3 +97,28 @@ def redact_secrets(text: str) -> tuple[str, tuple[SecretFinding, ...]]:
     for index, marker in enumerate(markers):
         value = value.replace(f"\ue000{index}\ue001", marker)
     return value, tuple(findings)
+
+
+def sanitize_structure(value: Any) -> tuple[Any, tuple[SecretFinding, ...]]:
+    """Recursively redact strings in JSON-compatible provenance and metadata."""
+    if isinstance(value, str):
+        return redact_secrets(value)
+    if isinstance(value, list | tuple):
+        safe_items = []
+        findings: list[SecretFinding] = []
+        for item in value:
+            safe, found = sanitize_structure(item)
+            safe_items.append(safe)
+            findings.extend(found)
+        return safe_items, tuple(findings)
+    if isinstance(value, dict):
+        safe_mapping = {}
+        findings = []
+        for key, item in value.items():
+            safe_key, key_findings = redact_secrets(str(key))
+            safe_value, value_findings = sanitize_structure(item)
+            safe_mapping[safe_key] = safe_value
+            findings.extend(key_findings)
+            findings.extend(value_findings)
+        return safe_mapping, tuple(findings)
+    return value, ()

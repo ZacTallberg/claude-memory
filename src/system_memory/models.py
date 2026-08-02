@@ -15,6 +15,7 @@ class Role(StrEnum):
 
 
 class Authority(StrEnum):
+    USER_AUTHORED = "user_authored"
     USER_DECLARATION = "user_declaration"
     USER_BEHAVIOR = "user_behavior"
     EXPLICIT_DECISION = "explicit_decision"

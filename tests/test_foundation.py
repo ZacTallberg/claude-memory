@@ -91,6 +91,27 @@ def test_secrets_are_redacted_in_database_and_archive(store):
     assert tombstones == 1
 
 
+def test_secrets_are_also_redacted_from_provenance_metadata(store):
+    synthetic = "github_pat_" + "Z9y8" * 8
+    event = make_event().model_copy(
+        update={
+            "source_locator": f"https://example.invalid/?access_token={synthetic}",
+            "metadata": {"diagnostic": f"password: {synthetic}"},
+        }
+    )
+    result = store.ingest(event)
+    with store.database.read() as connection:
+        source = connection.execute(
+            "SELECT locator FROM sources WHERE id=?", (result.source_id,)
+        ).fetchone()[0]
+        metadata = connection.execute(
+            "SELECT metadata FROM memory_events WHERE id=?", (result.event_id,)
+        ).fetchone()[0]
+    assert synthetic not in source
+    assert synthetic not in metadata
+    assert result.redaction_count >= 2
+
+
 def test_database_reports_full_durability_and_integrity(store):
     health = store.database.health()
     assert health["ok"] is True
