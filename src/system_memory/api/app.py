@@ -183,14 +183,24 @@ def create_app(
         incoming: IngestEvent,
         actor: Credential = authenticated_actor,
     ) -> IngestResult:
-        if actor.permits("ingest:any") or (
-            actor.permits("ingest:self") and actor.actor_id == incoming.agent_id
-        ):
-            pass
-        else:
+        own_identity = actor.actor_id == incoming.agent_id
+        user_authority = incoming.role.value == "user" or incoming.authority.value in {
+            "user_authored",
+            "user_declaration",
+            "user_behavior",
+        }
+        explicit_decision = incoming.authority.value == "explicit_decision"
+        allowed = actor.permits("ingest:any")
+        if own_identity and user_authority:
+            allowed = allowed or actor.permits("ingest:user-authored")
+        elif own_identity and explicit_decision:
+            allowed = allowed or actor.permits("ingest:decision")
+        elif own_identity:
+            allowed = allowed or actor.permits("ingest:self")
+        if not allowed:
             raise HTTPException(
                 status_code=status.HTTP_403_FORBIDDEN,
-                detail="credential cannot ingest for the asserted agent identity",
+                detail="credential cannot ingest the asserted identity or authority",
             )
         return context.store.ingest(incoming)
 

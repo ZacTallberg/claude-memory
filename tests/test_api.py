@@ -4,6 +4,7 @@ from fastapi.testclient import TestClient
 
 from system_memory.api import create_app
 from system_memory.auth import CredentialStore
+from system_memory.models import Authority, Role
 from system_memory.settings import Settings
 
 from .conftest import make_event
@@ -41,12 +42,15 @@ def test_liveness_is_public_but_private_routes_require_credentials(store, tmp_pa
 
 def test_ingest_identity_is_bound_to_credential(store, tmp_path):
     client, admin, worker = client_and_tokens(store, tmp_path)
-    own = client.post(
-        "/v1/events", headers=bearer(worker), json=make_event().model_dump(mode="json")
+    own_event = make_event().model_copy(
+        update={"role": Role.ASSISTANT, "authority": Authority.ASSISTANT_SYNTHESIS}
     )
+    own = client.post("/v1/events", headers=bearer(worker), json=own_event.model_dump(mode="json"))
     assert own.status_code == 200
 
-    impersonated = make_event(event_key="impostor").model_copy(update={"agent_id": "claude-main"})
+    impersonated = own_event.model_copy(
+        update={"provider_event_id": "impostor", "agent_id": "claude-main"}
+    )
     denied = client.post(
         "/v1/events",
         headers=bearer(worker),
@@ -58,6 +62,26 @@ def test_ingest_identity_is_bound_to_credential(store, tmp_path):
         "/v1/events",
         headers=bearer(admin),
         json=impersonated.model_dump(mode="json"),
+    )
+    assert allowed.status_code == 200
+
+
+def test_provider_credential_cannot_assert_user_authority_without_hook_scope(store, tmp_path):
+    client, _, worker = client_and_tokens(store, tmp_path)
+    user_event = make_event(event_key="forged-user-authority")
+    denied = client.post(
+        "/v1/events", headers=bearer(worker), json=user_event.model_dump(mode="json")
+    )
+    assert denied.status_code == 403
+
+    credentials = CredentialStore(store.database)
+    _, hook = credentials.create(
+        actor_id="codex-main",
+        label="trusted prompt hook",
+        scopes={"ingest:user-authored"},
+    )
+    allowed = client.post(
+        "/v1/events", headers=bearer(hook), json=user_event.model_dump(mode="json")
     )
     assert allowed.status_code == 200
 

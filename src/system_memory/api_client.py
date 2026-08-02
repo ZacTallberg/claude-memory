@@ -1,6 +1,9 @@
 from __future__ import annotations
 
+import hashlib
+import json
 import os
+from contextlib import suppress
 from datetime import datetime
 from pathlib import Path
 from urllib.parse import urlparse
@@ -119,6 +122,59 @@ class MemoryApiClient:
                 "metadata": {"adapter": "mcp", "explicit_checkpoint": True},
             },
         )
+
+    def record_user_prompt(
+        self,
+        *,
+        content: str,
+        session_id: str,
+        provider_event_id: str,
+        source_locator: str,
+        project_id: str | None = None,
+        occurred_at: datetime | None = None,
+        cwd: str | None = None,
+    ) -> dict:
+        return self._request(
+            "POST",
+            "/v1/events",
+            json={
+                "provider": self.provider,
+                "source_kind": "provider-user-prompt-hook",
+                "source_locator": source_locator,
+                "provider_event_id": provider_event_id,
+                "agent_id": self.agent_id,
+                "session_id": session_id,
+                "project_id": project_id,
+                "worktree": cwd,
+                "role": "user",
+                "authority": "user_authored",
+                "kind": "message",
+                "occurred_at": utc_iso(occurred_at),
+                "content": content,
+                "visibility": "private",
+                "trust": "authored",
+                "metadata": {"adapter": "user-prompt-hook"},
+            },
+        )
+
+    @staticmethod
+    def prompt_event_id(
+        *, session_id: str, prompt: str, turn_id: str | None, transcript_path: str | None
+    ) -> str:
+        if turn_id:
+            return f"turn:{turn_id}:user-prompt"
+        source_size: int | None = None
+        if transcript_path:
+            with suppress(OSError):
+                source_size = Path(transcript_path).stat().st_size
+        digest = hashlib.sha256(
+            json.dumps(
+                [session_id, transcript_path, source_size, prompt],
+                ensure_ascii=False,
+                separators=(",", ":"),
+            ).encode("utf-8")
+        ).hexdigest()
+        return f"prompt:{digest}"
 
     def _request(self, method: str, path: str, **kwargs) -> dict:
         token = self._token()
