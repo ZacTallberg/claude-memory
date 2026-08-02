@@ -36,7 +36,8 @@ a recovery source until V2 has passed its sealed gates and a restore rehearsal.
 - Compare v1 and v2 recall receipts without injecting both into prompts.
 - Canary one provider/session at a time.
 - Confirm global cross-project recall and exact project attribution.
-- Confirm each project hub remains authoritative and independent.
+- Confirm each project hub remains authoritative and independent while conforming to
+  the canonical `C:\code\game` hub adapter protocol.
 
 ## Stage 5: atomic cutover
 
@@ -52,7 +53,8 @@ a recovery source until V2 has passed its sealed gates and a restore rehearsal.
 
 - After the rollback window and a second restore rehearsal, archive the sanitized v1
   snapshot off-device.
+- Upgrade older project hubs to the canonical `game` hub runtime without combining
+  their stores.
 - Remove v1 runtime hooks, obsolete supervisors, polling mailboxes, and unused
   Postgres/ParadeDB configuration.
 - Retain migration manifests and audit receipts, not a noisy user-facing task archive.
-

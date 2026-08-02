@@ -12,6 +12,8 @@ remains the recovery source until the release gates in `docs/RELEASE-GATES.md` p
 - Memory is global by default. Project and task identity are ranking facets, never
   mandatory silos.
 - A project hub owns current tasks, leases, priorities, progress, and worker state.
+  `C:\code\game` is the canonical hub carry-forward; other project hubs upgrade to
+  its protocol and runtime without merging their stores.
 - Git and artifact stores own code and deliverables.
 - Provider sessions own only temporary working state.
 - The memory service stores durable episodes, claims, procedures, core memory, and
@@ -28,4 +30,3 @@ See:
 - `docs/ARCHITECTURE.md`
 - `docs/RELEASE-GATES.md`
 - `docs/MIGRATION.md`
-

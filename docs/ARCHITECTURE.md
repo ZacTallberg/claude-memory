@@ -13,9 +13,10 @@ worktrees, and projects. Project identity is retained as provenance and can boos
 query, but global recall is the default.
 
 Hubs remain project-specific. Each project hub owns its own current task graph,
-priority order, leases, checkpoints, worker presence, and decisions. The common hub
-code will be extracted into a reusable engine, but neither its runtime store nor its
-user experience becomes global.
+priority order, leases, checkpoints, worker presence, and decisions. `C:\code\game`
+is the canonical carry-forward implementation. Other hubs will be upgraded to its
+versioned protocol and runtime; their stores and project experiences do not become
+global, and no fourth hub engine will be created.
 
 ```text
 Claude sessions ----\
@@ -287,15 +288,16 @@ OpenTelemetry correlation follows a request through hook, context compilation,
 retrieval, hub lookup, MCP response, and late work. Logs and metrics are bounded and
 never contain prompt bodies or secrets by default.
 
-## 10. Reusable project-hub engine
+## 10. Canonical project-hub implementation
 
-The hub work is a separate package and release track. It removes copied engine code
-without merging project experiences or databases. Each project pins an engine version
-and supplies project-specific schema extensions, navigation, styling, verifier
-registry, deployment profile, and memory adapter configuration.
+The `game` hub is the canonical implementation and release track. It removes copied
+engine drift by supplying the versioned runtime and protocol that every project hub
+adopts, without merging project experiences or databases. Each project pins a `game`
+hub engine/protocol version and supplies project-specific schema extensions,
+navigation, styling, verifier registry, deployment profile, and memory adapter
+configuration.
 
-The engine guarantees transactional events/outbox, literal status semantics, atomic
+The canonical `game` engine guarantees transactional events/outbox, literal status semantics, atomic
 claim/lease/fencing, idempotency, authenticated actor identity, cursor-based live
 streams, and responsive projections. Project hubs remain free to present entirely
 different products.
-
