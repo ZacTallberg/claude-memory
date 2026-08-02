@@ -8,6 +8,7 @@ Two tiers:
 from __future__ import annotations
 
 import math
+import re
 from collections import defaultdict
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -64,16 +65,19 @@ class Retriever:
 
     def search(self, query: str, *, tier: str = "full", exclude_session: str | None = None,
                k: int | None = None, do_rerank: bool | None = None,
-               qvec: list[float] | None = None) -> list[Result]:
+               qvec: list[float] | None = None, use_bm25: bool = True,
+               use_vector: bool = True) -> list[Result]:
         if not query or not query.strip():
             return []
         rc = self.cfg.recall
         k = k or rc.top_k
-        bm25 = self.store.search_bm25(query, rc.bm25_k, exclude_session=exclude_session)
+        bm25 = (self.store.search_bm25(query, rc.bm25_k, exclude_session=exclude_session)
+                if use_bm25 else [])
 
-        if qvec is None:
+        if qvec is None and use_vector:
             qvec = self.embed_query(query)
-        vec = self.store.search_vector(qvec, rc.vector_k, exclude_session=exclude_session) if qvec else []
+        vec = (self.store.search_vector(qvec, rc.vector_k, exclude_session=exclude_session)
+               if use_vector and qvec else [])
 
         fused = self._rrf([bm25, vec])
         if not fused:
@@ -139,4 +143,16 @@ class Retriever:
         k = k or self.cfg.recall.facts_k
         if qvec is None:
             qvec = self.embed_query(query)
-        return self.store.search_facts(query, k, qvec=qvec)[:k]
+        candidates = self.store.search_facts(query, max(k * 3, 12), qvec=qvec)
+        out: list[Fact] = []
+        seen: set[str] = set()
+        for fact in candidates:
+            key = " ".join(re.findall(r"[a-z0-9]+", (fact.name or fact.title).lower()))
+            if key and key in seen:
+                continue
+            if key:
+                seen.add(key)
+            out.append(fact)
+            if len(out) >= k:
+                break
+        return out

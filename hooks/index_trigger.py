@@ -5,7 +5,7 @@ import os
 import subprocess
 import sys
 
-from _common import read_event, run_failsafe
+from _common import call_server, read_event, run_failsafe
 
 
 def main() -> None:
@@ -17,6 +17,15 @@ def main() -> None:
     if killed():
         return
     if not in_scope(ev.get("cwd"), cfg):
+        return
+
+    # Keep indexing inside the singleton warm process so a session ending cannot load a second
+    # ONNX model and contend with prompt recall. The endpoint is non-blocking and deduplicates
+    # overlapping requests. Retain the detached CLI path only as disaster recovery.
+    warm = call_server("/api/index", {"full": False, "promote": True,
+                                      "reason": ev.get("hook_event_name") or "lifecycle"},
+                       timeout=2.0)
+    if warm is not None:
         return
 
     flags = 0

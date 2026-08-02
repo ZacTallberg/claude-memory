@@ -67,7 +67,10 @@ def _ensure_server(cfg) -> None:
     except Exception:
         pass
 
-    url = f"http://{cfg.server.host}:{cfg.server.port}/healthz"
+    # Session-start recovery is a liveness decision. /healthz also checks readiness and may
+    # be slow while the shared writer is legitimately indexing; spawning a replacement then
+    # can destroy useful work.
+    url = f"http://{cfg.server.host}:{cfg.server.port}/livez"
     try:
         with urllib.request.urlopen(url, timeout=_HEALTH_TIMEOUT_S) as r:
             if r.status == 200 and supervisor_alive:

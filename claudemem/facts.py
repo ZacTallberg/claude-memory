@@ -7,6 +7,7 @@ from pathlib import Path
 from .config import Config
 from .log import get_logger
 from .paths import iter_note_files
+from .security import redact_secrets
 from .text import (collapse_ws, extract_wikilinks, normalize_note_type,
                    note_origin_session, parse_frontmatter)
 
@@ -58,11 +59,11 @@ def load_note(path: Path, project: str) -> NoteData | None:
         project=project,
         name=str(meta.get("name") or path.stem),
         title=_title_from(meta, path.name),
-        description=collapse_ws(str(meta.get("description", ""))),
+        description=collapse_ws(redact_secrets(str(meta.get("description", "")))[0]),
         type=normalize_note_type(meta),
         tags=[str(t) for t in tags],
         origin_session_id=note_origin_session(meta),
-        body=body.strip(),
+        body=redact_secrets(body)[0].strip(),
         wikilinks=extract_wikilinks(body),
         mtime=path.stat().st_mtime,
     )

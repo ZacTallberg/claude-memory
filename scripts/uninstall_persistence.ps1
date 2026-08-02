@@ -12,6 +12,7 @@
 #>
 $ErrorActionPreference = "Continue"
 $TaskName = "ClaudeMemoryPersistence"
+$WatchdogTaskName = "ClaudeMemoryWatchdog"
 
 $task = Get-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue
 if ($null -ne $task) {
@@ -22,11 +23,22 @@ if ($null -ne $task) {
   Write-Host "Scheduled Task '$TaskName' not found."
 }
 
+$watchdogTask = Get-ScheduledTask -TaskName $WatchdogTaskName -ErrorAction SilentlyContinue
+if ($null -ne $watchdogTask) {
+  try { Stop-ScheduledTask -TaskName $WatchdogTaskName -ErrorAction SilentlyContinue } catch {}
+  try { Unregister-ScheduledTask -TaskName $WatchdogTaskName -Confirm:$false; Write-Host "Removed Scheduled Task '$WatchdogTaskName'." }
+  catch { Write-Host "Watchdog task removal failed: $($_.Exception.Message)" }
+}
+
 # Also remove the no-admin HKCU Run fallback entry, if present.
 $key = "HKCU:\Software\Microsoft\Windows\CurrentVersion\Run"
 if (Get-ItemProperty -Path $key -Name "ClaudeMemoryPersistence" -ErrorAction SilentlyContinue) {
   Remove-ItemProperty -Path $key -Name "ClaudeMemoryPersistence" -ErrorAction SilentlyContinue
   Write-Host "Removed HKCU Run entry 'ClaudeMemoryPersistence'."
+}
+if (Get-ItemProperty -Path $key -Name $WatchdogTaskName -ErrorAction SilentlyContinue) {
+  Remove-ItemProperty -Path $key -Name $WatchdogTaskName -ErrorAction SilentlyContinue
+  Write-Host "Removed HKCU Run entry '$WatchdogTaskName'."
 }
 Write-Host "(The dashboard server / WSL pin from the current session, if any, were left running;"
 Write-Host " they will not be restarted at next logon.)"

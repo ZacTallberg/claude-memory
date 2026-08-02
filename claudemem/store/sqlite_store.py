@@ -15,6 +15,7 @@ from typing import Iterable, Sequence
 
 from ..config import Config
 from ..log import get_logger
+from ..ranking import reciprocal_rank_order
 from ..text import extract_terms
 from .base import Candidate, Chunk, Fact, Store
 
@@ -311,7 +312,8 @@ class SqliteStore(Store):
     # ---- curated facts ----
     def upsert_fact(self, *, path, project, name, title, description, type, tags, origin_session_id,
                     body, embedding, mtime, meta=None) -> int:
-        search_text = " ".join([title or "", description or "", body or ""])
+        search_text = " ".join([name or "", title or "", project or "", " ".join(tags or []),
+                                description or "", body or ""])
         with self._locked():
             self._conn.execute("""INSERT INTO facts(path,project,name,title,description,type,tags,
                     origin_session_id,body,search_text,mtime,meta) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)
@@ -354,26 +356,27 @@ class SqliteStore(Store):
 
     def search_facts(self, query, k, *, qvec=None) -> list[Fact]:
         expr = _fts_query(query)
-        out: dict[int, Fact] = {}
         conn = self._read_conn()
+        candidate_k = max(k * 5, 24)
+        bm25_ids: list[int] = []
+        vector_ids: list[int] = []
         if expr:
             rows = conn.execute("SELECT rowid FROM facts_fts WHERE facts_fts MATCH ? "
-                                "ORDER BY bm25(facts_fts) LIMIT ?", (expr, k)).fetchall()
-            for r in rows:
-                fr = conn.execute("SELECT * FROM facts WHERE id=?", (r["rowid"],)).fetchone()
-                if fr:
-                    out[fr["id"]] = self._row_to_fact(fr)
+                                "ORDER BY bm25(facts_fts) LIMIT ?", (expr, candidate_k)).fetchall()
+            bm25_ids = [r["rowid"] for r in rows]
         if qvec and self._vec:
             import sqlite_vec
             rows = conn.execute("SELECT rowid FROM facts_vec WHERE embedding MATCH ? "
                                 "ORDER BY distance LIMIT ?",
-                                (sqlite_vec.serialize_float32(qvec), k)).fetchall()
-            for r in rows:
-                if r["rowid"] not in out:
-                    fr = conn.execute("SELECT * FROM facts WHERE id=?", (r["rowid"],)).fetchone()
-                    if fr:
-                        out[fr["id"]] = self._row_to_fact(fr)
-        return list(out.values())
+                                (sqlite_vec.serialize_float32(qvec), candidate_k)).fetchall()
+            vector_ids = [r["rowid"] for r in rows]
+        ranked = reciprocal_rank_order((bm25_ids, vector_ids), rrf_k=self.cfg.recall.rrf_k)[:k]
+        if not ranked:
+            return []
+        ph = ",".join("?" * len(ranked))
+        facts = {r["id"]: self._row_to_fact(r) for r in
+                 conn.execute(f"SELECT * FROM facts WHERE id IN ({ph})", ranked)}
+        return [facts[fid] for fid in ranked if fid in facts]
 
     def get_fact(self, fact_id: int) -> Fact | None:
         with self._locked():

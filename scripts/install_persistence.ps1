@@ -17,31 +17,61 @@
 $ErrorActionPreference = "Stop"
 
 $TaskName = "ClaudeMemoryPersistence"
+$WatchdogTaskName = "ClaudeMemoryWatchdog"
 $root = Split-Path -Parent (Split-Path -Parent $MyInvocation.MyCommand.Path)
 $runner = Join-Path $root "scripts\persistence_run.ps1"
+$watchdog = Join-Path $root "scripts\watchdog_run.ps1"
 if (-not (Test-Path $runner)) { throw "runner not found: $runner" }
+if (-not (Test-Path $watchdog)) { throw "watchdog not found: $watchdog" }
 $psArgs = '-NoProfile -NonInteractive -ExecutionPolicy Bypass -WindowStyle Hidden -File "{0}"' -f $runner
+$watchdogArgs = '-NoProfile -NonInteractive -ExecutionPolicy Bypass -WindowStyle Hidden -File "{0}"' -f $watchdog
 
 function Install-Task {
   $action = New-ScheduledTaskAction -Execute "powershell.exe" -Argument $psArgs
-  $trigger = New-ScheduledTaskTrigger -AtLogOn
+  $logonTrigger = New-ScheduledTaskTrigger -AtLogOn
+  # A child server can survive after its supervising PowerShell process is externally stopped.
+  # At-logon alone then leaves memory unsupervised for days. A repeating watchdog trigger is
+  # harmless while the task is running (MultipleInstancesPolicy=IgnoreNew) and re-arms it within
+  # five minutes if the supervisor itself disappears.
+  $watchdogTrigger = New-ScheduledTaskTrigger -Once -At (Get-Date).AddMinutes(1) `
+    -RepetitionInterval (New-TimeSpan -Minutes 5) -RepetitionDuration (New-TimeSpan -Days 3650)
   $settings = New-ScheduledTaskSettingsSet -Hidden -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries `
-    -StartWhenAvailable -ExecutionTimeLimit ([TimeSpan]::Zero) -RestartCount 3 -RestartInterval (New-TimeSpan -Minutes 1)
+    -DontStopOnIdleEnd -StartWhenAvailable -ExecutionTimeLimit ([TimeSpan]::Zero) `
+    -RestartCount 10 -RestartInterval (New-TimeSpan -Minutes 1)
   $principal = New-ScheduledTaskPrincipal -UserId ([System.Security.Principal.WindowsIdentity]::GetCurrent().Name) `
     -LogonType Interactive -RunLevel Limited
-  Register-ScheduledTask -TaskName $TaskName -Action $action -Trigger $trigger -Settings $settings `
+  Register-ScheduledTask -TaskName $TaskName -Action $action -Trigger @($logonTrigger, $watchdogTrigger) -Settings $settings `
     -Principal $principal -Force -ErrorAction Stop `
-    -Description "Keeps the claude-memory stack alive (WSL pin + ParadeDB + warm server)." | Out-Null
+    -Description "Supervises shared Claude/Codex hybrid memory, live indexing, and verified backups." | Out-Null
   if (-not (Get-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue)) {
     throw "task registration silently failed"
   }
 }
 
-function Install-RunKey {
-  $key = "HKCU:\Software\Microsoft\Windows\CurrentVersion\Run"
-  $val = 'powershell.exe ' + $psArgs
-  New-ItemProperty -Path $key -Name "ClaudeMemoryPersistence" -Value $val -PropertyType String -Force | Out-Null
+function Install-WatchdogTask {
+  $action = New-ScheduledTaskAction -Execute "powershell.exe" -Argument $watchdogArgs
+  $logonTrigger = New-ScheduledTaskTrigger -AtLogOn
+  $repeatTrigger = New-ScheduledTaskTrigger -Once -At (Get-Date).AddMinutes(1) `
+    -RepetitionInterval (New-TimeSpan -Minutes 5) -RepetitionDuration (New-TimeSpan -Days 3650)
+  $settings = New-ScheduledTaskSettingsSet -Hidden -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries `
+    -DontStopOnIdleEnd -StartWhenAvailable -ExecutionTimeLimit ([TimeSpan]::Zero) `
+    -RestartCount 10 -RestartInterval (New-TimeSpan -Minutes 1)
+  $principal = New-ScheduledTaskPrincipal -UserId ([System.Security.Principal.WindowsIdentity]::GetCurrent().Name) `
+    -LogonType Interactive -RunLevel Limited
+  Register-ScheduledTask -TaskName $WatchdogTaskName -Action $action -Trigger @($logonTrigger, $repeatTrigger) `
+    -Settings $settings -Principal $principal -Force -ErrorAction Stop `
+    -Description "Re-arms the shared Claude/Codex memory supervisor if its heartbeat stops." | Out-Null
 }
+
+function Install-WatchdogRunKey {
+  $key = "HKCU:\Software\Microsoft\Windows\CurrentVersion\Run"
+  $val = 'powershell.exe ' + $watchdogArgs
+  New-ItemProperty -Path $key -Name $WatchdogTaskName -Value $val -PropertyType String -Force | Out-Null
+  Remove-ItemProperty -Path $key -Name $TaskName -ErrorAction SilentlyContinue
+}
+
+Install-WatchdogRunKey
+Write-Host "Installed no-admin HKCU watchdog startup entry."
 
 try {
   Install-Task
@@ -50,9 +80,16 @@ try {
 }
 catch {
   Write-Host "Scheduled Task registration unavailable ($($_.Exception.Message.Split([Environment]::NewLine)[0]))."
-  Write-Host "Falling back to a no-admin HKCU Run entry (starts at each logon)."
-  Install-RunKey
-  Write-Host "Installed HKCU\...\Run\ClaudeMemoryPersistence."
-  Write-Host "Start now without re-logon:  powershell -NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File `"$runner`""
+  Write-Host "The watchdog startup entry will supervise the existing task/process without admin access."
+}
+
+try {
+  Install-WatchdogTask
+  Write-Host "Installed repeating Scheduled Task '$WatchdogTaskName'."
+  Start-ScheduledTask -TaskName $WatchdogTaskName -ErrorAction Stop
+} catch {
+  Write-Host "Repeating watchdog task unavailable ($($_.Exception.Message.Split([Environment]::NewLine)[0]))."
+  Start-Process -FilePath "powershell.exe" -ArgumentList @("-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-File", $watchdog) -WindowStyle Hidden | Out-Null
+  Write-Host "Started the no-admin watchdog directly; it will return automatically at next logon."
 }
 Write-Host "Remove later with:  .\scripts\uninstall_persistence.ps1"

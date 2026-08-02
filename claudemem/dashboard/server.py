@@ -12,7 +12,7 @@ from fastapi.staticfiles import StaticFiles
 
 from claudemem.log import get_logger
 
-from .api import router
+from .api import live_index_loop, router
 from .state import get_state
 
 log = get_logger(__name__)
@@ -36,6 +36,8 @@ def create_app() -> FastAPI:
     @app.on_event("startup")
     def _warm():
         threading.Thread(target=get_state, daemon=True).start()
+        threading.Thread(target=live_index_loop, daemon=True,
+                         name="memory-live-index-scheduler").start()
 
     return app
 

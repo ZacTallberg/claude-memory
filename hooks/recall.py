@@ -33,12 +33,20 @@ def main() -> None:
     res = call_server("/api/recall", {"prompt": prompt, "cwd": cwd, "session_id": session_id},
                       timeout=8.0)
     if res is not None:
+        degraded = any(res.get(key) for key in ("timeout", "shed", "error"))
+        if degraded:
+            _local_keyword(cfg, prompt, session_id)
+            return
         # The server answered — memory is healthy and delivering. Refresh the beacon EVERY prompt so a
         # long-lived session never shows a false "mem stale" (the beacon used to age only from SessionStart).
-        write_health(source="server", chars=len(res.get("additionalContext") or ""))
+        mode = res.get("retrieval_mode") or "unknown"
+        write_health(source=("server" if mode == "hybrid" else "server-keyword-only"),
+                     retrieval_mode=mode, vector_used=bool(res.get("vector_used")),
+                     chars=len(res.get("additionalContext") or ""))
         if res.get("additionalContext"):
             emit_context(res["additionalContext"], EVENT)
-            return
+        # A healthy hybrid miss is complete. Do not repeat it with BM25 or mislabel it fallback.
+        return
 
     # 2) Fallback: local keyword-only (no embedding model load).
     _local_keyword(cfg, prompt, session_id)

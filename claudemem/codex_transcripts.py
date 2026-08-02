@@ -8,11 +8,35 @@ partial-line and injected-context protections as the Claude adapter.
 from __future__ import annotations
 
 import json
+import re
 from pathlib import Path
 
 from .config import Config
 from .text import collapse_ws, strip_injected_blocks
 from .transcripts import Unit, _parse_ts
+
+
+def _unwrap_user_payload(text: str, outer: str, inner: str) -> str:
+    """Replace a Codex transport wrapper with only its user-authored payload."""
+    outer_re = re.compile(fr"<{outer}\b.*?</{outer}>", re.DOTALL | re.IGNORECASE)
+    inner_re = re.compile(fr"<{inner}\b[^>]*>(.*?)</{inner}>", re.DOTALL | re.IGNORECASE)
+
+    def repl(match: re.Match) -> str:
+        nested = inner_re.search(match.group(0))
+        return nested.group(1) if nested else " "
+
+    return outer_re.sub(repl, text)
+
+
+def clean_codex_text(text: str) -> str:
+    """Keep authored/delegated task text while removing Codex transport and ambient UI state."""
+    out = text or ""
+    # A delegated main-worker task is valuable project memory; the routing/thread wrapper is not.
+    out = _unwrap_user_payload(out, "codex_delegation", "input")
+    # Goal continuations repeat a user-provided objective inside generic system prose. Retain the
+    # objective, not the instruction boilerplate that Codex adds around it.
+    out = _unwrap_user_payload(out, "codex_internal_context", "objective")
+    return collapse_ws(strip_injected_blocks(out))
 
 
 def _meta(path: Path) -> dict:
@@ -76,7 +100,7 @@ def parse_new(path: Path, start_byte: int, cfg: Config) -> tuple[list[Unit], int
                 continue
             if block.get("type") in ("input_text", "output_text", "text"):
                 texts.append(str(block.get("text") or ""))
-        cleaned = collapse_ws(strip_injected_blocks("\n".join(texts)))
+        cleaned = clean_codex_text("\n".join(texts))
         if len(cleaned) < 3:
             continue
         units.append(Unit(role=role, kind="text", text=cleaned, session_id=session_id,

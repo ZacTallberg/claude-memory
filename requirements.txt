@@ -25,4 +25,4 @@ pygments>=2.18               # code highlighting in rendered markdown
 anthropic>=0.40              # Claude Haiku context blurbs (needs ANTHROPIC_API_KEY)
 
 # --- optional: MCP server surface ---
-mcp>=1.2
+mcp>=1.2,<2

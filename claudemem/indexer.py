@@ -26,6 +26,7 @@ class IndexStats:
     units: int = 0
     chunks_added: int = 0
     notes: int = 0
+    notes_unchanged: int = 0
     notes_pruned: int = 0
     embedded: int = 0
     errors: int = 0
@@ -43,13 +44,16 @@ def _emit(progress: Progress, msg: str) -> None:
             pass
 
 
-def index(cfg: Config, store: Store, *, full: bool = False, progress: Progress = None) -> IndexStats:
+def index(cfg: Config, store: Store, *, full: bool = False, progress: Progress = None,
+          only_provider: str | None = None) -> IndexStats:
     provider = get_embedding_provider(cfg)
     ctx = Contextualizer(cfg)
     stats = IndexStats()
 
     # --- transcripts (incremental) ---
     tfiles = paths.iter_transcript_files(cfg)
+    if only_provider:
+        tfiles = [tf for tf in tfiles if tf.provider == only_provider]
     _emit(progress, f"scanning {len(tfiles)} transcripts...")
     for tf in tfiles:
         try:
@@ -94,25 +98,42 @@ def index(cfg: Config, store: Store, *, full: bool = False, progress: Progress =
             log.exception("transcript index failed: %s (%s)", tf.path, e)
 
     # --- curated notes (facts) ---
-    notes = facts_mod.load_notes(cfg)
-    _emit(progress, f"indexing {len(notes)} curated notes...")
-    for nd in notes:
+    notes = []
+    if only_provider is None:
+        notes = facts_mod.load_notes(cfg)
+        _emit(progress, f"indexing {len(notes)} curated notes...")
         try:
-            emb = None
-            if provider.available():
-                text = " ".join([nd.title, nd.description, nd.body])
-                try:
-                    emb = provider.embed_documents([text])[0]
-                except Exception:
-                    emb = None
-            store.upsert_fact(path=nd.path, project=nd.project, name=nd.name, title=nd.title,
-                              description=nd.description, type=nd.type, tags=nd.tags,
-                              origin_session_id=nd.origin_session_id, body=nd.body, embedding=emb,
-                              mtime=nd.mtime, meta={"wikilinks": nd.wikilinks})
-            stats.notes += 1
-        except Exception as e:
-            stats.errors += 1
-            log.exception("note index failed: %s (%s)", nd.path, e)
+            existing_facts = {f.path: f for f in store.list_facts()}
+        except Exception:
+            existing_facts = {}
+        embedding_model = getattr(provider, "name", None) if provider.available() else None
+        for nd in notes:
+            try:
+                existing = existing_facts.get(nd.path)
+                unchanged = (not full and existing is not None and existing.mtime is not None
+                             and abs(float(existing.mtime) - float(nd.mtime)) < 1e-6
+                             and embedding_model
+                             and existing.meta.get("embedding_model") == embedding_model)
+                if unchanged:
+                    stats.notes_unchanged += 1
+                    continue
+                emb = None
+                if provider.available():
+                    text = " ".join([nd.name, nd.title, nd.project, " ".join(nd.tags),
+                                     nd.description, nd.body])
+                    try:
+                        emb = provider.embed_documents([text])[0]
+                    except Exception:
+                        emb = None
+                store.upsert_fact(path=nd.path, project=nd.project, name=nd.name, title=nd.title,
+                                  description=nd.description, type=nd.type, tags=nd.tags,
+                                  origin_session_id=nd.origin_session_id, body=nd.body, embedding=emb,
+                                  mtime=nd.mtime, meta={"wikilinks": nd.wikilinks,
+                                                       "embedding_model": embedding_model})
+                stats.notes += 1
+            except Exception as e:
+                stats.errors += 1
+                log.exception("note index failed: %s (%s)", nd.path, e)
 
     # --- prune facts whose note file is gone ---
     # upsert_fact never removes anything, so deleted/renamed notes lingered in the index forever
@@ -122,7 +143,7 @@ def index(cfg: Config, store: Store, *, full: bool = False, progress: Progress =
     # scan is only a CANDIDATE, and the row is dropped only when the path is genuinely missing
     # from disk. Deterministic signal, not inference.
     try:
-        if notes:  # never prune off an empty scan; that is a failed scan, not an empty corpus
+        if only_provider is None and notes:  # provider-only rebuilds never touch curated notes
             seen = {nd.path for nd in notes}
             for f in store.list_facts():
                 if f.path in seen:
@@ -138,11 +159,12 @@ def index(cfg: Config, store: Store, *, full: bool = False, progress: Progress =
         log.exception("fact prune failed: %s", e)
 
     # --- graph from wikilinks ---
-    try:
-        nodes, edges = facts_mod.build_graph(notes)
-        store.replace_graph(nodes, edges)
-    except Exception as e:
-        log.exception("graph build failed: %s", e)
+    if only_provider is None:
+        try:
+            nodes, edges = facts_mod.build_graph(notes)
+            store.replace_graph(nodes, edges)
+        except Exception as e:
+            log.exception("graph build failed: %s", e)
 
     # --- embed pending chunks ---
     stats.embedded = embed_pending(cfg, store, provider, progress=progress)

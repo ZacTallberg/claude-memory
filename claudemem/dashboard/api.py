@@ -19,6 +19,7 @@ from claudemem.facts import load_note
 from claudemem.log import get_logger
 from claudemem.paths import killed, projects_root, safe_under, set_killed
 from claudemem.recall_format import format_recall, format_unify
+from claudemem.security import redact_secrets
 from claudemem.text import human_age, meaningful_term_count, snippet
 
 log = get_logger(__name__)
@@ -83,10 +84,69 @@ async def _bounded(kind: str, work, empty: dict) -> dict:
 _progress: deque[str] = deque(maxlen=1000)
 _index_running = False
 _index_lock = threading.Lock()
+_last_index_started = 0.0
+_last_index_finished = 0.0
+_last_index_error: str | None = None
+_last_retrieval = {"mode": "never", "ts": 0.0, "latency_ms": None}
 
 
 def _push(msg: str) -> None:
     _progress.append(f"{time.strftime('%H:%M:%S')} {msg}")
+
+
+def start_index_job(*, full: bool = False, promote: bool = False,
+                    only_provider: str | None = None, reason: str = "api",
+                    min_interval_s: float = 0.0) -> dict:
+    """Start one warm-process index pass, deduplicating and debouncing all callers."""
+    global _index_running, _last_index_started, _last_index_finished, _last_index_error
+    if only_provider not in (None, "claude", "codex"):
+        return {"started": False, "reason": "invalid provider"}
+    now = time.time()
+    with _index_lock:
+        if _index_running:
+            return {"started": False, "reason": "already running"}
+        if min_interval_s and now - _last_index_started < min_interval_s:
+            return {"started": False, "reason": "debounced"}
+        _index_running = True
+        _last_index_started = now
+        _last_index_error = None
+
+    def job():
+        global _index_running, _last_index_finished, _last_index_error
+        st = get_state()
+        try:
+            suffix = " (full)" if full else ""
+            if only_provider:
+                suffix += f" ({only_provider})"
+            _push(f"index started [{reason}]{suffix}")
+            run_index(st.cfg, st.store, full=full, progress=_push,
+                      only_provider=only_provider)
+            if promote:
+                from claudemem.promote import mine_candidates
+                drafted = mine_candidates()
+                _push(f"promotion scan complete: {drafted} drafted")
+            _push("index complete")
+        except Exception as e:
+            _last_index_error = f"{type(e).__name__}: {e}"
+            _push(f"index error: {_last_index_error}")
+        finally:
+            _last_index_finished = time.time()
+            _index_running = False
+
+    threading.Thread(target=job, daemon=True, name="memory-live-index").start()
+    return {"started": True, "reason": reason}
+
+
+def live_index_loop() -> None:
+    """Continuously tail active Claude/Codex rollouts into shared memory."""
+    cfg = get_state().cfg
+    interval = cfg.index.live_interval_seconds
+    if interval <= 0:
+        return
+    time.sleep(min(15, interval))
+    while True:
+        start_index_job(reason="live-sync", min_interval_s=max(1, interval * 0.8))
+        time.sleep(interval)
 
 
 # ---- serializers ----
@@ -101,8 +161,10 @@ def _result_json(x) -> dict:
 
 
 def _fact_brief(f) -> dict:
-    return {"id": f.id, "kind": "fact", "type": f.type, "title": f.title,
-            "description": f.description, "project": f.project, "path": f.path,
+    return {"id": f.id, "kind": "fact", "type": f.type,
+            "title": redact_secrets(f.title)[0],
+            "description": redact_secrets(f.description)[0],
+            "project": f.project, "path": f.path,
             "tags": f.tags}
 
 
@@ -112,14 +174,15 @@ def _mcp_result(x) -> dict:
         "id": c.id, "kind": "transcript", "project": c.project,
         "session": c.session_id, "role": c.role, "block": c.kind,
         "ts": c.ts.isoformat() if c.ts else None, "score": round(float(x.score), 4),
-        "reranked": bool(x.reranked), "content": c.content,
+        "reranked": bool(x.reranked), "content": redact_secrets(c.content)[0],
     }
 
 
 def _mcp_fact(f) -> dict:
     return {
-        "id": f.id, "kind": "fact", "type": f.type, "title": f.title,
-        "name": f.name, "description": f.description, "project": f.project,
+        "id": f.id, "kind": "fact", "type": f.type,
+        "title": redact_secrets(f.title)[0], "name": redact_secrets(f.name)[0],
+        "description": redact_secrets(f.description)[0], "project": f.project,
         "tags": list(f.tags or []), "path": f.path,
         "origin_session_id": f.origin_session_id,
     }
@@ -134,12 +197,14 @@ async def api_recall(req: Request):
     prompt = (body.get("prompt") or "")
     session_id = body.get("session_id")
     if meaningful_term_count(prompt) < cfg.recall.min_terms:
-        return {"additionalContext": "", "n_recalled": 0, "n_facts": 0}
+        return {"additionalContext": "", "n_recalled": 0, "n_facts": 0,
+                "retrieval_mode": "skipped"}
 
     def work():
         t0 = time.time()
         tier = "full" if cfg.reranker.hot_path else "hot"
         qv = st.retriever.embed_query(prompt)  # embed once, reuse for chunks + facts
+        mode = "hybrid" if qv else "keyword-only"
         results = st.retriever.search(prompt, tier=tier, exclude_session=session_id,
                                       k=cfg.recall.top_k, qvec=qv)
         facts = (st.retriever.search_facts(prompt, cfg.recall.facts_k, qvec=qv)
@@ -150,11 +215,13 @@ async def api_recall(req: Request):
         try:
             st.store.log_injection(hook="recall", session_id=session_id, prompt_excerpt=prompt[:200],
                                    n_recalled=len(results), n_facts=len(facts), chars=len(text),
-                                   latency_ms=latency)
+                                   latency_ms=latency,
+                                   details={"retrieval_mode": mode, "vector_used": bool(qv)})
         except Exception:
             pass
+        _last_retrieval.update(mode=mode, ts=time.time(), latency_ms=latency)
         return {"additionalContext": text, "n_recalled": len(results), "n_facts": len(facts),
-                "latency_ms": latency}
+                "latency_ms": latency, "retrieval_mode": mode, "vector_used": bool(qv)}
 
     return await _bounded("recall", work,
                           {"additionalContext": "", "n_recalled": 0, "n_facts": 0})
@@ -200,6 +267,7 @@ async def api_mcp_search(req: Request):
 
     def work():
         qvec = st.retriever.embed_query(query)
+        mode = "hybrid" if qvec else "keyword-only"
         results = []
         facts = []
         if kind in ("all", "transcripts"):
@@ -210,7 +278,8 @@ async def api_mcp_search(req: Request):
         if kind in ("all", "facts"):
             facts = st.retriever.search_facts(query, k, qvec=qvec)
         return {"query": query, "results": [_mcp_result(x) for x in results],
-                "facts": [_mcp_fact(f) for f in facts]}
+                "facts": [_mcp_fact(f) for f in facts], "retrieval_mode": mode,
+                "vector_used": bool(qvec)}
 
     return await asyncio.to_thread(work)
 
@@ -305,8 +374,9 @@ async def api_fact(fid: int):
     if not f:
         return {"error": "not found"}
     d = _fact_brief(f)
-    d["body"] = f.body
-    d["body_html"] = md_to_html(f.body)
+    safe_body = redact_secrets(f.body)[0]
+    d["body"] = safe_body
+    d["body_html"] = md_to_html(safe_body)
     d["origin_session_id"] = f.origin_session_id
     return d
 
@@ -320,7 +390,7 @@ async def ui_fact(fid: int):
     return HTMLResponse(
         f'<div class="fact-detail"><div class="badge {f.type}">{f.type}</div>'
         f'<h2>{f.title}</h2><div class="m">{f.project} · {f.path}</div>'
-        f'<div class="body">{md_to_html(f.body)}</div></div>')
+        f'<div class="body">{md_to_html(redact_secrets(f.body)[0])}</div></div>')
 
 
 # ================= graph / metrics / stats =================
@@ -355,6 +425,16 @@ PROBE_DEADLINE_S = float(os.environ.get("CLAUDEMEM_PROBE_DEADLINE_S", "8"))
 # of seconds. Restarting for that is actively harmful - it drops the models and guarantees the
 # next request is slow too. The threshold must sit above the worst LEGITIMATE stall.
 WEDGE_AFTER_S = float(os.environ.get("CLAUDEMEM_WEDGE_AFTER_S", "180"))
+
+
+@router.get("/livez")
+async def livez():
+    """Process/event-loop liveness only; never touch the store or model state.
+
+    Supervisors must not restart a healthy process merely because a legitimate index pass
+    holds the store busy. Readiness and degradation remain visible through ``/healthz``.
+    """
+    return {"ok": True, "pid": os.getpid()}
 
 
 @router.get("/healthz")
@@ -398,6 +478,16 @@ async def healthz():
     if since_ok > WEDGE_AFTER_S:
         out.update(ok=False, store=f"WEDGED: no successful store op in {since_ok:.0f}s")
         return JSONResponse(out, status_code=503)
+    st = get_state()
+    embedder = getattr(st, "embedder", None)
+    embedder_available = bool(embedder and embedder.available())
+    out.update(embedder_available=embedder_available,
+               retrieval_mode=("hybrid" if embedder_available else "keyword-only"),
+               last_retrieval=dict(_last_retrieval),
+               live_index={"running": _index_running,
+                           "last_started": _last_index_started,
+                           "last_finished": _last_index_finished,
+                           "last_error": _last_index_error})
     return out
 
 
@@ -483,28 +573,10 @@ async def api_killswitch_set(req: Request):
 # ================= index control =================
 @router.post("/api/index")
 async def api_index(req: Request):
-    global _index_running
     body = await req.json() if req.headers.get("content-type", "").startswith("application/json") else {}
-    full = bool(body.get("full"))
-    with _index_lock:
-        if _index_running:
-            return {"started": False, "reason": "already running"}
-        _index_running = True
-
-    def job():
-        global _index_running
-        st = get_state()
-        try:
-            _push("index started" + (" (full)" if full else ""))
-            run_index(st.cfg, st.store, full=full, progress=_push)
-            _push("index complete")
-        except Exception as e:
-            _push(f"index error: {e}")
-        finally:
-            _index_running = False
-
-    threading.Thread(target=job, daemon=True).start()
-    return {"started": True}
+    return start_index_job(full=bool(body.get("full")), promote=bool(body.get("promote")),
+                           only_provider=body.get("provider"),
+                           reason=str(body.get("reason") or "api"))
 
 
 @router.get("/api/index/stream")

@@ -106,6 +106,7 @@ class IndexCfg:
     tool_blobs: bool
     batch_size: int
     transcript_providers: tuple[str, ...]
+    live_interval_seconds: int
 
 
 @dataclass(frozen=True)
@@ -152,7 +153,8 @@ _DEFAULTS: dict = {
     "unify": {"max_facts": 120, "group_by": "project"},
     "server": {"host": "127.0.0.1", "port": 7777, "open_browser": True},
     "index": {"exclude_sidechains": True, "strip_injected": True, "tool_blobs": False,
-              "batch_size": 64, "transcript_providers": ["claude", "codex"]},
+              "batch_size": 64, "transcript_providers": ["claude", "codex"],
+              "live_interval_seconds": 60},
 }
 
 
@@ -238,5 +240,6 @@ def load_config() -> Config:
         server=ServerCfg(host=sv["host"], port=int(sv["port"]), open_browser=_b(sv["open_browser"])),
         index=IndexCfg(exclude_sidechains=_b(ix["exclude_sidechains"]), strip_injected=_b(ix["strip_injected"]),
                        tool_blobs=_b(ix["tool_blobs"]), batch_size=int(ix["batch_size"]),
-                       transcript_providers=tuple(ix["transcript_providers"])),
+                       transcript_providers=tuple(ix["transcript_providers"]),
+                       live_interval_seconds=max(0, int(ix["live_interval_seconds"]))),
     )

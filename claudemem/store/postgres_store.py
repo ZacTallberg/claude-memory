@@ -16,6 +16,7 @@ from psycopg.types.json import Json
 
 from ..config import Config
 from ..log import get_logger
+from ..ranking import reciprocal_rank_order
 from .base import Candidate, Chunk, Fact, Store
 
 log = get_logger(__name__)
@@ -236,7 +237,8 @@ class PostgresStore(Store):
     # ---- curated facts ----
     def upsert_fact(self, *, path, project, name, title, description, type, tags, origin_session_id,
                     body, embedding, mtime, meta=None) -> int:
-        search_text = " ".join([title or "", description or "", body or ""])
+        search_text = " ".join([name or "", title or "", project or "", " ".join(tags or []),
+                                description or "", body or ""])
         emb = _vec_literal(embedding) if embedding else None
         with self._lock, self._cur() as c:
             c.execute(f"""INSERT INTO facts(path, project, name, title, description, type, tags,
@@ -271,20 +273,26 @@ class PostgresStore(Store):
             return [self._row_to_fact(r) for r in c.fetchall()]
 
     def search_facts(self, query, k, *, qvec=None) -> list[Fact]:
-        out: dict[int, Fact] = {}
+        candidate_k = max(k * 5, 24)
+        bm25_ids: list[int] = []
+        vector_ids: list[int] = []
         with self._lock, self._cur() as c:
             if query.strip():
-                c.execute("""SELECT * FROM facts WHERE id @@@ paradedb.match('search_text', %s)
-                             ORDER BY paradedb.score(id) DESC LIMIT %s""", (query, k))
-                for r in c.fetchall():
-                    out[r["id"]] = self._row_to_fact(r)
+                c.execute("""SELECT id FROM facts WHERE id @@@ paradedb.match('search_text', %s)
+                             ORDER BY paradedb.score(id) DESC LIMIT %s""", (query, candidate_k))
+                bm25_ids = [r["id"] for r in c.fetchall()]
             if qvec:
                 lit = _vec_literal(qvec)
-                c.execute("""SELECT * FROM facts WHERE embedding IS NOT NULL
-                             ORDER BY embedding <=> %s::vector LIMIT %s""", (lit, k))
-                for r in c.fetchall():
-                    out.setdefault(r["id"], self._row_to_fact(r))
-        return list(out.values())[:k] if not qvec else list(out.values())[: max(k, len(out))]
+                c.execute("""SELECT id FROM facts WHERE embedding IS NOT NULL
+                             ORDER BY embedding <=> %s::vector LIMIT %s""", (lit, candidate_k))
+                vector_ids = [r["id"] for r in c.fetchall()]
+            ranked = reciprocal_rank_order((bm25_ids, vector_ids),
+                                           rrf_k=self.cfg.recall.rrf_k)[:k]
+            if not ranked:
+                return []
+            c.execute("SELECT * FROM facts WHERE id = ANY(%s)", (ranked,))
+            facts = {r["id"]: self._row_to_fact(r) for r in c.fetchall()}
+        return [facts[fid] for fid in ranked if fid in facts]
 
     def get_fact(self, fact_id: int) -> Fact | None:
         with self._lock, self._cur() as c:

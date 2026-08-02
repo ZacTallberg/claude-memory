@@ -54,6 +54,18 @@ function Write-Heartbeat {
   } catch { }
 }
 
+function Start-BackupCheck {
+  if ($script:backupProcess -and -not $script:backupProcess.HasExited) { return }
+  try {
+    $stdout = Join-Path $logDir "backup.stdout.log"
+    $stderr = Join-Path $logDir "backup.stderr.log"
+    $script:backupProcess = Start-Process -FilePath $py `
+      -ArgumentList @("-m", "claudemem", "backup", "--if-due", "--retention", "14") `
+      -WindowStyle Hidden -PassThru -RedirectStandardOutput $stdout -RedirectStandardError $stderr
+    Write-Log "backup check started asynchronously (pid=$($script:backupProcess.Id))"
+  } catch { Write-Log "backup check failed to start: $($_.Exception.Message)" }
+}
+
 # Singleton guard: the scheduled task, the SessionStart hook, and manual runs may all spawn
 # this script. Global\ (not Local\) because the task can land in a different logon session.
 # AbandonedMutexException = the previous holder died without releasing - WE own it now, so
@@ -105,11 +117,14 @@ function Start-Server {
 }
 
 function Test-Server {
-  # Probe /healthz, not /api/stats. /healthz answers on a short internal deadline and returns 503
-  # when the store is wedged, so "listening but useless" is distinguishable from "healthy".
-  # TimeoutSec was 3, which a server still loading its embedding model cannot meet; that is how
-  # this supervisor declared a live server dead 3 times in 90 seconds on 2026-07-22.
-  try { return (Invoke-WebRequest -Uri "http://127.0.0.1:7777/healthz" -UseBasicParsing -TimeoutSec 5).StatusCode -eq 200 }
+  # Restart decisions use liveness only. Readiness can legitimately be slow during a full
+  # reindex; coupling it to process restarts destroyed useful work and created restart storms.
+  try { return (Invoke-WebRequest -Uri "http://127.0.0.1:7777/livez" -UseBasicParsing -TimeoutSec 5).StatusCode -eq 200 }
+  catch { return $false }
+}
+
+function Test-PortBound {
+  try { return $null -ne (Get-NetTCPConnection -LocalPort 7777 -State Listen -ErrorAction Stop | Select-Object -First 1) }
   catch { return $false }
 }
 
@@ -136,8 +151,19 @@ if ($needDb) {
 } else {
   Write-Log "backend=sqlite: skipping WSL pin + ParadeDB; supervising the dashboard server only"
 }
-if (Test-Server) { Write-Log "a dashboard server is already up; not starting a second one"; $srv = $null }
-else { Stop-PortHolder; $srv = Start-Server }
+if (Test-Server) {
+  Write-Log "a live dashboard server is already up; not starting a second one"
+  $srv = $null
+} elseif (Test-PortBound) {
+  # Adopt the listener and give it the normal grace/strike sequence. Never kill an existing
+  # server on a single startup probe; it may be loading a model or completing an index pass.
+  Write-Log "port 7777 is occupied but liveness is not answering yet; adopting it for warmup"
+  $srv = $null
+} else {
+  $srv = Start-Server
+}
+$script:backupProcess = $null
+Start-BackupCheck
 
 # --- Supervise forever: revive anything that dies, re-assert the DB periodically. ---
 # Strike-based, with a warmup grace. A single failed probe is not evidence of death: models load
@@ -147,9 +173,15 @@ $StrikesToRestart = 3
 $strikes = 0
 $startedAt = Get-Date
 $lastDbCheck = Get-Date
+$lastBackupCheck = Get-Date
 while ($true) {
   Start-Sleep -Seconds 15
   Write-Heartbeat
+
+  if ($script:backupProcess -and $script:backupProcess.HasExited) {
+    Write-Log "backup check completed (pid=$($script:backupProcess.Id), exit=$($script:backupProcess.ExitCode))"
+    $script:backupProcess = $null
+  }
 
   if ($needDb -and ($pin -eq $null -or $pin.HasExited)) {
     Write-Log "WSL pin gone; restarting"
@@ -176,5 +208,9 @@ while ($true) {
   if ($needDb -and ((Get-Date) - $lastDbCheck).TotalSeconds -ge 120) {
     Ensure-Db
     $lastDbCheck = Get-Date
+  }
+  if (((Get-Date) - $lastBackupCheck).TotalSeconds -ge 3600) {
+    Start-BackupCheck
+    $lastBackupCheck = Get-Date
   }
 }

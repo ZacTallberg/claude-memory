@@ -33,6 +33,7 @@ from claudemem.paths import iter_memory_dirs, projects_root, safe_under
 from claudemem.providers.embeddings import NullEmbeddingProvider
 from claudemem.providers.reranker import NoopReranker
 from claudemem.recall_format import format_recall
+from claudemem.security import redact_secrets
 from claudemem.retriever import Retriever
 from claudemem.store.base import Fact
 from claudemem.store.factory import get_store
@@ -106,7 +107,7 @@ def _result_json(r) -> dict:
         "ts": c.ts.isoformat() if c.ts else None,
         "score": round(float(r.score), 4),
         "reranked": bool(r.reranked),
-        "content": c.content,
+        "content": redact_secrets(c.content)[0],
     }
 
 
@@ -115,16 +116,16 @@ def _fact_json(f: Fact, *, body: bool = False) -> dict:
         "id": f.id,
         "kind": "fact",
         "type": f.type,
-        "title": f.title,
-        "name": f.name,
-        "description": f.description,
+        "title": redact_secrets(f.title)[0],
+        "name": redact_secrets(f.name)[0],
+        "description": redact_secrets(f.description)[0],
         "project": f.project,
         "tags": list(f.tags or []),
         "path": f.path,
         "origin_session_id": f.origin_session_id,
     }
     if body:
-        d["body"] = f.body
+        d["body"] = redact_secrets(f.body)[0]
     return d
 
 
@@ -260,6 +261,12 @@ def write_note(project: str, title: str, type: str = "reference", body: str = ""
     title = collapse_ws(title or "")
     if not title:
         return {"error": "title is required"}
+    proposed = "\n".join([title, description or "", body or "",
+                            " ".join(str(tag) for tag in (tags or []))])
+    _redacted, secret_findings = redact_secrets(proposed)
+    if secret_findings:
+        return {"error": "refused: potential credential material must not be written to memory",
+                "secret_types": sorted({finding.kind for finding in secret_findings})}
 
     mem_dir = _resolve_memory_dir(cfg, project)
     if mem_dir is None:

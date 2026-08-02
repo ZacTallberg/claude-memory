@@ -51,12 +51,12 @@ def _desired() -> dict:
     return {
         "UserPromptSubmit": [{
             "hooks": [_handler("recall.py", 15, "Recalling shared local memory",
-                               context_limit=2500)]
+                               context_limit=9000)]
         }],
         "SessionStart": [{
             "matcher": "startup|resume|clear|compact",
             "hooks": [_handler("unify.py", 30, "Loading the shared memory map",
-                               context_limit=2500)]
+                               context_limit=9000)]
         }],
         "SessionEnd": [{
             "hooks": [_handler("index_trigger.py", 3, "Updating shared local memory")]

@@ -6,6 +6,8 @@ from datetime import datetime, timezone
 
 import yaml
 
+from .security import redact_secrets
+
 # Blocks WE (or the harness) inject — must be stripped before storing transcript text,
 # else recall recursively indexes its own past output ("eats its own tail").
 _INJECTED_BLOCKS = [
@@ -17,6 +19,12 @@ _INJECTED_BLOCKS = [
     (r"<command-(name|message|args)>.*?</command-(name|message|args)>", re.DOTALL | re.IGNORECASE),
     (r"<task-notification\b.*?</task-notification>", re.DOTALL | re.IGNORECASE),
     (r"<local-command-caveat\b.*?</local-command-caveat>", re.DOTALL | re.IGNORECASE),
+    # Codex desktop supplies these as ambient/system context inside user-shaped rollout
+    # messages. They are not authored conversation and must never become semantic memory.
+    (r"<in-app-browser-context\b.*?</in-app-browser-context>", re.DOTALL | re.IGNORECASE),
+    (r"<environment_context\b.*?</environment_context>", re.DOTALL | re.IGNORECASE),
+    (r"<recommended_plugins\b.*?</recommended_plugins>", re.DOTALL | re.IGNORECASE),
+    (r"<app-context\b.*?</app-context>", re.DOTALL | re.IGNORECASE),
 ]
 
 _STOPWORDS = set("""
@@ -36,7 +44,7 @@ def strip_injected_blocks(text: str) -> str:
     out = text
     for pat, flags in _INJECTED_BLOCKS:
         out = re.sub(pat, " ", out, flags=flags)
-    return out
+    return redact_secrets(out)[0]
 
 
 def extract_terms(text: str) -> list[str]:

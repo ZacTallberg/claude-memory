@@ -16,7 +16,8 @@ def _store_and_cfg():
 def cmd_index(args):
     from .indexer import index
     cfg, store = _store_and_cfg()
-    stats = index(cfg, store, full=args.full, progress=lambda m: print(m))
+    stats = index(cfg, store, full=args.full, progress=lambda m: print(m),
+                  only_provider=args.provider)
     print(json.dumps(stats.as_dict(), indent=2))
     if getattr(args, "promote", False):
         from .promote import mine_candidates
@@ -78,6 +79,24 @@ def cmd_eval(args):
     run_eval()
 
 
+def cmd_backup(args):
+    from pathlib import Path
+    from .backup import create_backup, verify_snapshot
+    from .config import load_config
+    if args.verify:
+        result = verify_snapshot(Path(args.verify))
+    else:
+        result = create_backup(load_config(), if_due=args.if_due, retention=args.retention)
+    print(json.dumps(result, indent=2))
+
+
+def cmd_sanitize(args):
+    from .config import load_config
+    from .sanitize import sanitize_sqlite
+    result = sanitize_sqlite(load_config(), apply=args.apply)
+    print(json.dumps(result, indent=2))
+
+
 def cmd_promote(args):
     from .promote import mine_candidates
     n = mine_candidates()
@@ -118,6 +137,7 @@ def main(argv: list[str] | None = None) -> None:
     sub = p.add_subparsers(dest="cmd", required=True)
 
     s = sub.add_parser("index"); s.add_argument("--full", action="store_true")
+    s.add_argument("--provider", choices=["claude", "codex"])
     s.add_argument("--promote", action="store_true"); s.set_defaults(fn=cmd_index)
     s = sub.add_parser("embed"); s.set_defaults(fn=cmd_embed)
     s = sub.add_parser("query"); s.add_argument("query"); s.add_argument("--k", type=int, default=6)
@@ -129,6 +149,11 @@ def main(argv: list[str] | None = None) -> None:
     s.set_defaults(fn=cmd_serve)
     s = sub.add_parser("selftest"); s.set_defaults(fn=cmd_selftest)
     s = sub.add_parser("eval"); s.set_defaults(fn=cmd_eval)
+    s = sub.add_parser("backup"); s.add_argument("--if-due", action="store_true")
+    s.add_argument("--retention", type=int, default=14); s.add_argument("--verify")
+    s.set_defaults(fn=cmd_backup)
+    s = sub.add_parser("sanitize"); s.add_argument("--apply", action="store_true")
+    s.set_defaults(fn=cmd_sanitize)
     s = sub.add_parser("promote"); s.set_defaults(fn=cmd_promote)
     s = sub.add_parser("install-hooks"); s.set_defaults(fn=cmd_install_hooks)
     s = sub.add_parser("uninstall-hooks"); s.set_defaults(fn=cmd_uninstall_hooks)

@@ -271,6 +271,24 @@ def run_selftest(verbose: bool = True) -> bool:
                 f"units={len(units)} roles={sorted({u.role for u in units})} partial_held={off < size}")
     ctx.check("Codex transcript adapter keeps only clean user/assistant messages", c_codex_transcript_parse)
 
+    def c_codex_ambient_cleaning():
+        from .codex_transcripts import clean_codex_text
+        ambient = ("<recommended_plugins>catalog noise</recommended_plugins> "
+                   "<environment_context><cwd>C:/secret</cwd></environment_context> "
+                   "<in-app-browser-context>tab noise</in-app-browser-context> "
+                   "Please preserve the authored request.")
+        delegated = ("<codex_delegation><source_thread_id>abc</source_thread_id>"
+                     "<input>Build the actual worker feature.</input></codex_delegation>")
+        goal = ("<codex_internal_context source=\"goal\">boilerplate "
+                "<objective>Keep live memory synchronized.</objective></codex_internal_context>")
+        a, d, g = map(clean_codex_text, (ambient, delegated, goal))
+        ok = (a == "Please preserve the authored request."
+              and d == "Build the actual worker feature."
+              and g == "Keep live memory synchronized.")
+        return ok, f"ambient={a!r} delegated={d!r} goal={g!r}"
+    ctx.check("Codex corpus cleaning drops ambient state but preserves authored payloads",
+              c_codex_ambient_cleaning)
+
     # -- curated note parse: frontmatter + nested type + wikilinks ----------
     def c_note_parse():
         from .facts import load_note
@@ -302,6 +320,19 @@ def run_selftest(verbose: bool = True) -> bool:
                 and "before" in out and "after" in out, "block removed, surrounding text kept")
     ctx.check("strip_injected_blocks removes <recalled-memory>", c_strip)
 
+    def c_secret_redaction():
+        from .security import redact_secrets
+        openai = "sk-proj-" + "A1b2" * 8
+        github = "github_pat_" + "Z9y8" * 8
+        raw = f"openai={openai} github={github} password: Correct-Horse-123"
+        cleaned, findings = redact_secrets(raw)
+        kinds = {finding.kind for finding in findings}
+        ok = (openai not in cleaned and github not in cleaned and "Correct-Horse-123" not in cleaned
+              and {"openai-token", "github-token"} <= kinds
+              and bool({"password-literal", "assigned-secret"} & kinds))
+        return ok, f"redacted={len(findings)} types={sorted(kinds)}"
+    ctx.check("secret scanner redacts credential-shaped values without echoing them", c_secret_redaction)
+
     # -- retriever fusion on synthetic in-memory candidate lists ------------
     def c_fusion():
         from .retriever import Retriever
@@ -314,6 +345,14 @@ def run_selftest(verbose: bool = True) -> bool:
         return (fused[2] > fused[1] and fused[2] > fused[3] and len(fused) == 3,
                 f"rrf id2={fused[2]:.4f} > id1={fused[1]:.4f},id3={fused[3]:.4f}")
     ctx.check("retriever RRF fusion ranks doubly-listed chunk highest", c_fusion)
+
+    def c_rank_order():
+        from .ranking import reciprocal_rank_order
+        lexical = list(range(1, 25))
+        semantic = [19, 30, 31]
+        order = reciprocal_rank_order((lexical, semantic), rrf_k=60)
+        return order[0] == 19, f"top={order[:4]} (id 19 is supported by both rankers)"
+    ctx.check("shared RRF ordering lets vector evidence promote a lower lexical fact", c_rank_order)
 
     # -- BM25 search returns hits (real DB) ---------------------------------
     real_q = "memory recall hook index retriever postgres embedding"
@@ -592,9 +631,46 @@ def run_selftest(verbose: bool = True) -> bool:
                       for e in hooks["UserPromptSubmit"] for h in e.get("hooks", []))
         complete = all(e in hooks for e in ("UserPromptSubmit", "SessionStart",
                                              "SessionEnd", "PreCompact"))
-        return complete and len(ours) == 1 and foreign, (
-            f"events_ok={complete} idempotent={len(ours) == 1} foreign_kept={foreign}")
+        context_limit = ours[0]["hooks"][0].get("additionalContextLimit", 0) if ours else 0
+        return complete and len(ours) == 1 and foreign and context_limit >= cfg.recall.max_chars, (
+            f"events_ok={complete} idempotent={len(ours) == 1} foreign_kept={foreign} "
+            f"context_limit={context_limit}")
     ctx.check("install-codex-hooks is valid, idempotent, and preserves foreign hooks", c_codex_hooks)
+
+    def c_verified_backup():
+        import sqlite3
+        from dataclasses import replace
+        from .backup import create_backup, verify_snapshot
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            db = root / "source.db"
+            conn = sqlite3.connect(db)
+            conn.executescript("""
+                CREATE TABLE sources(id INTEGER PRIMARY KEY);
+                CREATE TABLE chunks(id INTEGER PRIMARY KEY);
+                CREATE TABLE facts(id INTEGER PRIMARY KEY);
+                INSERT INTO sources VALUES (1);
+                INSERT INTO chunks VALUES (1);
+                INSERT INTO facts VALUES (1);
+            """)
+            conn.commit(); conn.close()
+            projects = root / "projects"; memory = projects / "C--code-test" / "memory"
+            memory.mkdir(parents=True)
+            (memory / "note.md").write_text("durable note\n", encoding="utf-8")
+            test_cfg = replace(
+                cfg, data_dir=root / "data",
+                scope=replace(cfg.scope, claude_projects_dir=str(projects)),
+                store=replace(cfg.store, backend="sqlite",
+                              sqlite=replace(cfg.store.sqlite, path=str(db))),
+            )
+            made = create_backup(test_cfg, retention=2)
+            checked = verify_snapshot(Path(made["snapshot"]))
+            due = create_backup(test_cfg, if_due=True, retention=2)
+        ok = (made.get("created") and checked.get("ok") and checked.get("notes") == 1
+              and due.get("created") is False and checked["counts"]["chunks"] == 1)
+        return ok, f"created={made.get('created')} verified={checked.get('ok')} due_skipped={not due.get('created')}"
+    ctx.check("SQLite and curated-note backup is atomic, checksummed, verified, and debounced",
+              c_verified_backup)
 
     # -- real query end-to-end via Retriever returns >0 distinct hits -------
     if store is None:

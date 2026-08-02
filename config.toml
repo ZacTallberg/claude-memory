@@ -72,3 +72,4 @@ strip_injected = true
 tool_blobs = false          # store compact tool summaries, not full tool blobs
 batch_size = 64
 transcript_providers = ["claude", "codex"]  # shared corpus; provider adapters normalize both
+live_interval_seconds = 60  # warm-server incremental sync so active workers can recall one another
