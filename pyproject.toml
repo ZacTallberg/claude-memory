@@ -8,6 +8,7 @@ dependencies = [
   "fastapi==0.116.1",
   "httpx==0.28.1",
   "mcp>=1.23,<2",
+  "numpy==2.3.2",
   "pydantic==2.11.7",
   "pydantic-settings==2.10.1",
   "python-multipart==0.0.20",
@@ -19,7 +20,6 @@ dependencies = [
 [project.optional-dependencies]
 local-models = [
   "fastembed==0.7.3",
-  "numpy==2.3.2",
 ]
 otel = [
   "opentelemetry-api==1.36.0",

@@ -323,4 +323,21 @@ CREATE TABLE IF NOT EXISTS credentials (
 CREATE INDEX IF NOT EXISTS credentials_actor_idx ON credentials(actor_id, revoked_at);
 """,
     ),
+    Migration(
+        3,
+        "embedding_generations",
+        r"""
+CREATE TABLE IF NOT EXISTS embedding_vectors (
+    generation_id TEXT NOT NULL REFERENCES search_generations(id) ON DELETE CASCADE,
+    document_id TEXT NOT NULL REFERENCES search_documents(id) ON DELETE CASCADE,
+    dimension INTEGER NOT NULL CHECK(dimension > 0),
+    vector BLOB NOT NULL,
+    vector_sha256 TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    PRIMARY KEY(generation_id, document_id)
+);
+CREATE INDEX IF NOT EXISTS embedding_vectors_generation_idx
+    ON embedding_vectors(generation_id);
+""",
+    ),
 )

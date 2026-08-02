@@ -1210,6 +1210,7 @@ dependencies = [
     { name = "fastapi" },
     { name = "httpx" },
     { name = "mcp" },
+    { name = "numpy" },
     { name = "pydantic" },
     { name = "pydantic-settings" },
     { name = "python-multipart" },
@@ -1228,7 +1229,6 @@ dev = [
 ]
 local-models = [
     { name = "fastembed" },
-    { name = "numpy" },
 ]
 otel = [
     { name = "opentelemetry-api" },
@@ -1245,7 +1245,7 @@ requires-dist = [
     { name = "httpx", specifier = "==0.28.1" },
     { name = "hypothesis", marker = "extra == 'dev'", specifier = "==6.138.3" },
     { name = "mcp", specifier = ">=1.23,<2" },
-    { name = "numpy", marker = "extra == 'local-models'", specifier = "==2.3.2" },
+    { name = "numpy", specifier = "==2.3.2" },
     { name = "opentelemetry-api", marker = "extra == 'otel'", specifier = "==1.36.0" },
     { name = "opentelemetry-exporter-otlp-proto-http", marker = "extra == 'otel'", specifier = "==1.36.0" },
     { name = "opentelemetry-instrumentation-fastapi", marker = "extra == 'otel'", specifier = "==0.57b0" },

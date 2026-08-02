@@ -159,3 +159,34 @@ class RecallResult(BaseModel):
     generation_id: str | None
     abstained: bool
     reason: str | None = None
+
+
+class EmbeddingManifest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    provider: str
+    model: str
+    revision: str
+    artifact_sha256: str | None = Field(default=None, pattern=r"^[0-9a-f]{64}$")
+    dimension: int = Field(gt=0, le=16_384)
+    native_dimension: int = Field(gt=0, le=16_384)
+    normalized: bool = True
+    query_prefix: str = ""
+    document_prefix: str = ""
+    matryoshka: bool = False
+
+    @field_validator("dimension")
+    @classmethod
+    def dimension_must_be_supported(cls, value: int, info):
+        native = info.data.get("native_dimension")
+        # native_dimension may be parsed after dimension, so the model-level invariant
+        # is completed in model_post_init below.
+        if native is not None and value > native:
+            raise ValueError("embedding dimension exceeds the model's native dimension")
+        return value
+
+    def model_post_init(self, __context: Any) -> None:
+        if self.dimension > self.native_dimension:
+            raise ValueError("embedding dimension exceeds the model's native dimension")
+        if self.dimension != self.native_dimension and not self.matryoshka:
+            raise ValueError("dimension reduction requires an explicitly Matryoshka-trained model")

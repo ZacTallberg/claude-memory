@@ -2,11 +2,15 @@ from __future__ import annotations
 
 import time
 import uuid
+from dataclasses import replace
 
 from .clock import utc_iso
+from .embeddings import EmbeddingProvider
 from .ids import content_hash
+from .inference import InferenceScheduler, InferenceShed, InferenceTimeout, WorkKind
 from .models import RecallEvidence, RecallQuery, RecallResult
 from .store import MemoryStore, SearchHit
+from .vector_index import VectorIndexCache
 
 
 class RecallEngine:
@@ -18,10 +22,19 @@ class RecallEngine:
         *,
         lexical_candidates: int = 40,
         abstention_min_score: float = 0.30,
+        vector_min_similarity: float = 0.72,
+        embedder: EmbeddingProvider | None = None,
+        scheduler: InferenceScheduler | None = None,
+        query_timeout_seconds: float = 2.0,
     ) -> None:
         self.store = store
         self.lexical_candidates = lexical_candidates
         self.abstention_min_score = abstention_min_score
+        self.vector_min_similarity = vector_min_similarity
+        self.embedder = embedder
+        self.scheduler = scheduler
+        self.query_timeout_seconds = query_timeout_seconds
+        self.vector_cache = VectorIndexCache()
 
     def recall(self, request: RecallQuery) -> RecallResult:
         request_id = f"recall_{uuid.uuid4().hex}"
@@ -42,9 +55,49 @@ class RecallEngine:
         )
         lexical_ms = (time.perf_counter() - lexical_started) * 1000
 
+        vector_hits: list[SearchHit] = []
+        vector_ran = False
+        vector_failure: str | None = None
+        vector_ms = 0.0
+        manifest = self.store.embedding_manifest(generation) if generation else None
+        if manifest and self.embedder:
+            if manifest != self.embedder.manifest:
+                vector_failure = "active embedding manifest does not match the loaded model"
+            elif not self.scheduler:
+                vector_failure = "inference scheduler is not configured"
+            else:
+                vector_started = time.perf_counter()
+                try:
+                    query_vector = self.scheduler.submit(
+                        WorkKind.QUERY_EMBEDDING,
+                        lambda: self.embedder.embed_query(request.query),
+                        timeout=self.query_timeout_seconds,
+                    )
+                    index = self.vector_cache.get(self.store, generation)
+                    vector_hits = index.search(
+                        query_vector,
+                        limit=max(self.lexical_candidates, request.limit),
+                        hard_project_ids=request.scope.project_ids if hard else (),
+                        hard_providers=request.scope.providers if hard else (),
+                        hard_session_ids=request.scope.session_ids if hard else (),
+                        hard_roles=(
+                            tuple(role.value for role in request.scope.roles) if hard else ()
+                        ),
+                    )
+                    vector_hits = [
+                        hit for hit in vector_hits if hit.vector_score >= self.vector_min_similarity
+                    ]
+                    vector_ran = True
+                except (InferenceShed, InferenceTimeout, ValueError, RuntimeError) as error:
+                    vector_failure = type(error).__name__
+                finally:
+                    vector_ms = (time.perf_counter() - vector_started) * 1000
+
+        fused = self._fuse(hits, vector_hits) if vector_ran else hits
+
         # Soft facets increase relevance without blocking cross-project or cross-provider
         # memory. Explicit hard scope was already applied in SQL.
-        rescored = [self._apply_soft_scope(hit, request) for hit in hits]
+        rescored = [self._apply_soft_scope(hit, request) for hit in fused]
         rescored.sort(key=lambda hit: (-hit.score, hit.document_id))
         accepted = [hit for hit in rescored if hit.score >= self.abstention_min_score]
         selected = self._fit_budget(accepted, request.limit, request.max_chars)
@@ -53,11 +106,12 @@ class RecallEngine:
         if not selected:
             mode = "empty"
             reason = "no evidence crossed the calibrated fast-path threshold"
+        elif vector_ran:
+            mode = "hybrid"
+            reason = None
         else:
-            # The first implementation slice is deliberately lexical-only. Calling it
-            # hybrid before a vector generation is present would repeat v1's telemetry bug.
             mode = "keyword_only"
-            reason = "dense retrieval generation is not active"
+            reason = vector_failure or "dense retrieval generation is not active"
 
         evidence = tuple(self._evidence(hit) for hit in selected)
         self.store.record_retrieval(
@@ -68,7 +122,11 @@ class RecallEngine:
             mode=mode,
             generation_id=generation,
             current_project_id=request.current_project_id,
-            stage_latency={"lexical_ms": round(lexical_ms, 3), "total_ms": round(elapsed_ms, 3)},
+            stage_latency={
+                "lexical_ms": round(lexical_ms, 3),
+                "vector_ms": round(vector_ms, 3),
+                "total_ms": round(elapsed_ms, 3),
+            },
             result_ids=[item.document_id for item in selected],
             fallback_reason=reason if mode == "keyword_only" else None,
         )
@@ -81,6 +139,29 @@ class RecallEngine:
             abstained=not bool(selected),
             reason=reason,
         )
+
+    @staticmethod
+    def _fuse(lexical: list[SearchHit], vector: list[SearchHit]) -> list[SearchHit]:
+        weights = ((lexical, 1.2), (vector, 1.0))
+        maximum = sum(weight / 61.0 for _, weight in weights)
+        by_id: dict[str, SearchHit] = {}
+        scores: dict[str, float] = {}
+        for lane, weight in weights:
+            for rank, hit in enumerate(lane, start=1):
+                scores[hit.document_id] = scores.get(hit.document_id, 0.0) + weight / (60 + rank)
+                current = by_id.get(hit.document_id)
+                if current is None:
+                    by_id[hit.document_id] = hit
+                else:
+                    by_id[hit.document_id] = replace(
+                        current,
+                        lexical_score=max(current.lexical_score, hit.lexical_score),
+                        exact_score=max(current.exact_score, hit.exact_score),
+                        vector_score=max(current.vector_score, hit.vector_score),
+                    )
+        return [
+            replace(hit, fusion_score=scores[document] / maximum) for document, hit in by_id.items()
+        ]
 
     @staticmethod
     def _apply_soft_scope(hit: SearchHit, request: RecallQuery) -> SearchHit:

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import re
 import sqlite3
@@ -7,11 +8,13 @@ from dataclasses import dataclass
 from datetime import datetime
 from typing import Any
 
+import numpy as np
+
 from .archive import CanonicalArchive
 from .clock import utc_iso
 from .database import Database
 from .ids import content_hash, document_id, episode_id, event_id, source_id, stable_id
-from .models import ClaimOperation, ClaimProposal, IngestEvent, IngestResult
+from .models import ClaimOperation, ClaimProposal, EmbeddingManifest, IngestEvent, IngestResult
 from .normalize import NORMALIZER_VERSION, normalize_authored_text
 
 
@@ -41,10 +44,13 @@ class SearchHit:
     lexical_score: float
     exact_score: float
     project_boost: float
+    vector_score: float = 0.0
+    fusion_score: float = 0.0
 
     @property
     def score(self) -> float:
-        return self.lexical_score + self.exact_score + self.project_boost
+        base = self.fusion_score if self.fusion_score else self.lexical_score + self.vector_score
+        return base + self.exact_score + self.project_boost
 
 
 class MemoryStore:
@@ -370,12 +376,17 @@ class MemoryStore:
         code_revision: str | None = None,
         lock_sha256: str | None = None,
     ) -> str:
+        parsed_embedding = (
+            EmbeddingManifest.model_validate(embedding_manifest).model_dump(mode="json")
+            if embedding_manifest
+            else None
+        )
         manifest = {
             "corpus_sha256": corpus_sha256,
             "chunker_version": chunker_version,
             "normalizer_version": NORMALIZER_VERSION,
             "lexical": lexical_config or {},
-            "embedding": embedding_manifest,
+            "embedding": parsed_embedding,
             "reranker": reranker_manifest,
             "code_revision": code_revision,
             "lock_sha256": lock_sha256,
@@ -395,7 +406,7 @@ class MemoryStore:
                     NORMALIZER_VERSION,
                     chunker_version,
                     json.dumps(lexical_config or {}, sort_keys=True),
-                    json.dumps(embedding_manifest, sort_keys=True) if embedding_manifest else None,
+                    json.dumps(parsed_embedding, sort_keys=True) if parsed_embedding else None,
                     json.dumps(reranker_manifest, sort_keys=True) if reranker_manifest else None,
                     code_revision,
                     lock_sha256,
@@ -441,12 +452,125 @@ class MemoryStore:
                     row["metadata"],
                 ),
             )
+            if target["embedding_manifest_json"]:
+                connection.execute(
+                    """INSERT OR IGNORE INTO embedding_queue(
+                           document_id,generation_id,priority,attempts,available_at
+                       ) VALUES (?,?,100,0,?)""",
+                    (doc_id, generation, utc_iso()),
+                )
         return doc_id
+
+    def embedding_manifest(self, generation: str) -> EmbeddingManifest | None:
+        with self.database.read() as connection:
+            row = connection.execute(
+                "SELECT embedding_manifest_json FROM search_generations WHERE id=?",
+                (generation,),
+            ).fetchone()
+        if not row or not row["embedding_manifest_json"]:
+            return None
+        return EmbeddingManifest.model_validate(json.loads(row["embedding_manifest_json"]))
+
+    def pending_embedding_batch(self, generation: str, *, limit: int = 8) -> list[tuple[str, str]]:
+        with self.database.read() as connection:
+            rows = connection.execute(
+                """SELECT d.id,d.body
+                   FROM embedding_queue q
+                   JOIN search_documents d ON d.id=q.document_id
+                   WHERE q.generation_id=? AND q.available_at<=?
+                   ORDER BY q.priority,q.available_at,q.document_id
+                   LIMIT ?""",
+                (generation, utc_iso(), max(1, min(limit, 8))),
+            ).fetchall()
+        return [(row["id"], row["body"]) for row in rows]
+
+    def put_embeddings(self, generation: str, vectors: dict[str, list[float]]) -> int:
+        manifest = self.embedding_manifest(generation)
+        if not manifest:
+            raise ValueError("generation has no embedding manifest")
+        prepared: list[tuple[str, bytes, str]] = []
+        for document, values in vectors.items():
+            vector = np.asarray(values, dtype="<f4")
+            if vector.ndim != 1 or int(vector.shape[0]) != manifest.dimension:
+                raise ValueError(
+                    f"embedding dimension mismatch for {document}: "
+                    f"got={vector.shape} expected={manifest.dimension}"
+                )
+            if not np.isfinite(vector).all():
+                raise ValueError(f"embedding contains non-finite values for {document}")
+            norm = float(np.linalg.norm(vector))
+            if norm <= 0:
+                raise ValueError(f"embedding has zero norm for {document}")
+            if manifest.normalized:
+                vector = vector / norm
+            payload = vector.astype("<f4", copy=False).tobytes()
+            prepared.append((document, payload, hashlib.sha256(payload).hexdigest()))
+        with self.database.write() as connection:
+            for document, payload, digest in prepared:
+                exists = connection.execute(
+                    "SELECT 1 FROM search_documents WHERE id=? AND generation_id=?",
+                    (document, generation),
+                ).fetchone()
+                if not exists:
+                    raise ValueError(f"document {document} is not in generation {generation}")
+                connection.execute(
+                    """INSERT INTO embedding_vectors(
+                           generation_id,document_id,dimension,vector,vector_sha256,created_at
+                       ) VALUES (?,?,?,?,?,?)
+                       ON CONFLICT(generation_id,document_id) DO UPDATE SET
+                           dimension=excluded.dimension,vector=excluded.vector,
+                           vector_sha256=excluded.vector_sha256,created_at=excluded.created_at""",
+                    (
+                        generation,
+                        document,
+                        manifest.dimension,
+                        payload,
+                        digest,
+                        utc_iso(),
+                    ),
+                )
+                connection.execute(
+                    "DELETE FROM embedding_queue WHERE generation_id=? AND document_id=?",
+                    (generation, document),
+                )
+        return len(prepared)
+
+    def vector_records(self, generation: str) -> list[dict[str, Any]]:
+        with self.database.read() as connection:
+            rows = connection.execute(
+                """SELECT d.*,v.dimension,v.vector,v.vector_sha256
+                   FROM embedding_vectors v
+                   JOIN search_documents d ON d.id=v.document_id
+                   WHERE v.generation_id=? AND d.generation_id=?
+                   ORDER BY d.id""",
+                (generation, generation),
+            ).fetchall()
+        return [dict(row) for row in rows]
+
+    def embedding_status(self, generation: str) -> dict[str, int]:
+        with self.database.read() as connection:
+            documents = int(
+                connection.execute(
+                    "SELECT COUNT(*) FROM search_documents WHERE generation_id=?", (generation,)
+                ).fetchone()[0]
+            )
+            vectors = int(
+                connection.execute(
+                    "SELECT COUNT(*) FROM embedding_vectors WHERE generation_id=?", (generation,)
+                ).fetchone()[0]
+            )
+            pending = int(
+                connection.execute(
+                    "SELECT COUNT(*) FROM embedding_queue WHERE generation_id=?", (generation,)
+                ).fetchone()[0]
+            )
+        return {"documents": documents, "vectors": vectors, "pending": pending}
 
     def activate_generation(self, generation: str) -> None:
         with self.database.write() as connection:
             row = connection.execute(
-                "SELECT status FROM search_generations WHERE id=?", (generation,)
+                "SELECT status,embedding_manifest_json FROM search_generations WHERE id=?",
+                (generation,),
             ).fetchone()
             if not row or row["status"] not in ("building", "active"):
                 raise ValueError("generation is not activatable")
@@ -457,6 +581,25 @@ class MemoryStore:
             )
             if count == 0:
                 raise ValueError("cannot activate an empty search generation")
+            manifest = row["embedding_manifest_json"]
+            if manifest:
+                vectors = int(
+                    connection.execute(
+                        "SELECT COUNT(*) FROM embedding_vectors WHERE generation_id=?",
+                        (generation,),
+                    ).fetchone()[0]
+                )
+                pending = int(
+                    connection.execute(
+                        "SELECT COUNT(*) FROM embedding_queue WHERE generation_id=?",
+                        (generation,),
+                    ).fetchone()[0]
+                )
+                if vectors != count or pending:
+                    raise ValueError(
+                        "cannot activate an incomplete embedding generation: "
+                        f"documents={count} vectors={vectors} pending={pending}"
+                    )
             connection.execute(
                 "UPDATE search_generations SET status='retired' WHERE status='active' AND id<>?",
                 (generation,),
