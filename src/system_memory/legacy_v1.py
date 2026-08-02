@@ -74,6 +74,9 @@ class LegacyV1Importer:
         )
         providers: Counter[str] = Counter()
         losses: Counter[str] = Counter()
+        imported_chunk_ids, imported_fact_ids = self.store.legacy_v1_row_ids(
+            report.source_database_sha256
+        )
         connection = sqlite3.connect(f"file:{database.as_posix()}?mode=ro&immutable=1", uri=True)
         connection.row_factory = sqlite3.Row
         try:
@@ -96,6 +99,19 @@ class LegacyV1Importer:
                 }
 
             seen: set[tuple[Any, ...]] = set()
+            pending_chunks: list[IngestEvent] = []
+
+            def flush_chunks() -> None:
+                if not pending_chunks:
+                    return
+                for result in self.store.ingest_batch(pending_chunks):
+                    report.redactions += result.redaction_count
+                    if result.inserted:
+                        report.chunk_events_inserted += 1
+                    else:
+                        report.chunk_events_existing += 1
+                pending_chunks.clear()
+
             query = """SELECT c.* FROM chunks c ORDER BY c.source_id,c.ts,c.id"""
             for row in connection.execute(query):
                 source = sources[int(row["source_id"])]
@@ -114,6 +130,9 @@ class LegacyV1Importer:
                     report.exact_duplicates_skipped += 1
                     continue
                 seen.add(duplicate_key)
+                if int(row["id"]) in imported_chunk_ids:
+                    report.chunk_events_existing += 1
+                    continue
 
                 provider = source["provider"]
                 providers[provider] += 1
@@ -169,17 +188,18 @@ class LegacyV1Importer:
                         "legacy_context_blurb": row["context_blurb"],
                     },
                 )
-                result = self.store.ingest(incoming)
-                report.redactions += result.redaction_count
-                if result.inserted:
-                    report.chunk_events_inserted += 1
-                else:
-                    report.chunk_events_existing += 1
+                pending_chunks.append(incoming)
+                if len(pending_chunks) >= 250:
+                    flush_chunks()
                 if on_progress and progress_every and report.chunk_rows_seen % progress_every == 0:
                     on_progress(report)
 
+            flush_chunks()
+
             if include_facts and not only_missing_sources:
-                self._import_facts(connection, report, providers, losses)
+                self._import_facts(
+                    connection, report, providers, losses, imported_fact_ids=imported_fact_ids
+                )
         finally:
             connection.close()
         report.provider_counts = dict(sorted(providers.items()))
@@ -192,9 +212,15 @@ class LegacyV1Importer:
         report: LegacyImportReport,
         providers: Counter[str],
         losses: Counter[str],
+        *,
+        imported_fact_ids: set[int],
     ) -> None:
+        pending: list[IngestEvent] = []
         for row in connection.execute("SELECT * FROM facts ORDER BY id"):
             report.facts_seen += 1
+            if int(row["id"]) in imported_fact_ids:
+                report.fact_events_existing += 1
+                continue
             rendering = "\n\n".join(
                 item.strip()
                 for item in (row["title"] or "", row["description"] or "", row["body"] or "")
@@ -238,7 +264,8 @@ class LegacyV1Importer:
                     "legacy_tags": row["tags"],
                 },
             )
-            result = self.store.ingest(incoming)
+            pending.append(incoming)
+        for result in self.store.ingest_batch(pending):
             report.redactions += result.redaction_count
             if result.inserted:
                 report.fact_events_inserted += 1

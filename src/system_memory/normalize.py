@@ -16,6 +16,7 @@ _DROP_BLOCKS = (
     "environment_context",
     "recommended_plugins",
     "app-context",
+    "heartbeat",
 )
 _BLOCK = re.compile(
     rf"<(?P<tag>{'|'.join(re.escape(item) for item in _DROP_BLOCKS)})\b[^>]*>.*?"
@@ -35,8 +36,8 @@ class NormalizedText:
     dropped: bool
 
 
-def normalize_authored_text(text: str, *, strip_transport: bool = False) -> NormalizedText:
-    """Preserve paragraphs/code while removing known injected transport and secrets."""
+def strip_injected_blocks(text: str, *, strip_transport: bool = False) -> str:
+    """Remove known transport injections without touching authored formatting or secrets."""
     value = (text or "").replace("\r\n", "\n").replace("\r", "\n")
     previous = None
     while value != previous:
@@ -44,6 +45,11 @@ def normalize_authored_text(text: str, *, strip_transport: bool = False) -> Norm
         value = _BLOCK.sub("\n", value)
     if strip_transport:
         value = _TRANSPORT_LINE.sub("", value)
-    value = "\n".join(line.rstrip() for line in value.split("\n")).strip()
+    return "\n".join(line.rstrip() for line in value.split("\n")).strip()
+
+
+def normalize_authored_text(text: str, *, strip_transport: bool = False) -> NormalizedText:
+    """Preserve paragraphs/code while removing known injected transport and secrets."""
+    value = strip_injected_blocks(text, strip_transport=strip_transport)
     safe, findings = redact_secrets(value)
     return NormalizedText(text=safe, secret_findings=findings, dropped=not bool(safe.strip()))

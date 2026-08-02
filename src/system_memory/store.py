@@ -16,7 +16,7 @@ from .database import Database
 from .ids import content_hash, document_id, episode_id, event_id, source_id, stable_id
 from .models import ClaimOperation, ClaimProposal, EmbeddingManifest, IngestEvent, IngestResult
 from .normalize import NORMALIZER_VERSION, normalize_authored_text
-from .security import redact_secrets, sanitize_structure
+from .security import SecretFinding, redact_secrets, sanitize_structure
 
 
 class IdentityConflict(RuntimeError):
@@ -54,6 +54,23 @@ class SearchHit:
         return base + self.exact_score + self.project_boost
 
 
+@dataclass(frozen=True)
+class _PreparedEvent:
+    incoming: IngestEvent
+    safe_locator: str
+    safe_metadata: dict[str, Any]
+    safe_worktree: str | None
+    findings: tuple[SecretFinding, ...]
+    body: str
+    body_hash: str
+    source_id: str
+    episode_id: str
+    event_id: str
+    occurred_at: str
+    prepared_at: str
+    archive_path: str
+
+
 class MemoryStore:
     def __init__(self, database: Database, archive: CanonicalArchive) -> None:
         self.database = database
@@ -63,6 +80,19 @@ class MemoryStore:
         return self.database.migrate()
 
     def ingest(self, incoming: IngestEvent) -> IngestResult:
+        prepared = self._prepare_event(incoming)
+        with self.database.write() as connection:
+            return self._persist_event(connection, prepared)
+
+    def ingest_batch(self, incoming: list[IngestEvent]) -> list[IngestResult]:
+        """Archive every event, then commit the complete batch in one transaction."""
+        if not incoming:
+            return []
+        prepared = [self._prepare_event(event) for event in incoming]
+        with self.database.write() as connection:
+            return [self._persist_event(connection, event) for event in prepared]
+
+    def _prepare_event(self, incoming: IngestEvent) -> _PreparedEvent:
         normalized = normalize_authored_text(incoming.content)
         if normalized.dropped:
             raise ValueError("event contains no memory-eligible authored content")
@@ -118,13 +148,29 @@ class MemoryStore:
         # Archive first. A crash can leave an unreferenced immutable blob, but can never
         # commit a canonical event whose archive payload does not already exist.
         archive_path = self.archive.put_event(evt_id, archive_payload)
-        metadata = dict(safe_metadata)
-        metadata["archive_path"] = str(archive_path)
+        return _PreparedEvent(
+            incoming=incoming,
+            safe_locator=safe_locator,
+            safe_metadata=safe_metadata,
+            safe_worktree=safe_worktree or None,
+            findings=all_findings,
+            body=normalized.text,
+            body_hash=body_hash,
+            source_id=src_id,
+            episode_id=ep_id,
+            event_id=evt_id,
+            occurred_at=occurred,
+            prepared_at=now,
+            archive_path=str(archive_path),
+        )
 
-        inserted = False
-        with self.database.write() as connection:
-            connection.execute(
-                """INSERT INTO sources(
+    @staticmethod
+    def _persist_event(connection: sqlite3.Connection, prepared: _PreparedEvent) -> IngestResult:
+        incoming = prepared.incoming
+        metadata = dict(prepared.safe_metadata)
+        metadata["archive_path"] = prepared.archive_path
+        connection.execute(
+            """INSERT INTO sources(
                        id,kind,provider,locator,locator_hash,content_hash,cursor,loss_flags,
                        metadata,first_seen_at,last_seen_at
                    ) VALUES (?,?,?,?,?,?,?,?,?,?,?)
@@ -134,22 +180,22 @@ class MemoryStore:
                        loss_flags=excluded.loss_flags,
                        metadata=excluded.metadata,
                        last_seen_at=excluded.last_seen_at""",
-                (
-                    src_id,
-                    incoming.source_kind,
-                    incoming.provider,
-                    safe_locator,
-                    content_hash(safe_locator),
-                    None,
-                    incoming.source_offset_end or 0,
-                    json.dumps(incoming.loss_flags),
-                    json.dumps({"latest_archive": str(archive_path)}, sort_keys=True),
-                    now,
-                    now,
-                ),
-            )
-            connection.execute(
-                """INSERT INTO episodes(
+            (
+                prepared.source_id,
+                incoming.source_kind,
+                incoming.provider,
+                prepared.safe_locator,
+                content_hash(prepared.safe_locator),
+                None,
+                incoming.source_offset_end or 0,
+                json.dumps(incoming.loss_flags),
+                json.dumps({"latest_archive": prepared.archive_path}, sort_keys=True),
+                prepared.prepared_at,
+                prepared.prepared_at,
+            ),
+        )
+        connection.execute(
+            """INSERT INTO episodes(
                        id,provider,agent_id,session_id,parent_session_id,sequence,project_id,
                        task_id,hub_instance_id,status,started_at,metadata,created_at
                    ) VALUES (?,?,?,?,?,?,?,?,?,'open',?,?,?)
@@ -158,82 +204,89 @@ class MemoryStore:
                        project_id=COALESCE(episodes.project_id,excluded.project_id),
                        task_id=COALESCE(episodes.task_id,excluded.task_id),
                        hub_instance_id=COALESCE(episodes.hub_instance_id,excluded.hub_instance_id)""",
-                (
-                    ep_id,
-                    incoming.provider,
-                    incoming.agent_id,
-                    incoming.session_id,
-                    incoming.parent_session_id,
-                    incoming.episode_sequence,
-                    incoming.project_id,
-                    incoming.task_id,
-                    incoming.hub_instance_id,
-                    occurred,
-                    json.dumps({}, sort_keys=True),
-                    now,
-                ),
-            )
-            existing = connection.execute(
-                "SELECT content_sha256 FROM memory_events WHERE id=?", (evt_id,)
-            ).fetchone()
-            if existing:
-                if existing["content_sha256"] != body_hash:
-                    raise IdentityConflict(f"event identity conflict: {evt_id}")
-            else:
-                connection.execute(
-                    """INSERT INTO memory_events(
+            (
+                prepared.episode_id,
+                incoming.provider,
+                incoming.agent_id,
+                incoming.session_id,
+                incoming.parent_session_id,
+                incoming.episode_sequence,
+                incoming.project_id,
+                incoming.task_id,
+                incoming.hub_instance_id,
+                prepared.occurred_at,
+                json.dumps({}, sort_keys=True),
+                prepared.prepared_at,
+            ),
+        )
+        existing = connection.execute(
+            "SELECT content_sha256 FROM memory_events WHERE id=?", (prepared.event_id,)
+        ).fetchone()
+        inserted = False
+        if existing:
+            if existing["content_sha256"] != prepared.body_hash:
+                raise IdentityConflict(f"event identity conflict: {prepared.event_id}")
+        else:
+            connection.execute(
+                """INSERT INTO memory_events(
                            id,source_id,episode_id,provider,provider_event_id,agent_id,session_id,
                            parent_session_id,project_id,task_id,hub_instance_id,worktree,commit_sha,
                            role,authority,kind,occurred_at,ingested_at,content,content_sha256,
                            source_offset_start,source_offset_end,visibility,trust,normalizer_version,
                            loss_flags,metadata
                        ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
-                    (
-                        evt_id,
-                        src_id,
-                        ep_id,
-                        incoming.provider,
-                        incoming.provider_event_id,
-                        incoming.agent_id,
-                        incoming.session_id,
-                        incoming.parent_session_id,
-                        incoming.project_id,
-                        incoming.task_id,
-                        incoming.hub_instance_id,
-                        safe_worktree or None,
-                        incoming.commit_sha,
-                        incoming.role.value,
-                        incoming.authority.value,
-                        incoming.kind.value,
-                        occurred,
-                        now,
-                        normalized.text,
-                        body_hash,
-                        incoming.source_offset_start,
-                        incoming.source_offset_end,
-                        incoming.visibility,
-                        incoming.trust,
-                        NORMALIZER_VERSION,
-                        json.dumps(incoming.loss_flags),
-                        json.dumps(metadata, ensure_ascii=False, sort_keys=True),
-                    ),
-                )
-                inserted = True
-            for finding in all_findings:
-                connection.execute(
-                    """INSERT OR IGNORE INTO secret_tombstones(
+                (
+                    prepared.event_id,
+                    prepared.source_id,
+                    prepared.episode_id,
+                    incoming.provider,
+                    incoming.provider_event_id,
+                    incoming.agent_id,
+                    incoming.session_id,
+                    incoming.parent_session_id,
+                    incoming.project_id,
+                    incoming.task_id,
+                    incoming.hub_instance_id,
+                    prepared.safe_worktree,
+                    incoming.commit_sha,
+                    incoming.role.value,
+                    incoming.authority.value,
+                    incoming.kind.value,
+                    prepared.occurred_at,
+                    prepared.prepared_at,
+                    prepared.body,
+                    prepared.body_hash,
+                    incoming.source_offset_start,
+                    incoming.source_offset_end,
+                    incoming.visibility,
+                    incoming.trust,
+                    NORMALIZER_VERSION,
+                    json.dumps(incoming.loss_flags),
+                    json.dumps(metadata, ensure_ascii=False, sort_keys=True),
+                ),
+            )
+            inserted = True
+        for finding in prepared.findings:
+            connection.execute(
+                """INSERT OR IGNORE INTO secret_tombstones(
                            fingerprint,kind,source_id,created_at,reason
                        ) VALUES (?,?,?,?,?)""",
-                    (finding.fingerprint, finding.kind, src_id, now, "redacted during ingestion"),
-                )
+                (
+                    finding.fingerprint,
+                    finding.kind,
+                    prepared.source_id,
+                    prepared.prepared_at,
+                    "redacted during ingestion",
+                ),
+            )
 
         return IngestResult(
-            event_id=evt_id,
-            source_id=src_id,
-            episode_id=ep_id,
+            event_id=prepared.event_id,
+            source_id=prepared.source_id,
+            episode_id=prepared.episode_id,
             inserted=inserted,
-            redaction_count=len(all_findings),
-            content_sha256=body_hash,
+            redaction_count=len(prepared.findings),
+            content_sha256=prepared.body_hash,
         )
 
     def close_episode(self, episode: str, *, ended_at: datetime | None = None) -> bool:
@@ -751,6 +804,29 @@ class MemoryStore:
                 name: int(connection.execute(f"SELECT COUNT(*) FROM {name}").fetchone()[0])
                 for name in names
             }
+
+    def legacy_v1_row_ids(self, source_database_sha256: str) -> tuple[set[int], set[int]]:
+        prefix = f"legacy-v1://{source_database_sha256}/%"
+        chunk_ids: set[int] = set()
+        fact_ids: set[int] = set()
+        with self.database.read() as connection:
+            rows = connection.execute(
+                """SELECT e.metadata
+                   FROM memory_events e
+                   JOIN sources s ON s.id=e.source_id
+                   WHERE s.locator LIKE ?""",
+                (prefix,),
+            ).fetchall()
+        for row in rows:
+            try:
+                metadata = json.loads(row["metadata"] or "{}")
+            except json.JSONDecodeError:
+                continue
+            if isinstance(metadata.get("legacy_chunk_id"), int):
+                chunk_ids.add(metadata["legacy_chunk_id"])
+            if isinstance(metadata.get("legacy_fact_id"), int):
+                fact_ids.add(metadata["legacy_fact_id"])
+        return chunk_ids, fact_ids
 
     @staticmethod
     def _key(value: str) -> str:

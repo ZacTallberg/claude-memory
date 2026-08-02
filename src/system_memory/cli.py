@@ -11,6 +11,7 @@ from .archive import CanonicalArchive
 from .auth import CredentialStore
 from .database import Database
 from .legacy_v1 import LegacyV1Importer
+from .raw_transcripts import RawTranscriptImporter
 from .settings import Settings
 from .store import MemoryStore
 
@@ -124,6 +125,14 @@ def command_import_v1(args: argparse.Namespace) -> int:
     return 0
 
 
+def command_import_raw(args: argparse.Namespace) -> int:
+    settings = _settings(args)
+    memory = _store(settings)
+    report = RawTranscriptImporter(memory).import_sources(Path(args.database))
+    print(report.model_dump_json(indent=2))
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="system-memory")
     parser.add_argument("--root", help="installation root (defaults to current directory)")
@@ -147,6 +156,12 @@ def build_parser() -> argparse.ArgumentParser:
     importer.add_argument("--skip-facts", action="store_true")
     importer.add_argument("--progress-every", type=int, default=1_000)
     importer.set_defaults(handler=command_import_v1)
+
+    raw_importer = subparsers.add_parser(
+        "import-raw", help="reparse available Claude and Codex source files from a v1 inventory"
+    )
+    raw_importer.add_argument("database")
+    raw_importer.set_defaults(handler=command_import_raw)
     return parser
 
 
