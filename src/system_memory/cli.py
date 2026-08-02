@@ -9,6 +9,7 @@ from pathlib import Path
 from .api import create_app
 from .archive import CanonicalArchive
 from .auth import CredentialStore
+from .backup import BackupManager
 from .database import Database
 from .evaluation import load_cases, run_evaluation, validate_gold64, write_schema
 from .legacy_v1 import LegacyV1Importer
@@ -200,6 +201,28 @@ def command_eval_schema(args: argparse.Namespace) -> int:
     return 0
 
 
+def command_backup(args: argparse.Namespace) -> int:
+    settings = _settings(args)
+    memory = _store(settings)
+    snapshot = BackupManager(memory, repository_root=Path(__file__).resolve().parents[2]).create(
+        Path(args.destination)
+    )
+    print(json.dumps({"ok": True, "snapshot": str(snapshot)}))
+    return 0
+
+
+def command_verify_backup(args: argparse.Namespace) -> int:
+    manifest = BackupManager.verify_snapshot(Path(args.snapshot))
+    print(manifest.model_dump_json(indent=2))
+    return 0
+
+
+def command_restore(args: argparse.Namespace) -> int:
+    target = BackupManager.restore(Path(args.snapshot), Path(args.target))
+    print(json.dumps({"ok": True, "restored": str(target)}))
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="system-memory")
     parser.add_argument("--root", help="installation root (defaults to current directory)")
@@ -252,6 +275,23 @@ def build_parser() -> argparse.ArgumentParser:
     schema = subparsers.add_parser("eval-schema", help="write the evaluation case JSON schema")
     schema.add_argument("output")
     schema.set_defaults(handler=command_eval_schema)
+
+    backup = subparsers.add_parser("backup", help="create a verified canonical snapshot")
+    backup.add_argument("destination")
+    backup.set_defaults(handler=command_backup)
+
+    verify_backup = subparsers.add_parser(
+        "verify-backup", help="verify every declared backup payload and archive reference"
+    )
+    verify_backup.add_argument("snapshot")
+    verify_backup.set_defaults(handler=command_verify_backup)
+
+    restore = subparsers.add_parser(
+        "restore", help="restore a verified snapshot into a new isolated root"
+    )
+    restore.add_argument("snapshot")
+    restore.add_argument("target")
+    restore.set_defaults(handler=command_restore)
     return parser
 
 
