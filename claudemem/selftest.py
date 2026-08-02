@@ -666,9 +666,22 @@ def run_selftest(verbose: bool = True) -> bool:
             made = create_backup(test_cfg, retention=2)
             checked = verify_snapshot(Path(made["snapshot"]))
             due = create_backup(test_cfg, if_due=True, retention=2)
+            snapshot = Path(made["snapshot"])
+            payload = snapshot / "claudemem.db"
+            held = snapshot / "claudemem.db.held"
+            payload.rename(held)
+            missing_rejected = False
+            try:
+                verify_snapshot(snapshot)
+            except RuntimeError:
+                missing_rejected = not payload.exists()
+            finally:
+                held.rename(payload)
         ok = (made.get("created") and checked.get("ok") and checked.get("notes") == 1
-              and due.get("created") is False and checked["counts"]["chunks"] == 1)
-        return ok, f"created={made.get('created')} verified={checked.get('ok')} due_skipped={not due.get('created')}"
+              and due.get("created") is False and checked["counts"]["chunks"] == 1
+              and checked.get("secret_scan") == "clean" and missing_rejected)
+        return ok, (f"created={made.get('created')} verified={checked.get('ok')} "
+                    f"due_skipped={not due.get('created')} missing_rejected={missing_rejected}")
     ctx.check("SQLite and curated-note backup is atomic, checksummed, verified, and debounced",
               c_verified_backup)
 

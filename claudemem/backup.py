@@ -28,12 +28,24 @@ def verify_snapshot(snapshot_dir: Path) -> dict:
     snapshot_dir = snapshot_dir.resolve()
     manifest_path = snapshot_dir / "manifest.json"
     manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    declared = set(manifest.get("sha256") or {})
+    required = {"claudemem.db", "curated-notes.zip"}
+    if declared != required:
+        raise RuntimeError(
+            f"backup manifest payload set differs: expected={sorted(required)} "
+            f"declared={sorted(declared)}")
+    actual_files = {path.name for path in snapshot_dir.iterdir() if path.is_file()}
+    expected_files = declared | {"manifest.json"}
+    if actual_files != expected_files:
+        raise RuntimeError(
+            f"backup directory payload set differs: expected={sorted(expected_files)} "
+            f"actual={sorted(actual_files)}")
     for name, expected in manifest["sha256"].items():
         path = snapshot_dir / name
-        if not path.is_file() or _sha256(path) != expected:
+        if not path.is_file() or path.stat().st_size <= 0 or _sha256(path) != expected:
             raise RuntimeError(f"backup checksum mismatch: {name}")
     db_path = snapshot_dir / "claudemem.db"
-    conn = sqlite3.connect(str(db_path))
+    conn = sqlite3.connect(f"file:{db_path.as_posix()}?mode=ro&immutable=1", uri=True)
     try:
         result = conn.execute("PRAGMA quick_check").fetchone()[0]
         if result != "ok":
@@ -43,10 +55,51 @@ def verify_snapshot(snapshot_dir: Path) -> dict:
             "chunks": conn.execute("SELECT count(*) FROM chunks").fetchone()[0],
             "facts": conn.execute("SELECT count(*) FROM facts").fetchone()[0],
         }
+        secret_counts: Counter[str] = Counter()
+        for table_row in conn.execute(
+                "SELECT name,sql FROM sqlite_master "
+                "WHERE type='table' AND name NOT LIKE 'sqlite_%'"):
+            table, schema_sql = table_row
+            if "using vec0" in (schema_sql or "").casefold():
+                continue
+            try:
+                columns = [(row[1], (row[2] or "").upper())
+                           for row in conn.execute(f'PRAGMA table_info("{table}")')]
+            except sqlite3.DatabaseError:
+                continue
+            text_columns = [name for name, kind in columns
+                            if kind in ("TEXT", "") or "CHAR" in kind or "CLOB" in kind]
+            if not text_columns:
+                continue
+            selected = ",".join('"' + name.replace('"', '""') + '"'
+                                for name in text_columns)
+            try:
+                rows = conn.execute(f'SELECT {selected} FROM "{table}"')
+                for row in rows:
+                    for value in row:
+                        if isinstance(value, str):
+                            _safe, findings = redact_secrets(value)
+                            secret_counts.update(finding.kind for finding in findings)
+            except sqlite3.DatabaseError:
+                # FTS/vector shadow tables may not be queryable without their extensions;
+                # canonical text tables were scanned independently above.
+                continue
     finally:
         conn.close()
+    with zipfile.ZipFile(snapshot_dir / "curated-notes.zip") as archive:
+        for member in archive.namelist():
+            if member.endswith("/"):
+                continue
+            text = archive.read(member).decode("utf-8", errors="replace")
+            _safe, findings = redact_secrets(text)
+            secret_counts.update(finding.kind for finding in findings)
+    if secret_counts:
+        raise RuntimeError(
+            "backup secret scan failed: "
+            + json.dumps(dict(sorted(secret_counts.items())), sort_keys=True))
     return {"ok": True, "snapshot": str(snapshot_dir), "counts": counts,
-            "notes": manifest.get("notes", 0), "created_at": manifest.get("created_at")}
+            "notes": manifest.get("notes", 0), "created_at": manifest.get("created_at"),
+            "secret_scan": "clean"}
 
 
 def create_backup(cfg: Config, *, if_due: bool = False, retention: int = 14,
