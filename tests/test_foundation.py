@@ -94,7 +94,7 @@ def test_secrets_are_redacted_in_database_and_archive(store):
 def test_database_reports_full_durability_and_integrity(store):
     health = store.database.health()
     assert health["ok"] is True
-    assert health["schema_version"] == 1
+    assert health["schema_version"] == 2
     with store.database.read() as connection:
         assert connection.execute("PRAGMA foreign_keys").fetchone()[0] == 1
         assert connection.execute("PRAGMA synchronous").fetchone()[0] == 2

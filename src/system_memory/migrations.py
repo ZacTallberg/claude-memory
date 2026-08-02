@@ -304,4 +304,23 @@ CREATE TABLE IF NOT EXISTS idempotency (
 );
 """,
     ),
+    Migration(
+        2,
+        "scoped_credentials",
+        r"""
+CREATE TABLE IF NOT EXISTS credentials (
+    id TEXT PRIMARY KEY,
+    actor_id TEXT NOT NULL,
+    label TEXT NOT NULL,
+    token_sha256 TEXT NOT NULL UNIQUE,
+    scopes_json TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    expires_at TEXT,
+    revoked_at TEXT,
+    last_used_at TEXT,
+    metadata TEXT NOT NULL DEFAULT '{}'
+);
+CREATE INDEX IF NOT EXISTS credentials_actor_idx ON credentials(actor_id, revoked_at);
+""",
+    ),
 )

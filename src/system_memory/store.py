@@ -473,6 +473,9 @@ class MemoryStore:
         limit: int = 20,
         current_project_id: str | None = None,
         hard_project_ids: tuple[str, ...] = (),
+        hard_providers: tuple[str, ...] = (),
+        hard_session_ids: tuple[str, ...] = (),
+        hard_roles: tuple[str, ...] = (),
     ) -> list[SearchHit]:
         fts_query, exact_terms = self._fts_query(query)
         if not fts_query:
@@ -489,6 +492,18 @@ class MemoryStore:
                 placeholders = ",".join("?" for _ in hard_project_ids)
                 where += f" AND d.project_id IN ({placeholders})"
                 parameters.extend(hard_project_ids)
+            if hard_providers:
+                placeholders = ",".join("?" for _ in hard_providers)
+                where += f" AND d.provider IN ({placeholders})"
+                parameters.extend(hard_providers)
+            if hard_session_ids:
+                placeholders = ",".join("?" for _ in hard_session_ids)
+                where += f" AND d.session_id IN ({placeholders})"
+                parameters.extend(hard_session_ids)
+            if hard_roles:
+                placeholders = ",".join("?" for _ in hard_roles)
+                where += f" AND d.role IN ({placeholders})"
+                parameters.extend(hard_roles)
             parameters.append(max(limit * 4, limit))
             rows = connection.execute(
                 f"""SELECT d.*, bm25(search_documents_fts,5.0,1.0) AS rank
@@ -534,6 +549,50 @@ class MemoryStore:
             )
         hits.sort(key=lambda item: (-item.score, item.document_id))
         return hits[:limit]
+
+    def active_generation_id(self) -> str | None:
+        with self.database.read() as connection:
+            row = connection.execute(
+                "SELECT id FROM search_generations WHERE status='active'"
+            ).fetchone()
+        return row["id"] if row else None
+
+    def record_retrieval(
+        self,
+        *,
+        request_id: str,
+        query_sha256: str,
+        requested_at: str,
+        delivered_at: str,
+        mode: str,
+        generation_id: str | None,
+        current_project_id: str | None,
+        stage_latency: dict[str, float],
+        result_ids: list[str],
+        fallback_reason: str | None,
+        index_age_seconds: float | None = None,
+    ) -> None:
+        with self.database.write() as connection:
+            connection.execute(
+                """INSERT INTO retrieval_receipts(
+                       request_id,query_sha256,requested_at,delivered_at,mode,generation_id,
+                       current_project_id,stage_latency_json,result_ids_json,fallback_reason,
+                       index_age_seconds
+                   ) VALUES (?,?,?,?,?,?,?,?,?,?,?)""",
+                (
+                    request_id,
+                    query_sha256,
+                    requested_at,
+                    delivered_at,
+                    mode,
+                    generation_id,
+                    current_project_id,
+                    json.dumps(stage_latency, sort_keys=True),
+                    json.dumps(result_ids),
+                    fallback_reason,
+                    index_age_seconds,
+                ),
+            )
 
     def counts(self) -> dict[str, int]:
         with self.database.read() as connection:

@@ -17,6 +17,7 @@ class Settings(BaseSettings):
     root: Path = Field(default_factory=lambda: Path.cwd())
     database_path: Path = Path("data/system-memory.db")
     archive_path: Path = Path("data/archive")
+    token_path: Path = Path("data/admin.token")
     busy_timeout_ms: int = Field(default=5_000, ge=100, le=120_000)
     host: str = "127.0.0.1"
     port: int = Field(default=7788, ge=1024, le=65_535)
@@ -34,3 +35,7 @@ class Settings(BaseSettings):
     @property
     def resolved_archive_path(self) -> Path:
         return self.resolve_path(self.archive_path)
+
+    @property
+    def resolved_token_path(self) -> Path:
+        return self.resolve_path(self.token_path)
