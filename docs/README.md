@@ -1,7 +1,7 @@
 # claude-memory
 
-A local, best-of-breed **agent-memory layer for Claude Code on Windows**. It gives Claude Code a
-persistent, searchable memory of everything you've done across every project on this machine, and
+A local, best-of-breed **agent-memory layer shared by Claude Code and Codex on Windows**. It gives both
+clients a persistent, searchable memory of work across every project on this machine, and
 injects the most relevant past context into each prompt automatically — without sending anything to a
 cloud (recall, indexing, and embeddings all run locally).
 
@@ -12,7 +12,7 @@ cloud (recall, indexing, and embeddings all run locally).
 
 ## What it is
 
-Two things plug into Claude Code's hook system:
+Equivalent lifecycle hooks plug into Claude Code and Codex:
 
 1. **Recall (hot path)** — on every prompt (`UserPromptSubmit`), it hybrid-searches your whole corpus
    and injects the top relevant snippets as *untrusted reference data*. Hard timeout, fail-safe: a slow
@@ -28,14 +28,14 @@ Plus a **dashboard** (FastAPI + HTMX) to search, browse, visualize, and curate t
 ## Architecture at a glance
 
 ```
-Claude Code
+Claude Code / Codex
   │  UserPromptSubmit ─▶ hooks/recall.py ─┐
   │  SessionStart     ─▶ hooks/unify.py  ─┤ (fail-safe, exit 0 always)
   │  SessionEnd/Compact▶ hooks/index_trigger.py ─▶ detached `mem index`
   ▼
 claudemem package
   ├─ retriever.py   hybrid search: BM25 + vector ─▶ RRF fuse ─▶ recency ─▶ dedupe ─▶ (rerank)
-  ├─ indexer.py     scan ─▶ chunk ─▶ (enrich) ─▶ embed ─▶ upsert  (incremental, tail-read)
+  ├─ indexer.py     Claude + Codex adapters ─▶ chunk ─▶ embed ─▶ upsert  (incremental, tail-read)
   ├─ providers/     local fastembed (ONNX, CPU) + optional cross-encoder reranker
   └─ store/         Store DAO  ─▶  SQLite+FTS5+sqlite-vec (PINNED)  |  ParadeDB (optional)
                                                                         │
@@ -81,8 +81,9 @@ py -3.12 -m venv .venv
 .\scripts\install_persistence.ps1
 ```
 
-After this, every Claude Code prompt under a configured workspace root gets relevant memory injected
-automatically.
+For Codex, also run `mem install-codex-hooks`, register the included MCP server, and restart Codex;
+see `docs/CODEX.md`. Afterward, prompts from either client under a configured workspace root receive
+relevant memory automatically.
 
 ### The `mem` command
 
@@ -124,8 +125,8 @@ All config lives in `config.toml` at the repo root. Precedence:
 
 Key sections (see `config.toml` for the full annotated set):
 
-- `[scope]` — `workspace_roots` (recall/unify only activate when Claude's cwd is under one of these) and
-  `claude_projects_dir` (where Claude Code stores per-project transcripts + `memory/` notes).
+- `[scope]` — `workspace_roots` (recall/unify activation), `claude_projects_dir` (Claude transcripts
+  and curated notes), and `codex_home` (Codex rollout discovery).
 - `[store]` — `backend` is **pinned to `"sqlite"`**. `"auto"` forked the store into two diverging
   copies whenever ParadeDB flapped (repaired outage — see `docs/CONTEXT.md`); keep it pinned to one
   backend. `[store.postgres]` points at `localhost:55432` for the optional ParadeDB path
@@ -176,8 +177,10 @@ across the whole machine, grouped by project (or type), capped at `unify.max_fac
 starts each session aware of everything it has recorded. Titles only — full notes are pulled on demand
 via the hub or `mem facts "<topic>"`.
 
-**Indexing** is incremental: transcripts are tail-read from a persisted byte offset (stopping at the
-first half-written line so a live session is never half-indexed), notes are re-read on mtime change.
+**Indexing** is incremental: provider adapters normalize Claude and Codex transcripts, tail-reading
+from persisted byte offsets and stopping before half-written lines. The Codex adapter retains only
+user/assistant messages and ignores reasoning, tool, developer/system, and unknown records. Notes are
+re-read on mtime change.
 `SessionEnd`/`PreCompact` fire `index_trigger.py`, which spawns a detached `mem index` so memory stays
 fresh without you running anything.
 
@@ -197,9 +200,10 @@ embedder status, kill-switch toggle, reindex). The UI is fully offline — all J
 
 ## MCP
 
-An optional MCP server (`mcp/server.py`) exposes search/browse/curate tools to MCP-aware clients so the
-agent can write and read memory through the Model Context Protocol in addition to the hooks. It's
-optional and not required for recall/unify to work.
+The MCP server (`mcp/server.py`) exposes search/browse/curate tools to MCP-aware clients. Each MCP
+process is a lightweight stdio proxy to the singleton warm vector service, preventing a worker fleet
+from loading one embedding model per worker. It degrades explicitly to local keyword search only when
+the supervised warm service is unavailable.
 
 ---
 

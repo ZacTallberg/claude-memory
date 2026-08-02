@@ -8,7 +8,7 @@ from pathlib import Path
 from typing import Callable
 
 from . import facts as facts_mod
-from . import paths, transcripts
+from . import codex_transcripts, paths, transcripts
 from .chunking import chunk_text, estimate_tokens
 from .config import Config
 from .log import get_logger
@@ -55,15 +55,21 @@ def index(cfg: Config, store: Store, *, full: bool = False, progress: Progress =
         try:
             src = store.get_source(str(tf.path))
             start = 0 if full else (src["bytes_indexed"] if src else 0)
-            units, new_off = transcripts.parse_new(tf.path, start, cfg)
+            parser = codex_transcripts if tf.provider == "codex" else transcripts
+            units, new_off = parser.parse_new(tf.path, start, cfg)
             if full and src:
                 store.delete_source(str(tf.path))
             session_id = (units[0].session_id if units
                           else (src.get("session_id") if src else None) or tf.path.stem)
-            sid = store.upsert_source(path=str(tf.path), kind="transcript", project=tf.project,
+            project = tf.project
+            if tf.provider == "codex" and units and units[0].cwd:
+                project = Path(units[0].cwd).name or "codex"
+            elif src and not units:
+                project = src.get("project", project)
+            sid = store.upsert_source(path=str(tf.path), kind="transcript", project=project,
                                       session_id=session_id, bytes_indexed=new_off,
                                       mtime=tf.path.stat().st_mtime,
-                                      meta={"encoded_dir": tf.encoded_dir})
+                                      meta={"encoded_dir": tf.encoded_dir, "provider": tf.provider})
             chunk_dicts = []
             for u in units:
                 for piece in chunk_text(u.text):
@@ -72,7 +78,7 @@ def index(cfg: Config, store: Store, *, full: bool = False, progress: Progress =
                         blurb = ctx.contextualize(u.text, piece)
                     chunk_dicts.append({
                         "ordinal": u.ordinal, "kind": u.kind, "role": u.role,
-                        "session_id": u.session_id, "project": tf.project, "cwd": u.cwd,
+                        "session_id": u.session_id, "project": project, "cwd": u.cwd,
                         "ts": u.ts, "content": piece, "context_blurb": blurb,
                         "token_est": estimate_tokens(piece), "meta": {},
                     })
@@ -82,7 +88,7 @@ def index(cfg: Config, store: Store, *, full: bool = False, progress: Progress =
             stats.units += len(units)
             stats.transcripts_scanned += 1
             if units:
-                _emit(progress, f"  {tf.project}/{tf.path.name}: +{len(chunk_dicts)} chunks")
+                _emit(progress, f"  {tf.provider}:{project}/{tf.path.name}: +{len(chunk_dicts)} chunks")
         except Exception as e:
             stats.errors += 1
             log.exception("transcript index failed: %s (%s)", tf.path, e)

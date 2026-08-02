@@ -1,16 +1,14 @@
 # claude-memory — MCP server
 
 An optional [Model Context Protocol](https://modelcontextprotocol.io) server that exposes
-claude-memory's core operations as tools, so **Claude Code (or any MCP client) can do
+the shared memory engine's core operations as tools, so **Claude Code, Codex, or any MCP client can do
 model-driven memory ops**: hybrid recall over past sessions, browse/search your curated
 notes, fetch a note, author a new curated note, and reproduce the exact recall envelope the
 prompt hook injects.
 
-It is built directly on the core API (`claudemem.config.load_config`,
-`claudemem.store.factory.get_store`, `claudemem.retriever.Retriever`) and shares the same
-ParadeDB index the hooks and dashboard use. It is **fully optional** — the hooks and
-dashboard work without it, and it degrades gracefully (keyword-only) if the embedder or
-vector layer is unavailable.
+The stdio process is deliberately lightweight. Hybrid/vector search and note-vector indexing proxy
+to the singleton supervised warm server; local SQLite provides a clearly marked keyword-only fallback
+if that server is unavailable. This prevents every agent worker from loading another ONNX model.
 
 Implemented with the official `mcp` Python SDK (FastMCP) over **stdio**.
 
@@ -37,6 +35,7 @@ Creates a markdown note with frontmatter aligned to existing curated notes:
 ```markdown
 ---
 name: <slug-or-name>
+title: <human-readable title>
 description: <one-line summary>
 metadata:
   node_type: memory
@@ -74,7 +73,7 @@ spawn this command for you — you normally don't run it by hand except to smoke
 
 ---
 
-## Register with Claude Code
+## Register with Claude Code or Codex
 
 ### Option A — `claude mcp add` (recommended)
 
@@ -99,6 +98,9 @@ Verify:
 claude mcp list
 claude mcp get claude-memory
 ```
+
+For Codex, use `codex mcp add` with the same command and environment. The exact machine command and
+the lifecycle-hook installation are documented in `docs/CODEX.md`.
 
 ### Option B — `.mcp.json` (manual / project-scoped)
 
@@ -153,5 +155,5 @@ mid-conversation to recall context or persist a durable note.
   you want it off.
 - **Embedding dim:** the server uses the configured embedder. If you change
   `embeddings.dim`, rebuild embeddings (`mem embed` / a full re-index) so vectors match.
-- **Warm models:** the server lazily loads the embedder/reranker once per process and keeps
-  them warm across tool calls.
+- **Warm models:** heavy models live only in the supervised dashboard/warm-server process. MCP stdio
+  processes remain lightweight proxies across any number of workers.

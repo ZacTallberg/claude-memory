@@ -31,7 +31,7 @@ def main() -> None:
 
     # 1) Warm server path (full hybrid; server logs the injection).
     res = call_server("/api/recall", {"prompt": prompt, "cwd": cwd, "session_id": session_id},
-                      timeout=4.0)
+                      timeout=8.0)
     if res is not None:
         # The server answered — memory is healthy and delivering. Refresh the beacon EVERY prompt so a
         # long-lived session never shows a false "mem stale" (the beacon used to age only from SessionStart).

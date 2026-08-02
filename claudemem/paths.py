@@ -66,6 +66,7 @@ class TranscriptFile:
     path: Path
     encoded_dir: str
     project: str
+    provider: str = "claude"
 
 
 @dataclass(frozen=True)
@@ -80,17 +81,26 @@ def projects_root(cfg: Config) -> Path:
 
 
 def iter_transcript_files(cfg: Config) -> list[TranscriptFile]:
-    """All *.jsonl session transcripts across every per-project dir."""
+    """All configured agent transcripts, tagged for provider-specific parsing."""
     out: list[TranscriptFile] = []
-    base = projects_root(cfg)
-    if not base.exists():
-        return out
-    for proj_dir in sorted(base.iterdir()):
-        if not proj_dir.is_dir():
-            continue
-        label = friendly_project(proj_dir.name)
-        for jf in sorted(proj_dir.glob("*.jsonl")):
-            out.append(TranscriptFile(path=jf, encoded_dir=proj_dir.name, project=label))
+    providers = set(cfg.index.transcript_providers)
+    if "claude" in providers:
+        base = projects_root(cfg)
+        if base.exists():
+            for proj_dir in sorted(base.iterdir()):
+                if not proj_dir.is_dir():
+                    continue
+                label = friendly_project(proj_dir.name)
+                for jf in sorted(proj_dir.glob("*.jsonl")):
+                    out.append(TranscriptFile(path=jf, encoded_dir=proj_dir.name,
+                                              project=label, provider="claude"))
+    if "codex" in providers:
+        home = Path(cfg.scope.codex_home)
+        for folder in (home / "sessions", home / "archived_sessions"):
+            if folder.exists():
+                for jf in sorted(folder.rglob("*.jsonl")):
+                    out.append(TranscriptFile(path=jf, encoded_dir="codex",
+                                              project="codex", provider="codex"))
     return out
 
 

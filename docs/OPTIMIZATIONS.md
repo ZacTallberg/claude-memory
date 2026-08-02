@@ -18,7 +18,7 @@ What keeps it from being the best *running instance* of that shape today is one 
 
 ---
 
-## 1. Hot-path recall collapses under concurrent sessions — THE open problem
+## 1. Hot-path recall collapse under concurrent sessions — repaired 2026-08-02
 
 **[measured 2026-07-31]** With 3+ Claude Code sessions active, warm-server recall latencies were
 13.1s / 37.8s / 67.2s (healthy single-session baseline: 0.29–0.47s). The hooks' client timeout
@@ -42,9 +42,17 @@ d. Admission caps sized for one session, not a fleet.
 The fallback still guards the prompt; today the timeout amputates server answers that were 5–10s
 away, and the telemetry shows those answers do eventually arrive and get logged.
 
-**Definition of done:** injections table shows `hook='recall'` (not `recall-fallback`) at p90
-under a 4-session synthetic load, and a selftest/load-guard exists that fails if concurrent recall
-p90 regresses — a guard proven to fire, like the wedge guards.
+**Repair:** SQLite hot reads now use per-thread query-only connections instead of the writer's global
+Python lock; ONNX query inference is serialized with a bounded LRU query cache; hook work runs in a
+fixed executor whose admission slot remains occupied after a caller timeout until the real thread
+exits; and the client timeout is 8s. The dead-supervisor gap now has a heartbeat checked at every
+SessionStart. Per-client MCP processes proxy to the singleton warm service rather than multiplying
+models.
+
+**Measured proof 2026-08-02:** 12 distinct recalls at four-way concurrency returned 12/12 hybrid
+contexts with zero shed/timeouts/fallbacks; p90 wall latency 908ms, max 1.054s. A vector-only query
+ranked a Codex-sourced session first. The self-test includes guards proving reads bypass the writer
+lock and timed-out work retains admission until it actually exits.
 
 ## 2. Backup floor for the DB after porting — cheap, do immediately post-port
 

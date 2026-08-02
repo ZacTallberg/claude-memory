@@ -64,6 +64,7 @@ class SqliteStore(Store):
         self._conn: sqlite3.Connection | None = None
         self._vec = False
         self._lock = threading.RLock()
+        self._read_local = threading.local()
 
     @contextmanager
     def _locked(self):
@@ -92,6 +93,30 @@ class SqliteStore(Store):
         except Exception as e:
             log.warning("sqlite-vec unavailable (keyword-only): %s", e)
             self._vec = False
+
+    def _read_conn(self) -> sqlite3.Connection:
+        """Return one query-only connection per worker thread.
+
+        SQLite WAL supports concurrent readers, but the original store put every read behind
+        the writer connection's global Python lock. Four otherwise independent hybrid recalls
+        therefore serialized, and one slow caller parked the entire fleet. Thread-local reader
+        connections let BM25/vector retrieval proceed concurrently while all mutations remain
+        serialized on the original connection.
+        """
+        conn = getattr(self._read_local, "conn", None)
+        if conn is not None:
+            return conn
+        conn = sqlite3.connect(str(self.path), check_same_thread=False)
+        conn.row_factory = sqlite3.Row
+        conn.execute("PRAGMA busy_timeout=5000;")
+        conn.execute("PRAGMA query_only=ON;")
+        if self._vec:
+            import sqlite_vec
+            conn.enable_load_extension(True)
+            sqlite_vec.load(conn)
+            conn.enable_load_extension(False)
+        self._read_local.conn = conn
+        return conn
 
     def close(self) -> None:
         if self._conn:
@@ -143,7 +168,7 @@ class SqliteStore(Store):
     # ---- sources & indexing ----
     def get_source(self, path: str) -> dict | None:
         with self._locked():
-            r = self._conn.execute("SELECT id,bytes_indexed,mtime,session_id FROM sources WHERE path=?",
+            r = self._conn.execute("SELECT id,bytes_indexed,mtime,session_id,project FROM sources WHERE path=?",
                                    (path,)).fetchone()
             return dict(r) if r else None
 
@@ -218,7 +243,7 @@ class SqliteStore(Store):
                 self._conn.commit()
 
     # ---- retrieval ----
-    def _filter_ids(self, ids: list[int], exclude_session, kinds) -> set[int]:
+    def _filter_ids(self, conn: sqlite3.Connection, ids: list[int], exclude_session, kinds) -> set[int]:
         if not ids:
             return set()
         ph = ",".join("?" * len(ids))
@@ -230,43 +255,43 @@ class SqliteStore(Store):
         if kinds:
             q += f" AND kind IN ({','.join('?' * len(kinds))})"
             params.extend(kinds)
-        return {r["id"] for r in self._conn.execute(q, params)}
+        return {r["id"] for r in conn.execute(q, params)}
 
     def search_bm25(self, query, k, *, exclude_session=None, kinds=None) -> list[Candidate]:
         expr = _fts_query(query)
         if not expr:
             return []
-        with self._locked():
-            rows = self._conn.execute(
-                "SELECT rowid, bm25(chunks_fts) AS r FROM chunks_fts WHERE chunks_fts MATCH ? "
-                "ORDER BY r LIMIT ?", (expr, k * 4)).fetchall()
-            ok = self._filter_ids([r["rowid"] for r in rows], exclude_session, kinds)
-            out, rank = [], 0
-            for r in rows:
-                if r["rowid"] in ok:
-                    rank += 1
-                    out.append(Candidate(chunk_id=r["rowid"], rank=rank, score=-float(r["r"])))
-                    if rank >= k:
-                        break
-            return out
+        conn = self._read_conn()
+        rows = conn.execute(
+            "SELECT rowid, bm25(chunks_fts) AS r FROM chunks_fts WHERE chunks_fts MATCH ? "
+            "ORDER BY r LIMIT ?", (expr, k * 4)).fetchall()
+        ok = self._filter_ids(conn, [r["rowid"] for r in rows], exclude_session, kinds)
+        out, rank = [], 0
+        for r in rows:
+            if r["rowid"] in ok:
+                rank += 1
+                out.append(Candidate(chunk_id=r["rowid"], rank=rank, score=-float(r["r"])))
+                if rank >= k:
+                    break
+        return out
 
     def search_vector(self, qvec, k, *, exclude_session=None, kinds=None) -> list[Candidate]:
         if not qvec or not self._vec:
             return []
         import sqlite_vec
-        with self._locked():
-            rows = self._conn.execute(
-                "SELECT rowid, distance FROM chunks_vec WHERE embedding MATCH ? ORDER BY distance LIMIT ?",
-                (sqlite_vec.serialize_float32(qvec), k * 4)).fetchall()
-            ok = self._filter_ids([r["rowid"] for r in rows], exclude_session, kinds)
-            out, rank = [], 0
-            for r in rows:
-                if r["rowid"] in ok:
-                    rank += 1
-                    out.append(Candidate(chunk_id=r["rowid"], rank=rank, score=1.0 - float(r["distance"])))
-                    if rank >= k:
-                        break
-            return out
+        conn = self._read_conn()
+        rows = conn.execute(
+            "SELECT rowid, distance FROM chunks_vec WHERE embedding MATCH ? ORDER BY distance LIMIT ?",
+            (sqlite_vec.serialize_float32(qvec), k * 4)).fetchall()
+        ok = self._filter_ids(conn, [r["rowid"] for r in rows], exclude_session, kinds)
+        out, rank = [], 0
+        for r in rows:
+            if r["rowid"] in ok:
+                rank += 1
+                out.append(Candidate(chunk_id=r["rowid"], rank=rank, score=1.0 - float(r["distance"])))
+                if rank >= k:
+                    break
+        return out
 
     @staticmethod
     def _row_to_chunk(r) -> Chunk:
@@ -280,9 +305,8 @@ class SqliteStore(Store):
         if not ids:
             return []
         ph = ",".join("?" * len(ids))
-        with self._locked():
-            rows = self._conn.execute(f"SELECT * FROM chunks WHERE id IN ({ph})", ids).fetchall()
-            return [self._row_to_chunk(r) for r in rows]
+        rows = self._read_conn().execute(f"SELECT * FROM chunks WHERE id IN ({ph})", ids).fetchall()
+        return [self._row_to_chunk(r) for r in rows]
 
     # ---- curated facts ----
     def upsert_fact(self, *, path, project, name, title, description, type, tags, origin_session_id,
@@ -331,24 +355,24 @@ class SqliteStore(Store):
     def search_facts(self, query, k, *, qvec=None) -> list[Fact]:
         expr = _fts_query(query)
         out: dict[int, Fact] = {}
-        with self._locked():
-            if expr:
-                rows = self._conn.execute("SELECT rowid FROM facts_fts WHERE facts_fts MATCH ? "
-                                          "ORDER BY bm25(facts_fts) LIMIT ?", (expr, k)).fetchall()
-                for r in rows:
-                    fr = self._conn.execute("SELECT * FROM facts WHERE id=?", (r["rowid"],)).fetchone()
+        conn = self._read_conn()
+        if expr:
+            rows = conn.execute("SELECT rowid FROM facts_fts WHERE facts_fts MATCH ? "
+                                "ORDER BY bm25(facts_fts) LIMIT ?", (expr, k)).fetchall()
+            for r in rows:
+                fr = conn.execute("SELECT * FROM facts WHERE id=?", (r["rowid"],)).fetchone()
+                if fr:
+                    out[fr["id"]] = self._row_to_fact(fr)
+        if qvec and self._vec:
+            import sqlite_vec
+            rows = conn.execute("SELECT rowid FROM facts_vec WHERE embedding MATCH ? "
+                                "ORDER BY distance LIMIT ?",
+                                (sqlite_vec.serialize_float32(qvec), k)).fetchall()
+            for r in rows:
+                if r["rowid"] not in out:
+                    fr = conn.execute("SELECT * FROM facts WHERE id=?", (r["rowid"],)).fetchone()
                     if fr:
                         out[fr["id"]] = self._row_to_fact(fr)
-            if qvec and self._vec:
-                import sqlite_vec
-                rows = self._conn.execute("SELECT rowid FROM facts_vec WHERE embedding MATCH ? "
-                                          "ORDER BY distance LIMIT ?",
-                                          (sqlite_vec.serialize_float32(qvec), k)).fetchall()
-                for r in rows:
-                    if r["rowid"] not in out:
-                        fr = self._conn.execute("SELECT * FROM facts WHERE id=?", (r["rowid"],)).fetchone()
-                        if fr:
-                            out[fr["id"]] = self._row_to_fact(fr)
         return list(out.values())
 
     def get_fact(self, fact_id: int) -> Fact | None:
@@ -424,8 +448,7 @@ class SqliteStore(Store):
             return cur.lastrowid
 
     def list_anti_memory(self) -> list[dict]:
-        with self._locked():
-            return [dict(r) for r in self._conn.execute("SELECT * FROM anti_memory ORDER BY ts DESC")]
+        return [dict(r) for r in self._read_conn().execute("SELECT * FROM anti_memory ORDER BY ts DESC")]
 
     # ---- observability ----
     def log_injection(self, *, hook, session_id, prompt_excerpt, n_recalled, n_facts, chars,

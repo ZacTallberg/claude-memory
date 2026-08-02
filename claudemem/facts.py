@@ -29,7 +29,8 @@ class NoteData:
 
 
 def _title_from(meta: dict, fallback_filename: str) -> str:
-    for key in ("name", "title"):
+    # `name` is the stable graph/filename identifier; `title` is display prose.
+    for key in ("title", "name"):
         v = meta.get(key)
         if v:
             return collapse_ws(str(v))
@@ -45,6 +46,9 @@ def load_note(path: Path, project: str) -> NoteData | None:
         return None
     meta, body = parse_frontmatter(raw)
     tags = meta.get("tags") or []
+    nested = meta.get("metadata")
+    if not tags and isinstance(nested, dict):
+        tags = nested.get("tags") or []
     if isinstance(tags, str):
         tags = [t.strip() for t in tags.split(",") if t.strip()]
     elif not isinstance(tags, list):

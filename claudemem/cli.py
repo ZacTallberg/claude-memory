@@ -94,6 +94,16 @@ def cmd_uninstall_hooks(args):
     print(uninstall())
 
 
+def cmd_install_codex_hooks(args):
+    from .codex_hooks_install import install
+    print(install())
+
+
+def cmd_uninstall_codex_hooks(args):
+    from .codex_hooks_install import uninstall
+    print(uninstall())
+
+
 def cmd_killswitch(args):
     from .paths import killed, set_killed
     if args.action == "status":
@@ -104,7 +114,7 @@ def cmd_killswitch(args):
 
 
 def main(argv: list[str] | None = None) -> None:
-    p = argparse.ArgumentParser(prog="mem", description="claude-memory CLI")
+    p = argparse.ArgumentParser(prog="mem", description="shared local agent-memory CLI")
     sub = p.add_subparsers(dest="cmd", required=True)
 
     s = sub.add_parser("index"); s.add_argument("--full", action="store_true")
@@ -122,6 +132,8 @@ def main(argv: list[str] | None = None) -> None:
     s = sub.add_parser("promote"); s.set_defaults(fn=cmd_promote)
     s = sub.add_parser("install-hooks"); s.set_defaults(fn=cmd_install_hooks)
     s = sub.add_parser("uninstall-hooks"); s.set_defaults(fn=cmd_uninstall_hooks)
+    s = sub.add_parser("install-codex-hooks"); s.set_defaults(fn=cmd_install_codex_hooks)
+    s = sub.add_parser("uninstall-codex-hooks"); s.set_defaults(fn=cmd_uninstall_codex_hooks)
     s = sub.add_parser("killswitch"); s.add_argument("action", choices=["on", "off", "status"])
     s.set_defaults(fn=cmd_killswitch)
 

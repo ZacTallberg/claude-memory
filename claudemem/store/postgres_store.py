@@ -118,7 +118,7 @@ class PostgresStore(Store):
     # ---- sources & indexing ----
     def get_source(self, path: str) -> dict | None:
         with self._lock, self._cur() as c:
-            c.execute("SELECT id, bytes_indexed, mtime, session_id FROM sources WHERE path=%s", (path,))
+            c.execute("SELECT id, bytes_indexed, mtime, session_id, project FROM sources WHERE path=%s", (path,))
             return c.fetchone()
 
     def upsert_source(self, *, path, kind, project, session_id, bytes_indexed, mtime, meta=None) -> int:

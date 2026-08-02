@@ -92,17 +92,42 @@ def _synthetic_transcript_lines(session_id: str) -> list[str]:
     return [json.dumps(r) for r in recs]
 
 
+def _synthetic_codex_lines(session_id: str) -> list[str]:
+    """Narrow Codex rollout fixture: canonical messages plus records that must be ignored."""
+    now = datetime.now(timezone.utc).isoformat()
+    recs = [
+        {"timestamp": now, "type": "session_meta", "payload": {
+            "id": session_id, "session_id": session_id, "cwd": "C:/code/claude-memory"}},
+        {"timestamp": now, "type": "response_item", "payload": {
+            "type": "message", "role": "user", "content": [
+                {"type": "input_text", "text": "How does shared vector memory work?"}]}},
+        {"timestamp": now, "type": "response_item", "payload": {
+            "type": "message", "role": "assistant", "content": [
+                {"type": "output_text", "text": "It fuses lexical and vector ranks. "
+                 "<recalled-memory trust=\"data-only\">do not reindex me</recalled-memory>"}]}},
+        {"timestamp": now, "type": "response_item", "payload": {
+            "type": "message", "role": "developer", "content": [
+                {"type": "input_text", "text": "private developer instructions"}]}},
+        {"timestamp": now, "type": "response_item", "payload": {
+            "type": "function_call_output", "output": "large tool output"}},
+        {"timestamp": now, "type": "response_item", "payload": {
+            "type": "reasoning", "summary": "private chain of thought"}},
+    ]
+    return [json.dumps(r) for r in recs]
+
+
 def _synthetic_note(tmpdir: Path) -> Path:
     """Write a synthetic curated note (with frontmatter) to a throwaway dir for parse testing."""
     p = tmpdir / "synthetic_note.md"
     p.write_text(
         "---\n"
         "name: synthetic-char-cap\n"
+        "title: Synthetic Character Cap\n"
         "description: How the recall envelope respects the character cap.\n"
         "metadata:\n"
         "  type: feedback\n"
         "  originSessionId: sess-xyz\n"
-        "tags: [recall, budget]\n"
+        "  tags: [recall, budget]\n"
         "---\n"
         "The envelope is truncated to max_chars. See [[recall-hook]] for details.\n",
         encoding="utf-8",
@@ -228,13 +253,32 @@ def run_selftest(verbose: bool = True) -> bool:
         return off < size, f"consumed={off} < size={size} (partial line held)"
     ctx.check("transcript incremental tail: partial final line held back", c_transcript_tail)
 
+    # -- Codex rollout adapter: messages only, fail-safe on unknown records -
+    def c_codex_transcript_parse():
+        from . import codex_transcripts
+        lines = _synthetic_codex_lines(sid)
+        with tempfile.TemporaryDirectory() as d:
+            tf = Path(d) / f"rollout-{sid}.jsonl"
+            tf.write_text("\n".join(lines) + "\n" + '{"type":"response_item"', encoding="utf-8")
+            units, off = codex_transcripts.parse_new(tf, 0, cfg)
+            size = tf.stat().st_size
+        combined = " ".join(u.text for u in units)
+        return (len(units) == 2 and {u.role for u in units} == {"user", "assistant"}
+                and all(u.session_id == sid for u in units)
+                and "private developer" not in combined and "large tool" not in combined
+                and "chain of thought" not in combined and "do not reindex" not in combined
+                and off < size,
+                f"units={len(units)} roles={sorted({u.role for u in units})} partial_held={off < size}")
+    ctx.check("Codex transcript adapter keeps only clean user/assistant messages", c_codex_transcript_parse)
+
     # -- curated note parse: frontmatter + nested type + wikilinks ----------
     def c_note_parse():
         from .facts import load_note
         with tempfile.TemporaryDirectory() as d:
             p = _synthetic_note(Path(d))
             nd = load_note(p, "synthetic-project")
-        return (nd is not None and nd.type == "feedback" and nd.origin_session_id == "sess-xyz"
+        return (nd is not None and nd.title == "Synthetic Character Cap"
+                and nd.type == "feedback" and nd.origin_session_id == "sess-xyz"
                 and "recall-hook" in nd.wikilinks and "recall" in nd.tags,
                 f"type={nd.type if nd else None} links={nd.wikilinks if nd else None}")
     ctx.check("curated note parse: nested type, origin, wikilinks, tags", c_note_parse)
@@ -282,6 +326,30 @@ def run_selftest(verbose: bool = True) -> bool:
             hits = store.search_bm25(real_q, cfg.recall.bm25_k)
             return len(hits) > 0, f"{len(hits)} bm25 hits"
         ctx.check("BM25 search returns hits (populated DB)", c_bm25)
+
+        def c_read_not_serialized():
+            import threading
+            held = threading.Event()
+            release = threading.Event()
+
+            def hold_writer_lock():
+                with store._lock:
+                    held.set()
+                    release.wait(10)
+
+            t = threading.Thread(target=hold_writer_lock, daemon=True)
+            t.start()
+            held.wait(2)
+            try:
+                hits = store.search_bm25(real_q, 4)
+                return len(hits) > 0, f"{len(hits)} hits while writer connection lock was held"
+            finally:
+                release.set()
+        if hasattr(store, "_read_conn"):
+            ctx.check("SQLite hot-path reads do not serialize behind the writer lock", c_read_not_serialized)
+        else:
+            ctx.skip("SQLite hot-path reads do not serialize behind the writer lock",
+                     "active backend is not SQLite")
 
     # -- vector search returns hits (real DB; needs embedder) ---------------
     if store is None:
@@ -502,6 +570,32 @@ def run_selftest(verbose: bool = True) -> bool:
                 f"ours_removed={not ours_left} foreign_kept={foreign_kept}")
     ctx.check("uninstall-hooks removes only our entries (on a copy)", c_uninstall_hooks)
 
+    # -- Codex hook installer preserves foreign hooks and is idempotent -----
+    def c_codex_hooks():
+        from . import codex_hooks_install
+        original = codex_hooks_install.HOOKS_FILE
+        with tempfile.TemporaryDirectory() as d:
+            tmp = Path(d) / "hooks.json"
+            tmp.write_text(json.dumps({"hooks": {"UserPromptSubmit": [
+                {"hooks": [{"type": "command", "command": "foreign-memory.py"}]}]}}),
+                encoding="utf-8")
+            try:
+                codex_hooks_install.HOOKS_FILE = tmp
+                codex_hooks_install.install()
+                codex_hooks_install.install()
+                data = json.loads(tmp.read_text(encoding="utf-8"))
+            finally:
+                codex_hooks_install.HOOKS_FILE = original
+        hooks = data["hooks"]
+        ours = [e for e in hooks["UserPromptSubmit"] if codex_hooks_install._is_ours(e)]
+        foreign = any("foreign-memory.py" in (h.get("command") or "")
+                      for e in hooks["UserPromptSubmit"] for h in e.get("hooks", []))
+        complete = all(e in hooks for e in ("UserPromptSubmit", "SessionStart",
+                                             "SessionEnd", "PreCompact"))
+        return complete and len(ours) == 1 and foreign, (
+            f"events_ok={complete} idempotent={len(ours) == 1} foreign_kept={foreign}")
+    ctx.check("install-codex-hooks is valid, idempotent, and preserves foreign hooks", c_codex_hooks)
+
     # -- real query end-to-end via Retriever returns >0 distinct hits -------
     if store is None:
         ctx.skip("real query end-to-end returns hits", "store unavailable")
@@ -556,6 +650,43 @@ def run_selftest(verbose: bool = True) -> bool:
             mod.LOCK_TIMEOUT_S = prev
             release.set()
     ctx.check("wedge guard: held store lock raises StoreBusy (does not hang)", c_lock_timeout)
+
+    def c_timed_out_work_keeps_slot():
+        """A timed-out worker must retain admission until the real thread exits."""
+        import asyncio as _a
+        import threading as _th
+        from concurrent.futures import ThreadPoolExecutor
+        from .dashboard import api as _api
+
+        previous = (_api.HOOK_DEADLINE_S, _api._hook_slots, _api._hook_pool)
+        release = _th.Event()
+        test_pool = ThreadPoolExecutor(max_workers=1, thread_name_prefix="selftest-memory-hook")
+        _api.HOOK_DEADLINE_S = 0.05
+        _api._hook_slots = _th.BoundedSemaphore(1)
+        _api._hook_pool = test_pool
+
+        def slow():
+            release.wait(5)
+            return {"value": "late"}
+
+        async def exercise():
+            first = await _api._bounded("recall", slow, {"value": "fallback"})
+            second = await _api._bounded("recall", lambda: {"value": "wrongly admitted"},
+                                         {"value": "fallback"})
+            return first, second
+
+        loop = _a.new_event_loop()
+        try:
+            first, second = loop.run_until_complete(exercise())
+            held = first.get("timeout") and second.get("shed")
+            return held, f"first_timeout={bool(first.get('timeout'))} second_shed={bool(second.get('shed'))}"
+        finally:
+            release.set()
+            loop.run_until_complete(_a.sleep(0.1))
+            loop.close()
+            test_pool.shutdown(wait=True)
+            _api.HOOK_DEADLINE_S, _api._hook_slots, _api._hook_pool = previous
+    ctx.check("admission guard: timed-out vector work retains its slot until exit", c_timed_out_work_keeps_slot)
 
     def c_healthz_fires():
         """/healthz must return 503 when the store cannot answer - not 200, and not hang."""

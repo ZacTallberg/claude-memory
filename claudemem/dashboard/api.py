@@ -3,18 +3,21 @@
 from __future__ import annotations
 
 import asyncio
+from concurrent.futures import ThreadPoolExecutor
 import os
 import threading
 import time
 from collections import deque
+from pathlib import Path
 
 from fastapi import APIRouter, Query, Request
 from fastapi.responses import HTMLResponse, JSONResponse
 from sse_starlette.sse import EventSourceResponse
 
 from claudemem.indexer import index as run_index
+from claudemem.facts import load_note
 from claudemem.log import get_logger
-from claudemem.paths import killed, set_killed
+from claudemem.paths import killed, projects_root, safe_under, set_killed
 from claudemem.recall_format import format_recall, format_unify
 from claudemem.text import human_age, meaningful_term_count, snippet
 
@@ -34,7 +37,13 @@ router = APIRouter()
 # still waiting for.
 HOOK_CONCURRENCY = int(os.environ.get("CLAUDEMEM_HOOK_CONCURRENCY", "4"))
 HOOK_DEADLINE_S = float(os.environ.get("CLAUDEMEM_HOOK_DEADLINE_S", "12"))
-_hook_sem = asyncio.Semaphore(HOOK_CONCURRENCY)
+# A timeout cannot cancel work already running in a Python thread. The former asyncio
+# semaphore was released as soon as wait_for timed out, even though to_thread kept running,
+# so every abandoned request admitted a replacement and the process grew an unbounded queue
+# of zombie recalls. A thread semaphore is released by the worker itself, only when the real
+# work ends; saturation therefore stays truly bounded.
+_hook_slots = threading.BoundedSemaphore(HOOK_CONCURRENCY)
+_hook_pool = ThreadPoolExecutor(max_workers=HOOK_CONCURRENCY, thread_name_prefix="memory-hook")
 _shed = {"recall": 0, "unify": 0}
 
 
@@ -44,21 +53,30 @@ async def _bounded(kind: str, work, empty: dict) -> dict:
     Returns `empty` instead of blocking when saturated or too slow — the caller's fallback is
     keyword-only recall, which is strictly better than a hang. Shedding is counted, never silent.
     """
-    if _hook_sem.locked() and _hook_sem._value <= 0:  # noqa: SLF001 - cheap saturation probe
+    if not _hook_slots.acquire(blocking=False):
         _shed[kind] += 1
         log.warning("%s shed: %d concurrent requests already in flight", kind, HOOK_CONCURRENCY)
         return {**empty, "shed": True}
-    async with _hook_sem:
+
+    def guarded():
         try:
-            return await asyncio.wait_for(asyncio.to_thread(work), timeout=HOOK_DEADLINE_S)
-        except asyncio.TimeoutError:
-            _shed[kind] += 1
-            log.warning("%s exceeded %.1fs deadline; returning empty", kind, HOOK_DEADLINE_S)
-            return {**empty, "timeout": True}
-        except Exception as e:
-            _shed[kind] += 1
-            log.warning("%s failed: %s: %s", kind, type(e).__name__, e)
-            return {**empty, "error": type(e).__name__}
+            return work()
+        finally:
+            _hook_slots.release()
+
+    future = asyncio.get_running_loop().run_in_executor(_hook_pool, guarded)
+    try:
+        # Shielding is deliberate: the caller gets its bounded fallback at the deadline,
+        # while the real worker retains its admission slot until it actually exits.
+        return await asyncio.wait_for(asyncio.shield(future), timeout=HOOK_DEADLINE_S)
+    except asyncio.TimeoutError:
+        _shed[kind] += 1
+        log.warning("%s exceeded %.1fs deadline; returning empty", kind, HOOK_DEADLINE_S)
+        return {**empty, "timeout": True}
+    except Exception as e:
+        _shed[kind] += 1
+        log.warning("%s failed: %s: %s", kind, type(e).__name__, e)
+        return {**empty, "error": type(e).__name__}
 
 
 # ---- index progress broker (for SSE) ----
@@ -86,6 +104,25 @@ def _fact_brief(f) -> dict:
     return {"id": f.id, "kind": "fact", "type": f.type, "title": f.title,
             "description": f.description, "project": f.project, "path": f.path,
             "tags": f.tags}
+
+
+def _mcp_result(x) -> dict:
+    c = x.chunk
+    return {
+        "id": c.id, "kind": "transcript", "project": c.project,
+        "session": c.session_id, "role": c.role, "block": c.kind,
+        "ts": c.ts.isoformat() if c.ts else None, "score": round(float(x.score), 4),
+        "reranked": bool(x.reranked), "content": c.content,
+    }
+
+
+def _mcp_fact(f) -> dict:
+    return {
+        "id": f.id, "kind": "fact", "type": f.type, "title": f.title,
+        "name": f.name, "description": f.description, "project": f.project,
+        "tags": list(f.tags or []), "path": f.path,
+        "origin_session_id": f.origin_session_id,
+    }
 
 
 # ================= warm hook endpoints =================
@@ -147,6 +184,71 @@ async def api_unify(req: Request):
         return {"additionalContext": text}
 
     return await _bounded("unify", work, {"additionalContext": ""})
+
+
+@router.post("/api/mcp/search")
+async def api_mcp_search(req: Request):
+    """Shared warm search for lightweight per-client MCP stdio processes."""
+    body = await req.json()
+    query = (body.get("query") or "").strip()
+    k = max(1, min(int(body.get("k") or 8), 50))
+    rerank = bool(body.get("rerank", True))
+    kind = body.get("kind") or "all"
+    if not query:
+        return {"query": query, "results": [], "facts": []}
+    st = get_state()
+
+    def work():
+        qvec = st.retriever.embed_query(query)
+        results = []
+        facts = []
+        if kind in ("all", "transcripts"):
+            results = st.retriever.search(
+                query, tier=("full" if rerank else "hot"), k=k,
+                do_rerank=rerank, qvec=qvec,
+            )
+        if kind in ("all", "facts"):
+            facts = st.retriever.search_facts(query, k, qvec=qvec)
+        return {"query": query, "results": [_mcp_result(x) for x in results],
+                "facts": [_mcp_fact(f) for f in facts]}
+
+    return await asyncio.to_thread(work)
+
+
+@router.post("/api/mcp/index-note")
+async def api_mcp_index_note(req: Request):
+    """Index one already-written curated note with the singleton warm embedder."""
+    body = await req.json()
+    st = get_state()
+    try:
+        path = Path(str(body.get("path") or "")).resolve()
+    except Exception:
+        return JSONResponse({"ok": False, "error": "invalid path"}, status_code=400)
+    base = projects_root(st.cfg).resolve()
+    if (not path.is_file() or not safe_under(path, [base])
+            or path.parent.name.lower() != "memory" or path.suffix.lower() != ".md"
+            or path.name.upper() == "MEMORY.MD"):
+        return JSONResponse({"ok": False, "error": "refused note path"}, status_code=400)
+    project = str(body.get("project") or path.parent.parent.name)
+
+    def work():
+        nd = load_note(path, project)
+        if nd is None:
+            return {"ok": False, "error": "note parse failed"}
+        embedding = None
+        if st.embedder.available():
+            embedding = st.embedder.embed_documents(
+                [" ".join([nd.title, nd.description, nd.body])]
+            )[0]
+        fid = st.store.upsert_fact(
+            path=nd.path, project=nd.project, name=nd.name, title=nd.title,
+            description=nd.description, type=nd.type, tags=nd.tags,
+            origin_session_id=nd.origin_session_id, body=nd.body, embedding=embedding,
+            mtime=nd.mtime, meta={"wikilinks": nd.wikilinks},
+        )
+        return {"ok": True, "fact_id": fid, "vector_indexed": embedding is not None}
+
+    return await asyncio.to_thread(work)
 
 
 # ================= search =================
@@ -271,7 +373,7 @@ async def healthz():
     """
     now = time.time()
     out = {"ok": True, "shed": dict(_shed),
-           "inflight": max(0, HOOK_CONCURRENCY - _hook_sem._value)}  # noqa: SLF001
+           "inflight": max(0, HOOK_CONCURRENCY - _hook_slots._value)}  # noqa: SLF001
     since_ok = now - _last_store_ok["ts"]
 
     if _probe_sem.locked():

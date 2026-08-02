@@ -55,14 +55,25 @@ def _ensure_server(cfg) -> None:
     import subprocess
     import urllib.request
 
+    import json
+    import time
+    from claudemem.config import ROOT
+
+    heartbeat = ROOT / "data" / "persistence-heartbeat.json"
+    supervisor_alive = False
+    try:
+        data = json.loads(heartbeat.read_text(encoding="utf-8"))
+        supervisor_alive = time.time() - float(data.get("ts", 0)) < 60
+    except Exception:
+        pass
+
     url = f"http://{cfg.server.host}:{cfg.server.port}/healthz"
     try:
         with urllib.request.urlopen(url, timeout=_HEALTH_TIMEOUT_S) as r:
-            if r.status == 200:
+            if r.status == 200 and supervisor_alive:
                 return
     except Exception:
         pass  # unreachable, wedged, 503, or too slow -> all mean "re-arm the supervisor"
-    from claudemem.config import ROOT
     runner = str(ROOT / "scripts" / "persistence_run.ps1")
     flags = (0x00000008 | 0x00000200) if os.name == "nt" else 0  # DETACHED | NEW_PROCESS_GROUP
     try:

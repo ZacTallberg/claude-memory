@@ -21,6 +21,7 @@ DATA_DIR = ROOT / "data"
 class ScopeCfg:
     workspace_roots: tuple[str, ...]
     claude_projects_dir: str
+    codex_home: str
 
 
 @dataclass(frozen=True)
@@ -104,6 +105,7 @@ class IndexCfg:
     strip_injected: bool
     tool_blobs: bool
     batch_size: int
+    transcript_providers: tuple[str, ...]
 
 
 @dataclass(frozen=True)
@@ -129,6 +131,7 @@ _DEFAULTS: dict = {
     "scope": {
         "workspace_roots": ["C:/code"],
         "claude_projects_dir": str(Path.home() / ".claude" / "projects").replace("\\", "/"),
+        "codex_home": str(Path.home() / ".codex").replace("\\", "/"),
     },
     "store": {
         # "auto" forks the store into diverging copies when the primary flaps (repaired outage —
@@ -148,7 +151,8 @@ _DEFAULTS: dict = {
                "include_facts": True, "facts_k": 4},
     "unify": {"max_facts": 120, "group_by": "project"},
     "server": {"host": "127.0.0.1", "port": 7777, "open_browser": True},
-    "index": {"exclude_sidechains": True, "strip_injected": True, "tool_blobs": False, "batch_size": 64},
+    "index": {"exclude_sidechains": True, "strip_injected": True, "tool_blobs": False,
+              "batch_size": 64, "transcript_providers": ["claude", "codex"]},
 }
 
 
@@ -187,6 +191,8 @@ def load_config() -> Config:
         raw["embeddings"]["model"] = env["CLAUDEMEM_EMBED_MODEL"]
     if "CLAUDEMEM_EMBED_DIM" in env:
         raw["embeddings"]["dim"] = int(env["CLAUDEMEM_EMBED_DIM"])
+    if "CLAUDEMEM_CODEX_HOME" in env:
+        raw["scope"]["codex_home"] = env["CLAUDEMEM_CODEX_HOME"]
 
     pg_pw = env.get("CLAUDEMEM_PG_PASSWORD", "claudemem")
 
@@ -206,6 +212,7 @@ def load_config() -> Config:
         scope=ScopeCfg(
             workspace_roots=tuple(s["workspace_roots"]),
             claude_projects_dir=s["claude_projects_dir"],
+            codex_home=s["codex_home"],
         ),
         store=StoreCfg(
             backend=st["backend"],
@@ -230,5 +237,6 @@ def load_config() -> Config:
         unify=UnifyCfg(max_facts=int(un["max_facts"]), group_by=un["group_by"]),
         server=ServerCfg(host=sv["host"], port=int(sv["port"]), open_browser=_b(sv["open_browser"])),
         index=IndexCfg(exclude_sidechains=_b(ix["exclude_sidechains"]), strip_injected=_b(ix["strip_injected"]),
-                       tool_blobs=_b(ix["tool_blobs"]), batch_size=int(ix["batch_size"])),
+                       tool_blobs=_b(ix["tool_blobs"]), batch_size=int(ix["batch_size"]),
+                       transcript_providers=tuple(ix["transcript_providers"])),
     )

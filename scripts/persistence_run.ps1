@@ -32,6 +32,7 @@ $env:PYTHONIOENCODING = "utf-8"
 $logDir = Join-Path $root "data\logs"
 New-Item -ItemType Directory -Force -Path $logDir | Out-Null
 $log = Join-Path $logDir "persistence.log"
+$heartbeat = Join-Path $root "data\persistence-heartbeat.json"
 
 # With the store pinned to sqlite, the WSL pin + ParadeDB legs are dead weight - supervise
 # only the dashboard server. They re-arm automatically if config.toml pins postgres/auto.
@@ -44,6 +45,13 @@ try {
 function Write-Log([string]$msg) {
   $line = "{0}  {1}" -f (Get-Date -Format "yyyy-MM-dd HH:mm:ss"), $msg
   Add-Content -Path $log -Value $line -Encoding utf8
+}
+
+function Write-Heartbeat {
+  try {
+    $payload = @{ ts = [DateTimeOffset]::UtcNow.ToUnixTimeSeconds(); pid = $PID } | ConvertTo-Json -Compress
+    [System.IO.File]::WriteAllText($heartbeat, $payload, (New-Object System.Text.UTF8Encoding($false)))
+  } catch { }
 }
 
 # Singleton guard: the scheduled task, the SessionStart hook, and manual runs may all spawn
@@ -65,6 +73,7 @@ if (-not $script:acquired) {
   exit 0
 }
 Write-Log "singleton: mutex acquired (pid $PID)"
+Write-Heartbeat
 
 Write-Log "persistence supervisor starting (root=$root)"
 
@@ -140,6 +149,7 @@ $startedAt = Get-Date
 $lastDbCheck = Get-Date
 while ($true) {
   Start-Sleep -Seconds 15
+  Write-Heartbeat
 
   if ($needDb -and ($pin -eq $null -or $pin.HasExited)) {
     Write-Log "WSL pin gone; restarting"
