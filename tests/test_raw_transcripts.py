@@ -101,6 +101,17 @@ def test_claude_reparse_keeps_authored_text_and_sidechains_only(store, tmp_path)
             },
             {
                 "type": "user",
+                "uuid": "compact-summary",
+                "sessionId": "claude-session",
+                "isCompactSummary": True,
+                "isVisibleInTranscriptOnly": True,
+                "message": {
+                    "role": "user",
+                    "content": "A model-generated compact summary of the prior session.",
+                },
+            },
+            {
+                "type": "user",
                 "uuid": "user-1",
                 "sessionId": "claude-session",
                 "timestamp": "2026-08-01T10:00:00Z",
@@ -122,10 +133,11 @@ def test_claude_reparse_keeps_authored_text_and_sidechains_only(store, tmp_path)
     bodies = "\n".join(row["content"] for row in rows)
 
     assert report.files_imported == 1
-    assert report.events_inserted == 4
+    assert report.events_inserted == 5
     assert report.reasoning_records_skipped == 1
     assert report.tool_records_skipped == 2
     assert report.sidechain_events == 1
+    assert report.compact_summaries_classified == 1
     assert report.exact_provider_duplicates_skipped == 1
     assert "The user's own declaration." in bodies
     assert "Visible assistant synthesis." in bodies
@@ -137,6 +149,9 @@ def test_claude_reparse_keeps_authored_text_and_sidechains_only(store, tmp_path)
     assert "Incomplete final record" not in bodies
     sidechain = next(row for row in rows if row["content"] == "Worker-authored synthesis.")
     assert sidechain["agent_id"] == "claude-worker:claude-session"
+    compact = next(row for row in rows if row["content"].startswith("A model-generated compact"))
+    assert compact["role"] == "system_observation"
+    assert compact["authority"] == "assistant_synthesis"
 
 
 def test_provider_identity_reuse_with_changed_content_is_versioned(store, tmp_path):

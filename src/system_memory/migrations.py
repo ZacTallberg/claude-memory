@@ -397,4 +397,34 @@ CREATE TRIGGER IF NOT EXISTS live_documents_au AFTER UPDATE ON live_documents BE
 END;
 """,
     ),
+    Migration(
+        6,
+        "persistent_live_vector_overlay",
+        r"""
+CREATE TABLE IF NOT EXISTS live_embedding_queue (
+    document_id TEXT NOT NULL REFERENCES live_documents(id) ON DELETE CASCADE,
+    generation_id TEXT NOT NULL REFERENCES search_generations(id) ON DELETE CASCADE,
+    priority INTEGER NOT NULL DEFAULT 100,
+    attempts INTEGER NOT NULL DEFAULT 0,
+    available_at TEXT NOT NULL,
+    claimed_at TEXT,
+    last_error_code TEXT,
+    PRIMARY KEY(document_id, generation_id)
+);
+CREATE INDEX IF NOT EXISTS live_embedding_queue_generation_idx
+    ON live_embedding_queue(generation_id, priority, available_at);
+
+CREATE TABLE IF NOT EXISTS live_embedding_vectors (
+    generation_id TEXT NOT NULL REFERENCES search_generations(id) ON DELETE CASCADE,
+    document_id TEXT NOT NULL REFERENCES live_documents(id) ON DELETE CASCADE,
+    dimension INTEGER NOT NULL CHECK(dimension > 0),
+    vector BLOB NOT NULL,
+    vector_sha256 TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    PRIMARY KEY(generation_id, document_id)
+);
+CREATE INDEX IF NOT EXISTS live_embedding_vectors_generation_idx
+    ON live_embedding_vectors(generation_id);
+""",
+    ),
 )

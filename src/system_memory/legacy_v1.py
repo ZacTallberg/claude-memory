@@ -156,11 +156,10 @@ class LegacyV1Importer:
                         loss_flags.extend(("source_missing", "legacy_recovered"))
                     losses.update(loss_flags)
                     role = Role.USER if row["role"] == "user" else Role.ASSISTANT
-                    authority = (
-                        Authority.USER_AUTHORED
-                        if role == Role.USER
-                        else Authority.ASSISTANT_SYNTHESIS
-                    )
+                    # A v1 chunk preserves a role label but not enough provider envelope
+                    # to distinguish direct user text from compaction/control material.
+                    # Keep the role as a retrieval facet without overstating authority.
+                    authority = Authority.IMPORTED_UNKNOWN
                     identity = stable_id(
                         "legacychunk",
                         source["path"] or f"source-{row['source_id']}",

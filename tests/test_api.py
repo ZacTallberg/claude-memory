@@ -4,7 +4,10 @@ from fastapi.testclient import TestClient
 
 from system_memory.api import create_app
 from system_memory.auth import CredentialStore
-from system_memory.models import Authority, Role
+from system_memory.embeddings import DeterministicEmbeddingProvider
+from system_memory.indexing import embed_generation
+from system_memory.inference import InferenceScheduler
+from system_memory.models import Authority, EmbeddingManifest, Role
 from system_memory.settings import Settings
 
 from .conftest import make_event
@@ -126,6 +129,49 @@ def test_ready_and_recall_report_actual_available_mode(store, tmp_path):
     )
     assert recalled.status_code == 200
     assert recalled.json()["mode"] == "keyword_only"
+
+
+def test_api_loads_an_exact_injected_vector_runtime_and_reports_hybrid(store, tmp_path):
+    event = store.ingest(make_event(content="Coral marks a cross-project ethical memory."))
+    manifest = EmbeddingManifest(
+        provider="deterministic-test",
+        model="test-vocabulary",
+        revision="fixture-1",
+        dimension=2,
+        native_dimension=2,
+    )
+    provider = DeterministicEmbeddingProvider(manifest, ("coral", "other"))
+    generation = store.create_search_generation(
+        corpus_sha256=store.event_corpus_sha256(),
+        chunker_version="event-v1",
+        embedding_manifest=manifest.model_dump(mode="json"),
+    )
+    store.index_event(event.event_id, generation)
+    scheduler = InferenceScheduler(capacity=4)
+    embed_generation(store, generation, provider, scheduler)
+    store.activate_generation(generation)
+
+    credentials = CredentialStore(store.database)
+    _, admin = credentials.create(actor_id="admin", label="admin", scopes={"*"})
+    app = create_app(
+        Settings(root=tmp_path),
+        store=store,
+        embedding_provider=provider,
+        inference_scheduler=scheduler,
+    )
+    client = TestClient(app)
+    ready = client.get("/readyz").json()
+    assert ready["available_modes"] == ["hybrid", "keyword_only"]
+    assert ready["embedding"]["ready"] is True
+
+    recalled = client.post(
+        "/v1/recall",
+        headers=bearer(admin),
+        json={"query": "coral"},
+    ).json()
+    assert recalled["mode"] == "hybrid"
+    assert "semantic-match" in recalled["evidence"][0]["reasons"]
+    scheduler.close()
 
 
 def test_authenticated_shutdown_is_deferred_and_admin_only(store, tmp_path):

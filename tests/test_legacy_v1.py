@@ -123,7 +123,7 @@ def test_legacy_import_is_loss_explicit_deduplicated_and_resumable(store, tmp_pa
     assert all(row["project_id"] is None for row in rows)
     assert any(row["provider"] == "legacy-unknown" for row in rows)
     assert any("source_missing" in row["loss_flags"] for row in rows)
-    assert any(row["authority"] == "user_authored" for row in rows)
+    assert any(row["authority"] == "imported_unknown" for row in rows)
     assert all("synthetic-secret" not in row["metadata"] for row in rows)
 
 

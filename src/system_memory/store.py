@@ -6,13 +6,13 @@ import re
 import sqlite3
 import time
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Any
 
 import numpy as np
 
 from .archive import CanonicalArchive
-from .clock import utc_iso
+from .clock import utc_iso, utc_now
 from .database import Database
 from .ids import content_hash, document_id, episode_id, event_id, source_id, stable_id
 from .models import ClaimOperation, ClaimProposal, EmbeddingManifest, IngestEvent, IngestResult
@@ -281,7 +281,8 @@ class MemoryStore:
                     "redacted during ingestion",
                 ),
             )
-        MemoryStore._index_live_event(connection, prepared, metadata)
+        if inserted:
+            MemoryStore._index_live_event(connection, prepared, metadata)
 
         return IngestResult(
             event_id=prepared.event_id,
@@ -337,6 +338,17 @@ class MemoryStore:
                 json.dumps(metadata, ensure_ascii=False, sort_keys=True),
             ),
         )
+        active = connection.execute(
+            """SELECT id FROM search_generations
+                 WHERE status='active' AND embedding_manifest_json IS NOT NULL"""
+        ).fetchone()
+        if active:
+            connection.execute(
+                """INSERT OR IGNORE INTO live_embedding_queue(
+                       document_id,generation_id,priority,attempts,available_at
+                   ) VALUES (?,?,100,0,?)""",
+                (live_id, active["id"], prepared.prepared_at),
+            )
 
     def backfill_archive_references(self, *, batch_size: int = 250) -> int:
         """Replace legacy machine-specific archive paths with portable validated refs."""
@@ -778,6 +790,90 @@ class MemoryStore:
                 )
         return len(prepared)
 
+    def pending_live_embedding_batch(
+        self, generation: str, *, limit: int = 8
+    ) -> list[tuple[str, str]]:
+        with self.database.read() as connection:
+            rows = connection.execute(
+                """SELECT d.id,d.body
+                   FROM live_embedding_queue q
+                   JOIN live_documents d ON d.id=q.document_id
+                   JOIN search_generations g ON g.id=q.generation_id
+                   WHERE q.generation_id=? AND g.status='active' AND q.available_at<=?
+                   ORDER BY q.priority,q.available_at,q.document_id
+                   LIMIT ?""",
+                (generation, utc_iso(), max(1, min(limit, 8))),
+            ).fetchall()
+        return [(row["id"], row["body"]) for row in rows]
+
+    def put_live_embeddings(self, generation: str, vectors: dict[str, list[float]]) -> int:
+        manifest = self.embedding_manifest(generation)
+        if not manifest:
+            raise ValueError("generation has no embedding manifest")
+        prepared: list[tuple[str, bytes, str]] = []
+        for document, values in vectors.items():
+            vector = np.asarray(values, dtype="<f4")
+            if vector.ndim != 1 or int(vector.shape[0]) != manifest.dimension:
+                raise ValueError(
+                    f"embedding dimension mismatch for {document}: "
+                    f"got={vector.shape} expected={manifest.dimension}"
+                )
+            if not np.isfinite(vector).all():
+                raise ValueError(f"embedding contains non-finite values for {document}")
+            norm = float(np.linalg.norm(vector))
+            if norm <= 0:
+                raise ValueError(f"embedding has zero norm for {document}")
+            if manifest.normalized:
+                vector = vector / norm
+            payload = vector.astype("<f4", copy=False).tobytes()
+            prepared.append((document, payload, hashlib.sha256(payload).hexdigest()))
+        with self.database.write() as connection:
+            active = connection.execute(
+                "SELECT 1 FROM search_generations WHERE id=? AND status='active'",
+                (generation,),
+            ).fetchone()
+            if not active:
+                raise ValueError("live embeddings can only target the active generation")
+            for document, payload, digest in prepared:
+                exists = connection.execute(
+                    "SELECT 1 FROM live_documents WHERE id=?", (document,)
+                ).fetchone()
+                if not exists:
+                    continue
+                connection.execute(
+                    """INSERT INTO live_embedding_vectors(
+                           generation_id,document_id,dimension,vector,vector_sha256,created_at
+                       ) VALUES (?,?,?,?,?,?)
+                       ON CONFLICT(generation_id,document_id) DO UPDATE SET
+                           dimension=excluded.dimension,vector=excluded.vector,
+                           vector_sha256=excluded.vector_sha256,created_at=excluded.created_at""",
+                    (generation, document, manifest.dimension, payload, digest, utc_iso()),
+                )
+                connection.execute(
+                    "DELETE FROM live_embedding_queue WHERE generation_id=? AND document_id=?",
+                    (generation, document),
+                )
+        return len(prepared)
+
+    def defer_live_embeddings(
+        self,
+        generation: str,
+        documents: list[str],
+        *,
+        error_code: str,
+        delay_seconds: float = 5.0,
+    ) -> None:
+        if not documents:
+            return
+        available = utc_iso(utc_now() + timedelta(seconds=delay_seconds))
+        with self.database.write() as connection:
+            connection.executemany(
+                """UPDATE live_embedding_queue
+                      SET attempts=attempts+1,available_at=?,last_error_code=?
+                    WHERE generation_id=? AND document_id=?""",
+                [(available, error_code[:128], generation, document) for document in documents],
+            )
+
     def vector_records(self, generation: str) -> list[dict[str, Any]]:
         with self.database.read() as connection:
             rows = connection.execute(
@@ -789,6 +885,27 @@ class MemoryStore:
                 (generation, generation),
             ).fetchall()
         return [dict(row) for row in rows]
+
+    def live_vector_records(self, generation: str) -> list[dict[str, Any]]:
+        with self.database.read() as connection:
+            rows = connection.execute(
+                """SELECT d.*,v.dimension,v.vector,v.vector_sha256,v.rowid AS vector_row_id
+                   FROM live_embedding_vectors v
+                   JOIN live_documents d ON d.id=v.document_id
+                   WHERE v.generation_id=?
+                   ORDER BY d.id""",
+                (generation,),
+            ).fetchall()
+        return [dict(row) for row in rows]
+
+    def live_vector_version(self, generation: str) -> tuple[int, int]:
+        with self.database.read() as connection:
+            row = connection.execute(
+                """SELECT COUNT(*) AS count,COALESCE(MAX(rowid),0) AS newest
+                   FROM live_embedding_vectors WHERE generation_id=?""",
+                (generation,),
+            ).fetchone()
+        return int(row["count"]), int(row["newest"])
 
     def embedding_status(self, generation: str) -> dict[str, int]:
         with self.database.read() as connection:
@@ -807,7 +924,29 @@ class MemoryStore:
                     "SELECT COUNT(*) FROM embedding_queue WHERE generation_id=?", (generation,)
                 ).fetchone()[0]
             )
-        return {"documents": documents, "vectors": vectors, "pending": pending}
+            live_documents = int(
+                connection.execute("SELECT COUNT(*) FROM live_documents").fetchone()[0]
+            )
+            live_vectors = int(
+                connection.execute(
+                    "SELECT COUNT(*) FROM live_embedding_vectors WHERE generation_id=?",
+                    (generation,),
+                ).fetchone()[0]
+            )
+            live_pending = int(
+                connection.execute(
+                    "SELECT COUNT(*) FROM live_embedding_queue WHERE generation_id=?",
+                    (generation,),
+                ).fetchone()[0]
+            )
+        return {
+            "documents": documents,
+            "vectors": vectors,
+            "pending": pending,
+            "live_documents": live_documents,
+            "live_vectors": live_vectors,
+            "live_pending": live_pending,
+        }
 
     def activate_generation(
         self, generation: str, *, expected_event_corpus_sha256: str | None = None
@@ -891,6 +1030,21 @@ class MemoryStore:
                  )""",
             (generation,),
         )
+        connection.execute("DELETE FROM live_embedding_queue WHERE generation_id<>?", (generation,))
+        connection.execute(
+            "DELETE FROM live_embedding_vectors WHERE generation_id<>?", (generation,)
+        )
+        if manifest:
+            connection.execute(
+                """INSERT OR IGNORE INTO live_embedding_queue(
+                       document_id,generation_id,priority,attempts,available_at
+                   )
+                   SELECT id,?,100,0,? FROM live_documents""",
+                (generation, utc_iso()),
+            )
+        else:
+            connection.execute("DELETE FROM live_embedding_queue")
+            connection.execute("DELETE FROM live_embedding_vectors")
 
     def lexical_search(
         self,

@@ -11,7 +11,10 @@ from .archive import CanonicalArchive
 from .auth import CredentialStore
 from .backup import BackupManager, repository_revision
 from .database import Database
+from .embeddings import FastEmbedProvider
 from .evaluation import load_cases, run_evaluation, validate_gold64, write_schema
+from .indexing import embed_generation
+from .inference import InferenceScheduler
 from .legacy_v1 import LegacyV1Importer
 from .raw_transcripts import RawTranscriptImporter
 from .recall import RecallEngine
@@ -178,6 +181,67 @@ def command_build_lexical(args: argparse.Namespace) -> int:
     return 0
 
 
+def command_build_vector(args: argparse.Namespace) -> int:
+    settings = _settings(args)
+    memory = _store(settings)
+    settings.resolved_embedding_cache_path.mkdir(parents=True, exist_ok=True)
+    provider = FastEmbedProvider.discover(
+        args.model,
+        cache_dir=settings.resolved_embedding_cache_path,
+        threads=settings.embedding_threads,
+        query_prefix=args.query_prefix,
+        document_prefix=args.document_prefix,
+    )
+    corpus_sha256 = memory.event_corpus_sha256()
+    generation = memory.create_search_generation(
+        corpus_sha256=corpus_sha256,
+        chunker_version="event-v1",
+        lexical_config={"tokenizer": "unicode61 remove_diacritics 2"},
+        embedding_manifest=provider.manifest.model_dump(mode="json"),
+        code_revision=args.code_revision,
+        lock_sha256=args.lock_sha256,
+    )
+
+    def index_progress(indexed: int) -> None:
+        print(
+            json.dumps({"progress": "index", "generation_id": generation, "indexed": indexed}),
+            file=sys.stderr,
+            flush=True,
+        )
+
+    indexed = memory.index_all_events(
+        generation,
+        batch_size=args.batch_size,
+        on_progress=index_progress,
+    )
+    scheduler = InferenceScheduler(capacity=settings.inference_capacity)
+    try:
+        embedded = embed_generation(
+            memory,
+            generation,
+            provider,
+            scheduler,
+            timeout_per_batch=args.embedding_timeout,
+        )
+    finally:
+        scheduler.close()
+    memory.activate_generation(generation, expected_event_corpus_sha256=corpus_sha256)
+    print(
+        json.dumps(
+            {
+                "generation_id": generation,
+                "corpus_sha256": corpus_sha256,
+                "indexed_now": indexed,
+                "embedded_now": embedded,
+                "manifest": provider.manifest.model_dump(mode="json"),
+                **memory.embedding_status(generation),
+            },
+            indent=2,
+        )
+    )
+    return 0
+
+
 def command_evaluate(args: argparse.Namespace) -> int:
     settings = _settings(args)
     memory = _store(settings)
@@ -189,7 +253,36 @@ def command_evaluate(args: argparse.Namespace) -> int:
         raise ValueError("sealed test cases require --allow-sealed")
     if not selected:
         raise ValueError(f"case file contains no {args.split} cases")
-    summary = run_evaluation(RecallEngine(memory), selected)
+    generation = memory.active_generation_id()
+    manifest = memory.embedding_manifest(generation) if generation else None
+    provider = None
+    scheduler = None
+    if manifest:
+        provider = FastEmbedProvider(
+            manifest,
+            cache_dir=settings.resolved_embedding_cache_path,
+            threads=settings.embedding_threads,
+            local_files_only=True,
+        )
+        scheduler = InferenceScheduler(capacity=settings.inference_capacity)
+    elif args.require_hybrid:
+        raise ValueError("evaluation requires an active dense generation")
+    try:
+        summary = run_evaluation(
+            RecallEngine(
+                memory,
+                embedder=provider,
+                scheduler=scheduler,
+                lexical_candidates=settings.lexical_limit,
+                abstention_min_score=settings.abstention_min_score,
+                vector_min_similarity=settings.vector_min_similarity,
+                query_timeout_seconds=settings.query_inference_timeout_seconds,
+            ),
+            selected,
+        )
+    finally:
+        if scheduler:
+            scheduler.close()
     print(summary.model_dump_json(indent=2))
     return 0
 
@@ -315,6 +408,19 @@ def build_parser() -> argparse.ArgumentParser:
     lexical.add_argument("--lock-sha256")
     lexical.set_defaults(handler=command_build_lexical)
 
+    vector = subparsers.add_parser(
+        "build-vector",
+        help="build and atomically activate a fingerprinted hybrid search generation",
+    )
+    vector.add_argument("--model", default="BAAI/bge-small-en-v1.5")
+    vector.add_argument("--query-prefix", default="")
+    vector.add_argument("--document-prefix", default="")
+    vector.add_argument("--batch-size", type=int, default=1_000)
+    vector.add_argument("--embedding-timeout", type=float, default=600.0)
+    vector.add_argument("--code-revision")
+    vector.add_argument("--lock-sha256")
+    vector.set_defaults(handler=command_build_vector)
+
     evaluate = subparsers.add_parser(
         "evaluate", help="run evidence-group retrieval evaluation against an active generation"
     )
@@ -322,6 +428,7 @@ def build_parser() -> argparse.ArgumentParser:
     evaluate.add_argument("--split", choices=("dev", "test"), default="dev")
     evaluate.add_argument("--allow-sealed", action="store_true")
     evaluate.add_argument("--validate-gold64", action="store_true")
+    evaluate.add_argument("--require-hybrid", action="store_true")
     evaluate.set_defaults(handler=command_evaluate)
 
     schema = subparsers.add_parser("eval-schema", help="write the evaluation case JSON schema")

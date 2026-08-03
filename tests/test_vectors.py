@@ -53,13 +53,27 @@ def build_hybrid(store):
 def test_embedding_generation_cannot_activate_partially(store):
     generation, provider = build_hybrid(store)
     status = store.embedding_status(generation)
-    assert status == {"documents": 2, "vectors": 0, "pending": 2}
+    assert status == {
+        "documents": 2,
+        "vectors": 0,
+        "pending": 2,
+        "live_documents": 2,
+        "live_vectors": 0,
+        "live_pending": 0,
+    }
     with pytest.raises(ValueError, match="incomplete"):
         store.activate_generation(generation)
 
     scheduler = InferenceScheduler(capacity=4)
     assert embed_generation(store, generation, provider, scheduler) == 2
-    assert store.embedding_status(generation) == {"documents": 2, "vectors": 2, "pending": 0}
+    assert store.embedding_status(generation) == {
+        "documents": 2,
+        "vectors": 2,
+        "pending": 0,
+        "live_documents": 2,
+        "live_vectors": 0,
+        "live_pending": 0,
+    }
     store.activate_generation(generation)
     scheduler.close()
 
@@ -111,4 +125,53 @@ def test_model_manifest_mismatch_degrades_explicitly_to_keyword(store):
     )
     assert result.mode == "keyword_only"
     assert "manifest" in (result.reason or "")
+    scheduler.close()
+
+
+def test_new_events_receive_a_persistent_live_vector_overlay(store):
+    generation, provider = build_hybrid(store)
+    scheduler = InferenceScheduler(capacity=4)
+    embed_generation(store, generation, provider, scheduler)
+    store.activate_generation(generation)
+    assert store.live_document_count() == 0
+
+    fresh = store.ingest(
+        make_event(
+            event_key="fresh-coral",
+            session_id="session-fresh",
+            project_id="new-project",
+            content="A fresh coral instruction arrived after generation activation.",
+        )
+    )
+    batch = store.pending_live_embedding_batch(generation)
+    assert len(batch) == 1
+    vectors = provider.embed_documents([body for _, body in batch])
+    store.put_live_embeddings(
+        generation,
+        dict(zip([document for document, _ in batch], vectors, strict=True)),
+    )
+    status = store.embedding_status(generation)
+    assert status["live_documents"] == 1
+    assert status["live_vectors"] == 1
+    assert status["live_pending"] == 0
+
+    result = RecallEngine(
+        store,
+        embedder=provider,
+        scheduler=scheduler,
+        vector_min_similarity=0.70,
+    ).recall(RecallQuery(query="coral instruction"))
+    live = next(item for item in result.evidence if item.ref_id == fresh.event_id)
+    assert "semantic-match" in live.reasons
+
+    duplicate = store.ingest(
+        make_event(
+            event_key="fresh-coral",
+            session_id="session-fresh",
+            project_id="new-project",
+            content="A fresh coral instruction arrived after generation activation.",
+        )
+    )
+    assert duplicate.inserted is False
+    assert store.live_document_count() == 1
     scheduler.close()

@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import hashlib
 from collections.abc import Sequence
+from pathlib import Path
 from typing import Protocol
 
 import numpy as np
@@ -19,11 +21,35 @@ class EmbeddingProvider(Protocol):
 class FastEmbedProvider:
     """FastEmbed wrapper that enforces the declared model contract exactly."""
 
-    def __init__(self, manifest: EmbeddingManifest) -> None:
+    def __init__(
+        self,
+        manifest: EmbeddingManifest,
+        *,
+        cache_dir: Path | None = None,
+        threads: int | None = None,
+        local_files_only: bool = True,
+    ) -> None:
         from fastembed import TextEmbedding
 
         self.manifest = manifest
-        self._model = TextEmbedding(model_name=manifest.model)
+        if manifest.provider != "fastembed":
+            raise ValueError("FastEmbedProvider requires a fastembed manifest")
+        if not manifest.artifact_sha256:
+            raise ValueError("fastembed generations require an exact artifact fingerprint")
+        self._model = TextEmbedding(
+            model_name=manifest.model,
+            cache_dir=str(cache_dir) if cache_dir else None,
+            threads=threads,
+            local_files_only=local_files_only,
+        )
+        revision, artifact = self._model_identity(self._model)
+        if revision != manifest.revision:
+            raise ValueError(
+                f"model revision differs from manifest: runtime={revision} "
+                f"manifest={manifest.revision}"
+            )
+        if artifact != manifest.artifact_sha256:
+            raise ValueError("model artifact fingerprint differs from manifest")
         probe = np.asarray(next(iter(self._model.embed(["dimension probe"]))), dtype=np.float32)
         native = int(probe.shape[0])
         if native != manifest.native_dimension:
@@ -31,6 +57,71 @@ class FastEmbedProvider:
                 f"model native dimension differs from manifest: runtime={native} "
                 f"manifest={manifest.native_dimension}"
             )
+
+    @classmethod
+    def discover(
+        cls,
+        model: str,
+        *,
+        cache_dir: Path | None = None,
+        threads: int | None = None,
+        normalized: bool = True,
+        query_prefix: str = "",
+        document_prefix: str = "",
+    ) -> FastEmbedProvider:
+        """Download/load one model and bind a manifest to its exact cached artifact."""
+        from fastembed import TextEmbedding
+
+        loaded = TextEmbedding(
+            model_name=model,
+            cache_dir=str(cache_dir) if cache_dir else None,
+            threads=threads,
+            local_files_only=False,
+        )
+        probe = np.asarray(next(iter(loaded.embed(["dimension probe"]))), dtype=np.float32)
+        native = int(probe.shape[0])
+        revision, artifact = cls._model_identity(loaded)
+        manifest = EmbeddingManifest(
+            provider="fastembed",
+            model=model,
+            revision=revision,
+            artifact_sha256=artifact,
+            dimension=native,
+            native_dimension=native,
+            normalized=normalized,
+            query_prefix=query_prefix,
+            document_prefix=document_prefix,
+            matryoshka=False,
+        )
+        provider = cls.__new__(cls)
+        provider.manifest = manifest
+        provider._model = loaded
+        return provider
+
+    @staticmethod
+    def _model_identity(model) -> tuple[str, str]:
+        inner = getattr(model, "model", None)
+        directory_value = getattr(inner, "_model_dir", None)
+        if not directory_value:
+            raise ValueError("fastembed did not expose the resolved model snapshot")
+        directory = Path(directory_value).resolve()
+        if not directory.is_dir():
+            raise ValueError("resolved fastembed model snapshot does not exist")
+        digest = hashlib.sha256(b"system-memory:fastembed-artifact:v1\n")
+        files = sorted(path for path in directory.rglob("*") if path.is_file())
+        if not files:
+            raise ValueError("resolved fastembed model snapshot is empty")
+        for path in files:
+            relative = path.relative_to(directory).as_posix()
+            digest.update(relative.encode("utf-8"))
+            digest.update(b"\0")
+            digest.update(str(path.stat().st_size).encode("ascii"))
+            digest.update(b"\0")
+            with path.open("rb") as handle:
+                for block in iter(lambda: handle.read(1024 * 1024), b""):
+                    digest.update(block)
+            digest.update(b"\n")
+        return directory.name, digest.hexdigest()
 
     def _finish(self, value) -> list[float]:
         vector = np.asarray(value, dtype=np.float32)

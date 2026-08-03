@@ -75,8 +75,9 @@ class RecallEngine:
                         lambda: self.embedder.embed_query(request.query),
                         timeout=self.query_timeout_seconds,
                     )
-                    index = self.vector_cache.get(self.store, generation)
-                    vector_hits = index.search(
+                    vector_hits = self.vector_cache.search(
+                        self.store,
+                        generation,
                         query_vector,
                         limit=max(self.lexical_candidates, request.limit),
                         hard_project_ids=request.scope.project_ids if hard else (),
@@ -207,6 +208,8 @@ class RecallEngine:
     @staticmethod
     def _evidence(hit: SearchHit) -> RecallEvidence:
         reasons = ["lexical-match"]
+        if hit.vector_score:
+            reasons.append("semantic-match")
         if hit.exact_score:
             reasons.append("exact-term-support")
         if hit.project_boost:

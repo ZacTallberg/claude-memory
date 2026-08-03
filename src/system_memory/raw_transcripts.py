@@ -49,6 +49,7 @@ class RawImportReport(BaseModel):
     exact_provider_duplicates_skipped: int = 0
     provider_identity_revisions: int = 0
     sidechain_events: int = 0
+    compact_summaries_classified: int = 0
     provider_counts: dict[str, int] = Field(default_factory=dict)
     failure_types: dict[str, int] = Field(default_factory=dict)
 
@@ -259,6 +260,7 @@ class RawTranscriptImporter:
                     )
                 blocks = _text_blocks(content, frozenset({"text"}))
                 sidechain = bool(record.get("isSidechain"))
+                compact_summary = bool(record.get("isCompactSummary"))
                 session_id = str(record.get("sessionId") or path.stem)
                 agent_id = f"claude-worker:{session_id}" if sidechain else "claude-main"
                 for block_index, text in blocks:
@@ -276,28 +278,36 @@ class RawTranscriptImporter:
                             agent_id=agent_id,
                             session_id=session_id,
                             project_id=None,
-                            role=Role.USER if role_value == "user" else Role.ASSISTANT,
-                            authority=(
-                                Authority.USER_AUTHORED
-                                if role_value == "user"
-                                else Authority.ASSISTANT_SYNTHESIS
+                            role=(
+                                Role.SYSTEM_OBSERVATION
+                                if compact_summary
+                                else (Role.USER if role_value == "user" else Role.ASSISTANT)
                             ),
-                            kind=EventKind.MESSAGE,
+                            authority=(
+                                Authority.ASSISTANT_SYNTHESIS
+                                if compact_summary or role_value == "assistant"
+                                else Authority.USER_AUTHORED
+                            ),
+                            kind=EventKind.CHECKPOINT if compact_summary else EventKind.MESSAGE,
                             occurred_at=_timestamp(record.get("timestamp"), fallback=fallback),
                             content=text,
                             visibility="private",
-                            trust="authored",
+                            trust="derived" if compact_summary else "authored",
+                            loss_flags=("provider_compaction_summary",) if compact_summary else (),
                             metadata={
                                 "cwd": record.get("cwd"),
                                 "git_branch": record.get("gitBranch"),
                                 "parent_message_uuid": record.get("parentUuid"),
                                 "is_sidechain": sidechain,
+                                "is_compact_summary": compact_summary,
                                 "source_line": line_number,
                             },
                         )
                     )
                     if sidechain:
                         report.sidechain_events += 1
+                    if compact_summary:
+                        report.compact_summaries_classified += 1
         return events
 
     def _parse_codex(self, path: Path, report: RawImportReport) -> list[IngestEvent]:

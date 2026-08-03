@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import threading
 from dataclasses import replace
+from typing import Any
 
 import numpy as np
 
@@ -26,15 +27,31 @@ class VectorIndex:
         if not manifest:
             raise ValueError("generation has no embedding manifest")
         records = store.vector_records(generation_id)
+        return cls._from_records(generation_id, manifest.dimension, records)
+
+    @classmethod
+    def load_live(cls, store: MemoryStore, generation_id: str) -> VectorIndex | None:
+        manifest = store.embedding_manifest(generation_id)
+        if not manifest:
+            raise ValueError("generation has no embedding manifest")
+        records = store.live_vector_records(generation_id)
+        if not records:
+            return None
+        return cls._from_records(generation_id, manifest.dimension, records)
+
+    @classmethod
+    def _from_records(
+        cls, generation_id: str, dimension: int, records: list[dict[str, Any]]
+    ) -> VectorIndex:
         if not records:
             raise ValueError("generation has no vectors")
-        matrix = np.empty((len(records), manifest.dimension), dtype=np.float32)
+        matrix = np.empty((len(records), dimension), dtype=np.float32)
         documents: list[SearchHit] = []
         for index, row in enumerate(records):
-            if int(row["dimension"]) != manifest.dimension:
+            if int(row["dimension"]) != dimension:
                 raise ValueError("stored vector dimension differs from generation manifest")
             vector = np.frombuffer(row["vector"], dtype="<f4")
-            if int(vector.shape[0]) != manifest.dimension:
+            if int(vector.shape[0]) != dimension:
                 raise ValueError("stored vector payload has the wrong length")
             matrix[index] = vector
             documents.append(
@@ -118,6 +135,8 @@ class VectorIndexCache:
     def __init__(self) -> None:
         self._lock = threading.Lock()
         self._index: VectorIndex | None = None
+        self._live_index: VectorIndex | None = None
+        self._live_key: tuple[str, int, int] | None = None
 
     def get(self, store: MemoryStore, generation_id: str) -> VectorIndex:
         current = self._index
@@ -130,3 +149,32 @@ class VectorIndexCache:
             loaded = VectorIndex.load(store, generation_id)
             self._index = loaded
             return loaded
+
+    def get_live(self, store: MemoryStore, generation_id: str) -> VectorIndex | None:
+        count, newest = store.live_vector_version(generation_id)
+        key = (generation_id, count, newest)
+        if self._live_key == key:
+            return self._live_index
+        with self._lock:
+            if self._live_key == key:
+                return self._live_index
+            loaded = VectorIndex.load_live(store, generation_id) if count else None
+            self._live_index = loaded
+            self._live_key = key
+            return loaded
+
+    def search(
+        self,
+        store: MemoryStore,
+        generation_id: str,
+        query_vector: list[float],
+        *,
+        limit: int,
+        **filters,
+    ) -> list[SearchHit]:
+        hits = self.get(store, generation_id).search(query_vector, limit=limit, **filters)
+        live = self.get_live(store, generation_id)
+        if live:
+            hits.extend(live.search(query_vector, limit=limit, **filters))
+        hits.sort(key=lambda item: (-item.vector_score, item.document_id))
+        return hits[:limit]
