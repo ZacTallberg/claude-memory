@@ -1,7 +1,7 @@
 [project]
 name = "claudemem"
-version = "0.2.0"
-description = "Shared local agent-memory for Claude Code and Codex (hybrid BM25+vector recall + dashboard)."
+version = "0.3.0"
+description = "Private machine-wide memory for local agent runtimes with typed, hybrid retrieval."
 requires-python = ">=3.12"
 readme = "docs/README.md"
 dynamic = ["dependencies"]

@@ -30,8 +30,11 @@ from pathlib import Path
 from mcp.server.fastmcp import FastMCP
 
 from claudemem.config import Config, load_config
-from claudemem.facts import load_note
+from claudemem.conflict_service import synchronize_fact_conflicts
+from claudemem.facts import load_note, load_notes
 from claudemem.lifecycle import VALID_STATUSES, VALID_VISIBILITIES, parse_datetime
+from claudemem.memory_types import (MEMORY_KINDS, find_claim_conflicts,
+                                    normalize_memory_metadata)
 from claudemem.note_io import atomic_write_text
 from claudemem.paths import (canonical_memory_root, is_curated_note_path, iter_memory_dirs,
                              memory_write_roots, project_from_cwd, safe_under)
@@ -101,6 +104,21 @@ def _warm_post(path: str, payload: dict, timeout: float = 20.0) -> dict | None:
         return None
 
 
+def _positive_ids(values) -> list[int]:
+    """Normalize bounded evidence ids supplied by an MCP client."""
+    out: list[int] = []
+    for raw in values if isinstance(values, list) else []:
+        try:
+            item_id = int(raw)
+        except (TypeError, ValueError):
+            continue
+        if item_id > 0 and item_id not in out:
+            out.append(item_id)
+        if len(out) >= 50:
+            break
+    return out
+
+
 # ---- serializers (stable JSON shapes for clients) ----
 def _result_json(r) -> dict:
     c = r.chunk
@@ -130,6 +148,10 @@ def _fact_json(f: Fact, *, body: bool = False) -> dict:
         "tags": list(f.tags or []),
         "path": f.path,
         "origin_session_id": f.origin_session_id,
+        "memory_kind": (f.meta or {}).get("memory_kind", "semantic"),
+        "importance": (f.meta or {}).get("importance", 0.7),
+        "claims": list((f.meta or {}).get("claims") or []),
+        "conflict_ids": list((f.meta or {}).get("conflict_ids") or []),
         "lifecycle": {key: (f.meta or {}).get(key) for key in (
             "status", "visibility", "confidence", "valid_from", "valid_to",
             "supersedes", "superseded_by", "provenance")},
@@ -197,7 +219,7 @@ def memory_index(query: str, k: int = 12) -> dict:
 @mcp.tool()
 def get_memory_chunks(ids: list[int]) -> dict:
     """Fetch full transcript chunks selected from memory_index results by numeric id."""
-    clean_ids = list(dict.fromkeys(int(x) for x in (ids or [])))[:50]
+    clean_ids = _positive_ids(ids)
     chunks = {c.id: c for c in _store().get_chunks(clean_ids)}
     return {"chunks": [{"id": chunks[cid].id, "project": chunks[cid].project,
                          "session": chunks[cid].session_id, "role": chunks[cid].role,
@@ -244,6 +266,17 @@ def get_fact(id: int) -> dict:
 
 
 @mcp.tool()
+def memory_conflicts() -> dict:
+    """List unresolved contradictions among explicit single-valued temporal claims.
+
+    Conflicting notes remain auditable and manually searchable but are withheld from automatic
+    context until supersession, validity, or cardinality metadata resolves the contradiction.
+    """
+    conflicts = find_claim_conflicts(load_notes(_config()))
+    return {"count": len(conflicts), "conflicts": conflicts}
+
+
+@mcp.tool()
 def recall(prompt: str, session_id: str | None = None, cwd: str | None = None) -> dict:
     """Return the SAME reference envelope the UserPromptSubmit hook injects for a prompt:
     a `<recalled-memory>` data-only block of past-session snippets plus a `<curated-notes>`
@@ -273,6 +306,8 @@ def recall(prompt: str, session_id: str | None = None, cwd: str | None = None) -
             "latency_ms": int(warm.get("latency_ms") or 0),
             "retrieval_mode": warm.get("retrieval_mode") or "unknown",
             "vector_used": bool(warm.get("vector_used")),
+            "chunk_ids": list(warm.get("chunk_ids") or []),
+            "fact_ids": list(warm.get("fact_ids") or []),
         }, timeout=cfg.delivery.receipt_timeout_seconds)
         return {"text": text, "n_recalled": int(warm.get("n_recalled") or 0),
                 "n_facts": int(warm.get("n_facts") or 0), "chars": len(text),
@@ -290,7 +325,9 @@ def recall(prompt: str, session_id: str | None = None, cwd: str | None = None) -
             n_recalled=len(results), n_facts=len(facts), chars=len(text), latency_ms=0,
             details={"request_id": request_id, "delivery_status": "fallback",
                      "failure_reason": failure_reason, "retrieval_mode": "keyword-only",
-                     "vector_used": False},
+                     "vector_used": False,
+                     "chunk_ids": [result.chunk.id for result in results],
+                     "fact_ids": [fact.id for fact in facts]},
         )
     except Exception:
         pass
@@ -300,7 +337,8 @@ def recall(prompt: str, session_id: str | None = None, cwd: str | None = None) -
 
 @mcp.tool()
 def memory_feedback(request_id: str, outcome: str, reason: str = "",
-                    session_id: str | None = None) -> dict:
+                    session_id: str | None = None, chunk_ids: list[int] | None = None,
+                    fact_ids: list[int] | None = None) -> dict:
     """Record whether one recall was helpful, neutral, harmful, or stale.
 
     Use this only when the effect is observable; do not invent feedback merely because a
@@ -313,9 +351,14 @@ def memory_feedback(request_id: str, outcome: str, reason: str = "",
     if value not in {"helpful", "neutral", "harmful", "stale"}:
         return {"error": "outcome must be helpful, neutral, harmful, or stale"}
     safe_reason = collapse_ws(redact_secrets(reason or "")[0])[:500]
+    clean_chunks = _positive_ids(chunk_ids)
+    clean_facts = _positive_ids(fact_ids)
     fid = _store().log_memory_feedback(request_id=rid, outcome=value,
                                        session_id=session_id, reason=safe_reason,
-                                       details={"client": "mcp"})
+                                       details={"client": "mcp", "chunk_ids": clean_chunks,
+                                                "fact_ids": clean_facts,
+                                                "attribution": "explicit" if (clean_chunks or clean_facts)
+                                                else "request-level"})
     return {"ok": True, "feedback_id": fid, "request_id": rid, "outcome": value}
 
 
@@ -324,6 +367,8 @@ def write_note(project: str, title: str, type: str = "reference", body: str = ""
                tags: list[str] | None = None, description: str = "",
                name: str | None = None, status: str = "active",
                visibility: str = "machine", confidence: float = 1.0,
+               memory_kind: str = "semantic", importance: float = 0.7,
+               claims: list[dict] | None = None,
                valid_from: str | None = None, valid_to: str | None = None,
                supersedes: str | None = None, provenance: str | None = "mcp:write_note") -> dict:
     """Author (or update) a curated Markdown memory note in the client-neutral store,
@@ -360,10 +405,17 @@ def write_note(project: str, title: str, type: str = "reference", body: str = ""
         return {"error": f"status must be one of {sorted(VALID_STATUSES)}"}
     if visibility not in VALID_VISIBILITIES:
         return {"error": f"visibility must be one of {sorted(VALID_VISIBILITIES)}"}
+    memory_kind = (memory_kind or "semantic").strip().lower()
+    if memory_kind not in MEMORY_KINDS:
+        return {"error": f"memory_kind must be one of {sorted(MEMORY_KINDS)}"}
     try:
         confidence = max(0.0, min(1.0, float(confidence)))
     except (TypeError, ValueError):
         return {"error": "confidence must be between 0 and 1"}
+    try:
+        importance = max(0.0, min(1.0, float(importance)))
+    except (TypeError, ValueError):
+        return {"error": "importance must be between 0 and 1"}
     parsed_from = parse_datetime(valid_from)
     parsed_to = parse_datetime(valid_to)
     if valid_from and not parsed_from:
@@ -374,8 +426,19 @@ def write_note(project: str, title: str, type: str = "reference", body: str = ""
         return {"error": "valid_to must be later than valid_from"}
     valid_from = parsed_from.isoformat() if parsed_from else None
     valid_to = parsed_to.isoformat() if parsed_to else None
+    normalized_memory = normalize_memory_metadata(
+        {"metadata": {"memory_kind": memory_kind, "importance": importance,
+                      "claims": claims or []}},
+        note_name=collapse_ws(name or "") or _slug(title), note_type=t,
+        lifecycle={"status": status, "confidence": confidence,
+                   "valid_from": valid_from, "valid_to": valid_to,
+                   "provenance": provenance},
+    )
+    if claims and len(normalized_memory["claims"]) != len(claims):
+        return {"error": "each claim requires subject, predicate, and object"}
     proposed = "\n".join([title, description or "", body or "", provenance or "",
-                            " ".join(str(tag) for tag in (tags or []))])
+                            " ".join(str(tag) for tag in (tags or [])),
+                            json.dumps(normalized_memory["claims"], ensure_ascii=False)])
     _redacted, secret_findings = redact_secrets(proposed)
     if secret_findings:
         return {"error": "refused: potential credential material must not be written to memory",
@@ -400,7 +463,9 @@ def write_note(project: str, title: str, type: str = "reference", body: str = ""
                       type=t, tags=[collapse_ws(str(x)) for x in (tags or []) if str(x).strip()],
                       body=(body or "").strip(), status=status, visibility=visibility,
                       confidence=confidence, valid_from=valid_from, valid_to=valid_to,
-                      supersedes=supersedes, provenance=provenance)
+                      supersedes=supersedes, provenance=provenance,
+                      memory_kind=memory_kind, importance=importance,
+                      claims=normalized_memory["claims"])
 
     created = not target.exists()
     try:
@@ -417,6 +482,8 @@ def write_note(project: str, title: str, type: str = "reference", body: str = ""
         "path": str(target),
         "project": _project_label(cfg, mem_dir),
         "type": t,
+        "memory_kind": memory_kind,
+        "importance": importance,
         "title": title,
         "fact_id": fact_id,
         "indexed": indexed,
@@ -476,6 +543,9 @@ def supersede_note(id: int, replacement_title: str, replacement_body: str,
         visibility=str((old.meta or {}).get("visibility") or "machine"),
         confidence=float((old.meta or {}).get("confidence", 1.0)), valid_from=now,
         valid_to=None, supersedes=old.name, provenance=f"supersedes:{old.name}",
+        memory_kind=str((old.meta or {}).get("memory_kind") or "semantic"),
+        importance=float((old.meta or {}).get("importance", 0.7)),
+        claims=list((old.meta or {}).get("claims") or []),
     )
     old_meta.update({"status": "superseded", "valid_to": now,
                      "superseded_by": new_note_name})
@@ -513,15 +583,23 @@ def _render_note(*, name: str, title: str, description: str, type: str,
                  tags: list[str], body: str, status: str = "active",
                  visibility: str = "machine", confidence: float = 1.0,
                  valid_from: str | None = None, valid_to: str | None = None,
-                 supersedes: str | None = None, provenance: str | None = None) -> str:
+                 supersedes: str | None = None, provenance: str | None = None,
+                 memory_kind: str = "semantic", importance: float = 0.7,
+                 claims: list[dict] | None = None) -> str:
     """Emit frontmatter matching existing curated notes:
     name / description / metadata{node_type, type, [tags]} + body."""
     import yaml  # available (used by text.parse_frontmatter)
 
     meta: dict = {"node_type": "memory", "type": type, "status": status,
-                  "visibility": visibility, "confidence": confidence}
+                  "visibility": visibility, "confidence": confidence,
+                  "memory_kind": memory_kind, "importance": importance}
     if tags:
         meta["tags"] = tags
+    if claims:
+        # Remove derived note/id fields before persisting portable source metadata.
+        meta["claims"] = [{key: value for key, value in claim.items()
+                           if key not in {"id", "note"} and value is not None}
+                          for claim in claims]
     for key, value in (("valid_from", valid_from), ("valid_to", valid_to),
                        ("supersedes", supersedes), ("provenance", provenance)):
         if value:
@@ -602,9 +680,11 @@ def _index_note(cfg: Config, path: Path, mem_dir: Path) -> tuple[int | None, boo
             path=nd.path, project=nd.project, name=nd.name, title=nd.title,
             description=nd.description, type=nd.type, tags=nd.tags,
             origin_session_id=nd.origin_session_id, body=nd.body, embedding=None,
-            mtime=nd.mtime, meta={"wikilinks": nd.wikilinks, "lifecycle_schema": 1,
-                                 **nd.lifecycle},
+            mtime=nd.mtime, meta={"wikilinks": nd.wikilinks, "lifecycle_schema": 2,
+                                 "memory_kind": nd.memory_kind, "importance": nd.importance,
+                                 "claims": nd.claims, "conflict_ids": [], **nd.lifecycle},
         )
+        synchronize_fact_conflicts(cfg, store)
         return fid, True, False
     except Exception:
         return None, False, False

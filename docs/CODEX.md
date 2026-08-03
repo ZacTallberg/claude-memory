@@ -31,8 +31,9 @@ Use `/mcp` to confirm the `claude-memory` tools are available.
   `~/.codex/{sessions,archived_sessions}/**/*.jsonl` into the shared corpus. The Codex parser
   deliberately retains only user and assistant message text; tools, reasoning, system/developer
   context, and unknown rollout records are ignored.
-- MCP provides explicit `memory_search`, `search_facts`, `get_fact`, `list_facts`, `recall`, and
-  `write_note` operations at any point in a task.
+- MCP provides explicit progressive search, fact browsing, exact recall envelopes, typed note
+  authoring/supersession, contradiction inspection (`memory_conflicts`), and attributable
+  usefulness feedback at any point in a task.
 
 The hooks are user-level and machine-wide (`[scope].activation = "installed_clients"`), so generated
 projectless tasks under `Documents\Codex` receive the same recall as repositories under `C:\code`.
@@ -44,4 +45,5 @@ After installation or upgrades, run `mem integrations` for connector coverage an
 
 The Codex rollout format is documented as unstable. Its adapter is therefore narrow, fail-safe,
 and regression-tested. An unknown future record shape is skipped instead of poisoning or blocking
-memory delivery.
+memory delivery. Claude and Codex are built-ins, not architectural boundaries: additional local
+agent formats can register the background-only adapter protocol described in `docs/ADAPTERS.md`.

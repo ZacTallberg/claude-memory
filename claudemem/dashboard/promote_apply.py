@@ -7,6 +7,7 @@ from pathlib import Path
 import yaml
 
 from claudemem.config import Config
+from claudemem.conflict_service import synchronize_fact_conflicts
 from claudemem.facts import load_note
 from claudemem.note_io import atomic_write_text
 from claudemem.paths import canonical_memory_root, is_curated_note_path, iter_memory_dirs
@@ -38,6 +39,9 @@ def accept_candidate(cfg: Config, store: Store, pid: int, project: str | None = 
     front = {"name": safe_title, "title": safe_title, "description": safe_title,
              "metadata": {"node_type": "memory", "type": cand.get("type", "reference"),
                           "status": "active", "visibility": "machine", "confidence": 0.8,
+                          "memory_kind": (cand.get("support") or {}).get("memory_kind", "semantic")
+                          if isinstance(cand.get("support"), dict) else "semantic",
+                          "importance": 0.7,
                           "provenance": "promotion-review"}}
     frontmatter = yaml.safe_dump(front, sort_keys=False, allow_unicode=True,
                                  default_flow_style=False)
@@ -48,5 +52,10 @@ def accept_candidate(cfg: Config, store: Store, pid: int, project: str | None = 
                           description=nd.description, type=nd.type, tags=nd.tags,
                           origin_session_id=nd.origin_session_id, body=nd.body, embedding=None,
                           mtime=nd.mtime, meta={"wikilinks": nd.wikilinks,
-                                               "lifecycle_schema": 1, **nd.lifecycle})
+                                               "lifecycle_schema": 2,
+                                               "memory_kind": nd.memory_kind,
+                                               "importance": nd.importance,
+                                               "claims": nd.claims,
+                                               "conflict_ids": [], **nd.lifecycle})
+        synchronize_fact_conflicts(cfg, store)
     store.update_promotion(pid, "accepted")

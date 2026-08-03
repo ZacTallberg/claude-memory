@@ -129,6 +129,13 @@ def _synthetic_note(tmpdir: Path) -> Path:
         "  status: active\n"
         "  visibility: machine\n"
         "  confidence: 0.9\n"
+        "  memory_kind: procedural\n"
+        "  importance: 0.95\n"
+        "  claims:\n"
+        "    - subject: recall.envelope\n"
+        "      predicate: max_chars\n"
+        "      object: configured\n"
+        "      cardinality: one\n"
         "  valid_from: 2026-01-01T00:00:00Z\n"
         "  originSessionId: sess-xyz\n"
         "  tags: [recall, budget]\n"
@@ -171,7 +178,9 @@ def run_selftest(verbose: bool = True) -> bool:
         ok = (cfg.scope.workspace_roots and cfg.scope.memory_root and cfg.embeddings.dim > 0
               and cfg.scope.activation in ("installed_clients", "workspace_roots")
               and cfg.recall.max_chars <= 10000 and cfg.store.backend in ("auto", "postgres", "sqlite")
-              and cfg.delivery.server_deadline_seconds < cfg.delivery.client_timeout_seconds)
+              and cfg.delivery.server_deadline_seconds < cfg.delivery.client_timeout_seconds
+              and cfg.consolidation.candidate_cap > 0
+              and cfg.consolidation.min_interval_hours >= 0)
         return ok, (f"backend={cfg.store.backend} activation={cfg.scope.activation} "
                     f"deadline={cfg.delivery.server_deadline_seconds}s<"
                     f"{cfg.delivery.client_timeout_seconds}s dim={cfg.embeddings.dim}")
@@ -384,6 +393,18 @@ def run_selftest(verbose: bool = True) -> bool:
     ctx.check("Codex corpus cleaning drops ambient state but preserves authored payloads",
               c_codex_ambient_cleaning)
 
+    def c_transcript_adapter_contract():
+        from .transcript_adapters import TranscriptAdapter, adapter_status, get_adapter
+        claude = get_adapter("claude")
+        codex = get_adapter("codex")
+        status = adapter_status(cfg)
+        return (isinstance(claude, TranscriptAdapter) and isinstance(codex, TranscriptAdapter)
+                and {item["name"] for item in status} >= {"claude", "codex"}
+                and all(item["enabled"] for item in status if item["name"] in {"claude", "codex"}),
+                f"adapters={[item['name'] for item in status]}")
+    ctx.check("transcript adapter SDK exposes safe built-ins and extension contract",
+              c_transcript_adapter_contract)
+
     # -- curated note parse: frontmatter + nested type + wikilinks ----------
     def c_note_parse():
         from .facts import load_note
@@ -395,7 +416,9 @@ def run_selftest(verbose: bool = True) -> bool:
                 and "recall-hook" in nd.wikilinks and "recall" in nd.tags
                 and nd.lifecycle["status"] == "active"
                 and nd.lifecycle["visibility"] == "machine"
-                and nd.lifecycle["confidence"] == 0.9,
+                and nd.lifecycle["confidence"] == 0.9
+                and nd.memory_kind == "procedural" and nd.importance == 0.95
+                and len(nd.claims) == 1 and nd.claims[0]["cardinality"] == "one",
                 f"type={nd.type if nd else None} links={nd.wikilinks if nd else None}")
     ctx.check("curated note parse: fields, lifecycle, provenance links", c_note_parse)
 
@@ -421,6 +444,38 @@ def run_selftest(verbose: bool = True) -> bool:
                 and not fact_is_recallable(uncertain),
                 "temporal and visibility rules constrain automatic recall")
     ctx.check("temporal lifecycle and visibility constrain automatic recall", c_note_lifecycle)
+
+    def c_typed_claim_conflicts():
+        from .facts import load_note
+        from .lifecycle import fact_is_recallable
+        from .memory_types import find_claim_conflicts
+        from .store.base import Fact
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            bodies = (("old-model", "BAAI/bge-small-en-v1.5"),
+                      ("new-model", "snowflake/snowflake-arctic-embed-s"))
+            notes = []
+            for name, value in bodies:
+                path = root / f"{name}.md"
+                path.write_text(
+                    "---\n" + f"name: {name}\nmetadata:\n  type: reference\n"
+                    "  memory_kind: semantic\n  claims:\n"
+                    "    - subject: memory.embedding\n      predicate: model\n"
+                    f"      object: {value}\n      cardinality: one\n"
+                    "    - subject: memory.embedding\n      predicate: provider\n"
+                    f"      object: {name}\n      cardinality: one\n---\nvalue\n",
+                    encoding="utf-8")
+                notes.append(load_note(path, "selftest"))
+            conflicts = find_claim_conflicts(notes)
+        fact = Fact(id=1, path="p", project="selftest", name="old-model", title="old",
+                    description="", type="reference", tags=[], origin_session_id=None, body="",
+                    meta={"status": "active", "visibility": "machine", "confidence": 1.0,
+                          "conflict_ids": [conflicts[0]["id"]] if conflicts else []})
+        return (len(conflicts) == 2 and conflicts[0]["subject"] == "memory.embedding"
+                and {row["predicate"] for row in conflicts} == {"model", "provider"}
+                and not fact_is_recallable(fact),
+                f"conflicts={len(conflicts)} automatic_recall={fact_is_recallable(fact)}")
+    ctx.check("typed temporal claims detect contradictions and fail closed", c_typed_claim_conflicts)
 
     def c_neutral_note_roots():
         from dataclasses import replace
@@ -476,9 +531,39 @@ def run_selftest(verbose: bool = True) -> bool:
                 f"feedback_id={fid} count={count}")
     ctx.check("memory usefulness feedback persists and is observable", c_feedback_roundtrip)
 
+    def c_feedback_attribution_profile():
+        from dataclasses import replace
+        from .feedback_learning import build_profile
+        from .store.sqlite_store import SqliteStore
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            test_cfg = replace(
+                cfg, root=root, data_dir=root,
+                store=replace(cfg.store, backend="sqlite",
+                              sqlite=replace(cfg.store.sqlite, path=str(root / "feedback-profile.db"))))
+            test_store = SqliteStore(test_cfg); test_store.connect(); test_store.migrate()
+            try:
+                test_store.log_injection(
+                    hook="hook-recall-delivered", session_id="s", prompt_excerpt="q",
+                    n_recalled=1, n_facts=1, chars=10, latency_ms=1,
+                    details={"request_id": "profile-request", "chunk_ids": [41], "fact_ids": [7],
+                             "delivery_status": "delivered"})
+                test_store.log_memory_feedback(
+                    request_id="profile-request", outcome="helpful",
+                    details={"client": "selftest", "chunk_ids": [41],
+                             "fact_ids": [7], "attribution": "explicit"})
+                profile, report = build_profile(test_store)
+            finally:
+                test_store.close()
+        return (profile.attributed_events == 1 and profile.chunk_weights[41] > 1.0
+                and profile.fact_weights[7] > 1.0 and report["activation"] == "offline-experiment-only",
+                f"events={profile.attributed_events} chunk_weight={profile.chunk_weights.get(41):.4f}")
+    ctx.check("feedback joins delivery ids into bounded offline-only ranking evidence",
+              c_feedback_attribution_profile)
+
     def c_mcp_note_supersession():
         from dataclasses import replace
-        from .lifecycle import fact_is_active
+        from .lifecycle import fact_is_active, fact_is_recallable
         from .store.sqlite_store import SqliteStore
         from .store import factory
         from .mcp import server as mcp_server
@@ -507,6 +592,14 @@ def run_selftest(verbose: bool = True) -> bool:
                 changed = mcp_server.supersede_note(
                     made.get("fact_id"), "Current endpoint v2", "Use endpoint v2.",
                     reason="v1 was retired")
+                claim_a = mcp_server.write_note(
+                    "alpha", "Endpoint claim A", body="Endpoint A is current.",
+                    claims=[{"subject": "alpha.endpoint", "predicate": "current",
+                             "object": "A", "cardinality": "one"}], provenance="selftest")
+                claim_b = mcp_server.write_note(
+                    "alpha", "Endpoint claim B", body="Endpoint B is current.",
+                    claims=[{"subject": "alpha.endpoint", "predicate": "current",
+                             "object": "B", "cardinality": "one"}], provenance="selftest")
                 facts = test_store.list_facts(project="alpha")
             finally:
                 (factory._singleton, mcp_server._cfg, mcp_server._keyword_retriever,
@@ -514,13 +607,16 @@ def run_selftest(verbose: bool = True) -> bool:
                 test_store.close()
         active = [f for f in facts if fact_is_active(f)]
         retired = [f for f in facts if (f.meta or {}).get("status") == "superseded"]
-        ok = (made.get("ok") and changed.get("ok") and len(facts) == 2
-              and len(active) == 1 and len(retired) == 1
-              and active[0].meta.get("supersedes") == retired[0].name
-              and retired[0].meta.get("superseded_by") == active[0].name)
+        replacement = next((f for f in active if (f.meta or {}).get("supersedes")), None)
+        conflicted = [f for f in facts if (f.meta or {}).get("conflict_ids")]
+        ok = (made.get("ok") and changed.get("ok") and claim_a.get("ok") and claim_b.get("ok")
+              and len(facts) == 4 and len(active) == 3 and len(retired) == 1
+              and replacement is not None and replacement.meta.get("supersedes") == retired[0].name
+              and retired[0].meta.get("superseded_by") == replacement.name
+              and len(conflicted) == 2 and all(not fact_is_recallable(f) for f in conflicted))
         return ok, (f"created={made.get('ok')} superseded={changed.get('ok')} "
-                    f"active={len(active)} retired={len(retired)}")
-    ctx.check("MCP note writes are neutral, atomic, and preserve supersession history",
+                    f"active={len(active)} retired={len(retired)} conflicts={len(conflicted)}")
+    ctx.check("MCP writes preserve supersession and immediately quarantine contradictions",
               c_mcp_note_supersession)
 
     # -- meaningful_term_count gating ---------------------------------------
@@ -598,6 +694,38 @@ def run_selftest(verbose: bool = True) -> bool:
         return order[0] == 19, f"top={order[:4]} (id 19 is supported by both rankers)"
     ctx.check("shared RRF ordering lets vector evidence promote a lower lexical fact", c_rank_order)
 
+    def c_model_bakeoff_is_shadowed():
+        from .model_bakeoff import parse_model_spec, supported_model_specs
+        supported = supported_model_specs()
+        current = parse_model_spec("current", cfg)
+        parsed = parse_model_spec("BAAI/bge-small-en-v1.5", cfg)
+        return (current.model == cfg.embeddings.model and current.dim == cfg.embeddings.dim
+                and parsed.dim == 384 and parsed.model in supported,
+                f"current={current.model}@{current.dim} supported={len(supported)}")
+    ctx.check("model bake-off resolves native dimensions without mutating live configuration",
+              c_model_bakeoff_is_shadowed)
+
+    def c_longmemeval_adapter():
+        from .benchmarks.longmemeval import run
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            source = root / "longmemeval.json"
+            source.write_text(json.dumps([{
+                "question_id": "selftest-1", "question_type": "single-session-user",
+                "question": "Which transport uses cobalt zebra quic?",
+                "haystack_session_ids": ["noise", "answer"],
+                "haystack_sessions": [
+                    [{"role": "user", "content": "ordinary unrelated gardening notes"}],
+                    [{"role": "user", "content": "cobalt zebra uses QUIC WebTransport"}],
+                ],
+                "answer_session_ids": ["answer"],
+            }]), encoding="utf-8")
+            report = run(source, mode="bm25", k=1, output=root / "out.json")
+        return (report["scored"] == 1 and report["recall_at_k"] == 1.0
+                and report["metric_scope"] == "session retrieval only",
+                f"recall@1={report['recall_at_k']} scope={report['metric_scope']}")
+    ctx.check("LongMemEval adapter reports honest session-retrieval metrics", c_longmemeval_adapter)
+
     # -- BM25 search returns hits (real DB) ---------------------------------
     real_q = "memory recall hook index retriever postgres embedding"
     if store is None:
@@ -645,7 +773,24 @@ def run_selftest(verbose: bool = True) -> bool:
         def c_vec():
             qv = embedder.embed_query(real_q)
             hits = store.search_vector(qv, cfg.recall.vector_k)
-            return len(hits) > 0, f"{len(hits)} vector hits"
+            parity = True
+            fallback = True
+            if hasattr(store, "_chunk_vector_matrix") and getattr(store, "_vec", False):
+                import sqlite_vec
+                raw = store._read_conn().execute(
+                    "SELECT rowid FROM chunks_vec WHERE embedding MATCH ? ORDER BY distance LIMIT ?",
+                    (sqlite_vec.serialize_float32(qv), cfg.recall.vector_k)).fetchall()
+                parity = [hit.chunk_id for hit in hits] == [row["rowid"] for row in raw]
+                original = store._chunk_vector_snapshot
+                try:
+                    store._chunk_vector_snapshot = lambda _conn: (_ for _ in ()).throw(
+                        MemoryError("synthetic snapshot failure"))
+                    degraded = store.search_vector(qv, cfg.recall.vector_k)
+                    fallback = [hit.chunk_id for hit in degraded] == [row["rowid"] for row in raw]
+                finally:
+                    store._chunk_vector_snapshot = original
+            return (len(hits) > 0 and parity and fallback,
+                    f"{len(hits)} vector hits exact_parity={parity} sqlite_fallback={fallback}")
         ctx.check("vector search returns hits (populated DB)", c_vec)
 
     # -- hybrid fuse returns hits (real DB) ---------------------------------

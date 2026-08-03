@@ -49,6 +49,8 @@ Dashboard (mem serve): FastAPI + HTMX + Alpine + Cytoscape + ECharts, warm model
 
 The dashboard process is also the **warm server**: it prewarms the real embedding, BM25, vector, and
 fact-search paths before readiness, then keeps the embedder and store hot so recall stays fast.
+On SQLite it also keeps a revision-tracked exact chunk-vector matrix warm, avoiding one full
+sqlite-vec scan per concurrent worker while preserving the same distance ordering.
 
 ---
 
@@ -106,6 +108,13 @@ with `.\mem.cmd`) and you get:
 | `mem delivery-check [--load]` | focused hybrid-delivery and latency-SLO check (optionally during indexing) |
 | `mem integrations` | census Claude/Codex hook + MCP coverage and warm-server health |
 | `mem promote` | mine recurring lessons into curated-note candidates |
+| `mem consolidate` | review-first durable decision/outcome/lesson candidate mining |
+| `mem conflicts [--strict]` | inspect unresolved single-valued temporal claims |
+| `mem adapters` / `mem models` | inspect transcript adapters / installed FastEmbed choices |
+| `mem tune-ranking` | read-only golden-set RRF and recency sweep |
+| `mem feedback-experiment` | gated, offline-only usefulness-attribution experiment |
+| `mem model-bakeoff current <model>` | native-dimension shadow embedding comparison |
+| `mem longmemeval <json>` | honest LongMemEval session-retrieval evaluation |
 | `mem install-hooks` / `mem uninstall-hooks` | wire/unwire Claude Code hooks |
 | `mem killswitch on\|off\|status` | toggle the kill switch (see below) |
 
@@ -152,6 +161,8 @@ Key sections (see `config.toml` for the full annotated set):
   non-loopback binds, non-loopback peers, hostile browser origins, and untrusted Host headers.
 - `[index]` — `exclude_sidechains`, `strip_injected` (strips our own injected blocks before storing,
   so recall never eats its own tail), batch size.
+- `[consolidation]` — bounded review-candidate mining after indexing. It is interval-limited and
+  never accepts generated candidates into authoritative memory automatically.
 
 ---
 
@@ -187,10 +198,12 @@ injection by itself. **No hits → emits nothing but records a delivered miss. A
 keyword fallback, then exit 0.**
 
 Curated notes may declare `status`, `valid_from`, `valid_to`, `supersedes`, `superseded_by`,
-`confidence`, `visibility`, and `provenance` in frontmatter. Expired, draft, obsolete, and superseded
+`confidence`, `visibility`, `provenance`, `memory_kind`, `importance`, and explicit temporal `claims`
+in frontmatter. Expired, draft, obsolete, and superseded
 notes remain auditable but are excluded from automatic recall and the session-start map.
 Private notes are manual-only, project notes require a matching working directory, and confidence
-below 0.5 is manual-only.
+below 0.5 is manual-only. Unresolved contradictory single-valued claims are also manual-only until
+validity or supersession resolves them; see `docs/MEMORY_MODEL.md`.
 
 **Unify** (`hooks/unify.py`, `SessionStart`): builds a `<memory-map>` of your curated-note titles
 across the whole machine, grouped by project (or type). It attempts the complete catalog and uses a
@@ -206,6 +219,8 @@ re-read on mtime change.
 fresh without you running anything.
 The singleton ONNX inference lane is query-priority: indexing uses small document microbatches and
 yields between them whenever prompt queries are waiting.
+Additional agent runtimes can register a background-only Python entry point without entering the
+prompt trust boundary; see `docs/ADAPTERS.md`.
 
 ---
 
@@ -227,22 +242,24 @@ The MCP server (`mcp/server.py`) exposes search/browse/curate tools to MCP-aware
 process is a lightweight stdio proxy to the singleton warm vector service, preventing a worker fleet
 from loading one embedding model per worker. It degrades explicitly to local keyword search only when
 the supervised warm service is unavailable. Progressive disclosure (`memory_index` then
-`get_memory_chunks`), temporal supersession, and explicit usefulness feedback are first-class tools.
+`get_memory_chunks`), temporal supersession, typed note authoring, `memory_conflicts`, and attributable
+usefulness feedback are first-class tools.
 
 ---
 
 ## Eval & self-test
 
-- `mem selftest` runs the opt-in regression suite (config load, store connect/migrate, embedder + dim, index a
-  synthetic transcript/note, BM25/vector/hybrid hits, recall envelope validity, trivial-prompt and
-  machine-wide/optional-confined activation, continuation cues, live-session exclusion, query-priority
-  indexing, well-formed unify overflow, kill-switch no-op, char-cap enforcement,
-  injected-block stripping, keyword-degrade path, injection logging, install-hooks idempotency). Exits
+- `mem selftest` runs the opt-in regression suite (config/store/migrations, embeddings, synthetic
+  indexing, hybrid recall, hooks, activation scope, concurrency, security envelopes, delivery,
+  adapter SDK, typed conflicts, feedback attribution, model-dimension safety, and benchmark adapters). Exits
   non-zero on any failure. On a fresh install with nothing indexed yet, corpus-dependent checks SKIP
   with a "corpus empty — run `mem index`" reason rather than failing: no hits from an empty store is
   correct behavior, not a defect.
 - `mem eval` scores coverage, strict recall, rejected-target safety, usefulness, and continuation
   usefulness against `eval/golden.jsonl`; it records the run for drift detection.
+- `mem tune-ranking`, `mem feedback-experiment`, `mem model-bakeoff`, and `mem longmemeval` are
+  auditable offline experiments. They cannot alter live rankings or embeddings; see
+  `docs/BENCHMARKS.md` for their selection gates and honest metric boundaries.
 - `mem delivery-check --load` is the focused operational gate: uncached concurrent hybrid requests
   plus real hooks in unrelated directories while a live index pass runs. These checks are manual/
   deployment-time; none execute on every prompt.

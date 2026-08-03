@@ -49,6 +49,11 @@ C:\code\claude-memory\
     eval.py                  ← recall@k golden scorer + drift snapshot
     selftest.py              ← regression self-test (>=18 checks)
     cli.py                   ← `mem` entrypoint (argparse subcommands)
+    memory_types.py          # typed memory metadata + deterministic temporal conflicts
+    transcript_adapters.py   # built-ins + background-only extension contract
+    feedback_learning.py     # offline attributable-feedback experiments
+    ranking_experiment.py    # read-only golden-set parameter sweeps
+    model_bakeoff.py         # native-dimension shadow embedding comparisons
     store\
       __init__.py
       base.py                ← Store ABC (the DAO contract, §4)
@@ -148,6 +153,12 @@ enrich_notes = true          # always enrich curated notes (small, high value)
 enrich_transcripts = false   # off by default (volume); flip on or sample
 max_doc_chars = 60000        # cap document size sent for contextualization
 
+[consolidation]
+enabled = true
+auto_after_index = true       # background only, after successful indexing
+min_interval_hours = 24       # bound formation work
+candidate_cap = 15            # review candidates only; never auto-accept notes
+
 [recall]                     # hot path
 top_k = 6                    # max distinct-session snippets injected
 bm25_k = 40
@@ -222,6 +233,11 @@ root and expands `data/`.
   `confidence`, `visibility`, and `provenance`. Inactive/expired notes remain auditable but are
   excluded from automatic recall; low-confidence/private notes are manual-only and project notes
   require a matching cwd-derived label.
+- Cognitive metadata: `memory_kind` is `semantic|episodic|procedural`; `importance` is bounded to
+  0..1. Optional explicit claims carry subject, predicate, object, `one|many` cardinality,
+  confidence, validity, status, and provenance. Active overlapping `one` claims with different
+  objects are contradictions. Both remain auditable/manual-searchable but are fail-closed from
+  automatic recall until validity or supersession resolves them.
 - Body: the markdown after frontmatter. Extract `[[wikilinks]]` → entity/relation edges for the graph.
 - Notes are indexed whole (note-level), title+description+body all searchable; body embedded.
 
@@ -324,6 +340,11 @@ class Store(ABC):
   `facts_vec` for KNN. If `sqlite-vec` fails to load → vector tables absent → `search_vector` returns
   [] and the retriever runs keyword-only. WAL mode, `busy_timeout=5000`, `synchronous=NORMAL`.
 
+The warm SQLite process maintains an exact chunk-vector matrix derived from `chunks_vec`. It must
+preserve sqlite-vec distance order, update incrementally for same-process writes, and reload when a
+durable revision indicates an external writer. Cold/failure behavior remains sqlite-vec or explicit
+keyword degradation; the matrix is never authoritative state.
+
 ### 4.3 factory
 `get_store(config) -> Store`: if backend `postgres` → connect; if `auto` → try postgres, on failure log
 + fall back to sqlite; if `sqlite` → sqlite. Always `migrate()` on first use.
@@ -347,6 +368,10 @@ class EmbeddingProvider(ABC):
   L2-normalize vectors (cosine). Warm the model once per process (module-level singleton).
 - **ollama_embed** / **cloud_embed**: optional, same interface, behind config; never required.
 - Provider must `available()`-check and the indexer/retriever must degrade (keyword-only) if not.
+- Local providers use model-specific query and passage semantics when available. `mem model-bakeoff`
+  resolves installed FastEmbed native dimensions and rejects undocumented truncation. It always
+  includes the deployed model as a control, writes an offline report, and cannot activate or rewrite
+  the live index.
 
 ### 5.2 Reranker
 ```python
@@ -480,6 +505,11 @@ opens `http://127.0.0.1:7777`.
 ---
 
 ## 8. CLI (`mem`, via `python -m claudemem`)
+
+In addition to core index/query/serve/integration commands, the contract includes `consolidate`,
+`conflicts [--strict]`, `adapters`, `models`, `tune-ranking`, `feedback-experiment`,
+`model-bakeoff`, and `longmemeval`. Experiment commands are read-only with respect to live ranking
+and embeddings.
 `index [--full] [--source P]` · `query "<q>" [--k N] [--rerank]` · `facts "<topic>"` · `embed`
 (backfill missing) · `eval` · `selftest` · `delivery-check [--load]` · `integrations` · `stats` ·
 `serve [--port]` · `promote` ·
@@ -499,6 +529,9 @@ opens `http://127.0.0.1:7777`.
   injected-block stripping; explicit keyword degradation; hook installers. Exit non-zero on failure.
 - These suites are opt-in/deployment gates, not prompt-path work. `delivery-check --load` is the narrow
   live SLO gate and proves real hook receipts in unrelated directories while indexing runs.
+- Ranking sweeps, attributable-feedback learning, and embedding bake-offs are read-only experiments
+  with explicit safety gates and `live_change_applied: false`. The LongMemEval adapter scores session
+  retrieval only and must never be reported as end-to-end answer-generation accuracy.
 
 ---
 
@@ -510,6 +543,8 @@ opens `http://127.0.0.1:7777`.
   or into an existing legacy Claude memory dir.
 - **Local API**: refuse non-loopback binds and peers, hostile origins, and untrusted Host headers.
 - **Hook integrity**: lifecycle hooks execute checked-in local scripts and never fetch/execute remote code.
+- **Extension integrity**: third-party transcript entry points load only in the background indexer;
+  prompt hooks never import adapter code and built-in adapter names cannot be replaced.
 - **Fail-safe**: hooks catch everything → exit 0, inject nothing. Never block the prompt.
 - **Concurrency**: many readers (hooks) + a single writer (indexer). Postgres handles it; SQLite uses WAL
   + busy_timeout and serializes writes through the indexer process.

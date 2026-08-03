@@ -1,6 +1,6 @@
-"""claudemem — local best-of-breed agent-memory layer for Claude Code.
+"""claudemem — private machine-wide memory for local agent runtimes.
 
-Files are the source of truth (Claude Code JSONL transcripts + curated markdown notes);
+Files are the source of truth (adapter-normalized transcripts + curated Markdown notes);
 the database (ParadeDB primary, SQLite fallback) is a rebuildable derived index.
 
 Public entry points:
@@ -10,4 +10,4 @@ Public entry points:
     from claudemem.retriever import Retriever
 """
 
-__version__ = "0.1.0"
+__version__ = "0.3.0"

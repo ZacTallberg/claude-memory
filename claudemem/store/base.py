@@ -95,6 +95,9 @@ class Store(ABC):
     @abstractmethod
     def get_chunks(self, ids: Iterable[int]) -> list[Chunk]:
         """Fetch full chunks by id (order need not be preserved; caller reorders)."""
+    @abstractmethod
+    def chunks_for_sessions(self, session_ids: Sequence[str], *, limit_per_session: int = 40) -> list[Chunk]:
+        """Bounded evidence lookup for offline eval/model bake-offs; never used on the prompt path."""
 
     # --- curated facts ---
     @abstractmethod
@@ -107,6 +110,9 @@ class Store(ABC):
     def search_facts(self, query: str, k: int, *, qvec: list[float] | None = None) -> list[Fact]: ...
     @abstractmethod
     def get_fact(self, fact_id: int) -> Fact | None: ...
+    @abstractmethod
+    def update_fact_meta(self, fact_id: int, meta: dict) -> None:
+        """Replace rebuildable metadata without re-embedding unchanged note content."""
     @abstractmethod
     def delete_fact(self, path: str) -> None: ...
     @abstractmethod

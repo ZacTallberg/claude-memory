@@ -89,6 +89,11 @@ def fact_is_recallable(fact, *, project: str | None = None,
     """
     if not fact_is_active(fact, now=now):
         return False
+    # A single-valued structured claim that conflicts with another currently valid note is
+    # manual-review material, not safe automatic context. The notes remain searchable and
+    # auditable; resolving the validity/supersession metadata restores automatic delivery.
+    if (fact.meta or {}).get("conflict_ids"):
+        return False
     try:
         if float((fact.meta or {}).get("confidence", 1.0)) < 0.5:
             return False

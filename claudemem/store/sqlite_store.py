@@ -8,6 +8,7 @@ import json
 import os
 import sqlite3
 import threading
+import time
 from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
@@ -66,6 +67,16 @@ class SqliteStore(Store):
         self._vec = False
         self._lock = threading.RLock()
         self._read_local = threading.local()
+        # sqlite-vec performs an exact flat scan. Four prompt workers issuing four independent SQL
+        # scans over ~50k x 384 vectors saturates the CPU/memory bus. Keep one warm immutable NumPy
+        # snapshot for chunk search; writes update it incrementally and a DB revision detects writes
+        # made by another process. Facts remain tiny and use sqlite-vec directly.
+        self._vector_cache_lock = threading.RLock()
+        self._chunk_vector_ids = None
+        self._chunk_vector_matrix = None
+        self._chunk_vector_norms = None
+        self._chunk_vector_positions: dict[int, int] = {}
+        self._chunk_vector_revision: str | None = None
 
     @contextmanager
     def _locked(self):
@@ -139,8 +150,10 @@ class SqliteStore(Store):
                     body TEXT, search_text TEXT, mtime REAL, meta TEXT DEFAULT '{}');
                 CREATE VIRTUAL TABLE IF NOT EXISTS chunks_fts USING fts5(search_text, tokenize='porter');
                 CREATE VIRTUAL TABLE IF NOT EXISTS facts_fts USING fts5(search_text, tokenize='porter');
-                CREATE TABLE IF NOT EXISTS graph_nodes(id TEXT PRIMARY KEY, label TEXT, type TEXT, grp TEXT);
-                CREATE TABLE IF NOT EXISTS graph_edges(id INTEGER PRIMARY KEY, source TEXT, target TEXT, kind TEXT);
+                CREATE TABLE IF NOT EXISTS graph_nodes(id TEXT PRIMARY KEY, label TEXT, type TEXT,
+                    grp TEXT, meta TEXT DEFAULT '{}');
+                CREATE TABLE IF NOT EXISTS graph_edges(id INTEGER PRIMARY KEY, source TEXT, target TEXT,
+                    kind TEXT, meta TEXT DEFAULT '{}');
                 CREATE TABLE IF NOT EXISTS injections(id INTEGER PRIMARY KEY, ts TEXT DEFAULT (datetime('now')),
                     hook TEXT, session_id TEXT, prompt_excerpt TEXT, n_recalled INTEGER, n_facts INTEGER,
                     chars INTEGER, latency_ms INTEGER, details TEXT);
@@ -159,6 +172,11 @@ class SqliteStore(Store):
                 CREATE INDEX IF NOT EXISTS chunks_session ON chunks(session_id);
                 CREATE INDEX IF NOT EXISTS memory_feedback_request ON memory_feedback(request_id);
             """)
+            # Additive migrations for databases created before typed temporal graph metadata.
+            for table in ("graph_nodes", "graph_edges"):
+                columns = {row[1] for row in c.execute(f"PRAGMA table_info({table})")}
+                if "meta" not in columns:
+                    c.execute(f"ALTER TABLE {table} ADD COLUMN meta TEXT DEFAULT '{{}}'")
             if self._vec:
                 c.execute(f"CREATE VIRTUAL TABLE IF NOT EXISTS chunks_vec USING vec0(embedding float[{self.dim}]);")
                 c.execute(f"CREATE VIRTUAL TABLE IF NOT EXISTS facts_vec USING vec0(embedding float[{self.dim}]);")
@@ -219,12 +237,17 @@ class SqliteStore(Store):
         if not rows or not self._vec:
             return
         import sqlite_vec
+        revision = f"{time.time_ns()}-{os.getpid()}-{threading.get_ident()}"
         with self._locked():
             for cid, vec in rows:
                 self._conn.execute("DELETE FROM chunks_vec WHERE rowid=?", (cid,))
                 self._conn.execute("INSERT INTO chunks_vec(rowid,embedding) VALUES (?,?)",
                                    (cid, sqlite_vec.serialize_float32(vec)))
+            self._conn.execute("""INSERT INTO kv(key,value) VALUES ('chunks_vec:revision',?)
+                                  ON CONFLICT(key) DO UPDATE SET value=excluded.value""",
+                               (json.dumps({"revision": revision}),))
             self._conn.commit()
+        self._update_chunk_vector_cache(rows, revision)
 
     def chunks_missing_embeddings(self, limit: int) -> list[Chunk]:
         if not self._vec:
@@ -235,18 +258,27 @@ class SqliteStore(Store):
             return [self._row_to_chunk(r) for r in rows]
 
     def delete_source(self, path: str) -> None:
+        removed: list[int] = []
+        revision: str | None = None
         with self._locked():
             r = self._conn.execute("SELECT id FROM sources WHERE path=?", (path,)).fetchone()
             if r:
                 sid = r["id"]
                 cids = [x["id"] for x in self._conn.execute("SELECT id FROM chunks WHERE source_id=?", (sid,))]
+                removed = cids
                 for cid in cids:
                     self._conn.execute("DELETE FROM chunks_fts WHERE rowid=?", (cid,))
                     if self._vec:
                         self._conn.execute("DELETE FROM chunks_vec WHERE rowid=?", (cid,))
                 self._conn.execute("DELETE FROM chunks WHERE source_id=?", (sid,))
                 self._conn.execute("DELETE FROM sources WHERE id=?", (sid,))
+                revision = f"{time.time_ns()}-{os.getpid()}-{threading.get_ident()}"
+                self._conn.execute("""INSERT INTO kv(key,value) VALUES ('chunks_vec:revision',?)
+                                      ON CONFLICT(key) DO UPDATE SET value=excluded.value""",
+                                   (json.dumps({"revision": revision}),))
                 self._conn.commit()
+        if removed and revision:
+            self._remove_chunk_vectors_from_cache(removed, revision)
 
     # ---- retrieval ----
     def _filter_ids(self, conn: sqlite3.Connection, ids: list[int], exclude_session, kinds) -> set[int]:
@@ -284,20 +316,139 @@ class SqliteStore(Store):
     def search_vector(self, qvec, k, *, exclude_session=None, kinds=None) -> list[Candidate]:
         if not qvec or not self._vec:
             return []
-        import sqlite_vec
         conn = self._read_conn()
-        rows = conn.execute(
-            "SELECT rowid, distance FROM chunks_vec WHERE embedding MATCH ? ORDER BY distance LIMIT ?",
-            (sqlite_vec.serialize_float32(qvec), k * 4)).fetchall()
-        ok = self._filter_ids(conn, [r["rowid"] for r in rows], exclude_session, kinds)
+        try:
+            import numpy as np
+            ids, matrix, norms = self._chunk_vector_snapshot(conn)
+            if not len(ids):
+                return []
+            query = np.asarray(qvec, dtype=np.float32)
+            distance_sq = np.maximum(0.0, norms + float(query @ query) - 2.0 * (matrix @ query))
+            candidate_k = min(len(ids), max(k * 4, k))
+            if candidate_k < len(ids):
+                selected = np.argpartition(distance_sq, candidate_k - 1)[:candidate_k]
+                selected = selected[np.argsort(distance_sq[selected], kind="stable")]
+            else:
+                selected = np.argsort(distance_sq, kind="stable")
+            rows = [(int(ids[index]), float(distance_sq[index]) ** 0.5) for index in selected]
+        except Exception as exc:
+            # The snapshot is an optimization, never the availability boundary. Preserve exact
+            # sqlite-vec behavior if allocation, revision loading, or NumPy fails.
+            log.warning("warm chunk-vector snapshot unavailable; using sqlite-vec: %s", exc)
+            return self._search_vector_sqlite(qvec, k, exclude_session=exclude_session, kinds=kinds)
+        ok = self._filter_ids(conn, [rowid for rowid, _distance in rows], exclude_session, kinds)
         out, rank = [], 0
-        for r in rows:
-            if r["rowid"] in ok:
+        for rowid, distance in rows:
+            if rowid in ok:
                 rank += 1
-                out.append(Candidate(chunk_id=r["rowid"], rank=rank, score=1.0 - float(r["distance"])))
+                out.append(Candidate(chunk_id=rowid, rank=rank, score=1.0 - distance))
                 if rank >= k:
                     break
         return out
+
+    def _search_vector_sqlite(self, qvec, k, *, exclude_session=None, kinds=None) -> list[Candidate]:
+        import sqlite_vec
+        conn = self._read_conn()
+        rows = conn.execute(
+            "SELECT rowid,distance FROM chunks_vec WHERE embedding MATCH ? "
+            "ORDER BY distance LIMIT ?",
+            (sqlite_vec.serialize_float32(qvec), k * 4)).fetchall()
+        ok = self._filter_ids(conn, [row["rowid"] for row in rows], exclude_session, kinds)
+        out: list[Candidate] = []
+        for row in rows:
+            if row["rowid"] not in ok:
+                continue
+            out.append(Candidate(chunk_id=row["rowid"], rank=len(out) + 1,
+                                 score=1.0 - float(row["distance"])))
+            if len(out) >= k:
+                break
+        return out
+
+    @staticmethod
+    def _read_chunk_vector_revision(conn: sqlite3.Connection) -> str:
+        row = conn.execute("SELECT value FROM kv WHERE key='chunks_vec:revision'").fetchone()
+        if not row:
+            return "initial"
+        try:
+            return str(json.loads(row["value"] or "{}").get("revision") or "initial")
+        except (TypeError, json.JSONDecodeError, AttributeError):
+            return str(row["value"] or "initial")
+
+    def _chunk_vector_snapshot(self, conn: sqlite3.Connection):
+        """Return an exact, process-warm vector snapshot consistent with a DB revision."""
+        import numpy as np
+        revision = self._read_chunk_vector_revision(conn)
+        with self._vector_cache_lock:
+            if (self._chunk_vector_matrix is not None
+                    and self._chunk_vector_revision == revision):
+                return self._chunk_vector_ids, self._chunk_vector_matrix, self._chunk_vector_norms
+            # Read revision and vectors in one WAL snapshot. If an external writer commits just
+            # afterward, its revision is observed and reloaded on the next query.
+            conn.execute("BEGIN")
+            try:
+                revision = self._read_chunk_vector_revision(conn)
+                rows = conn.execute("SELECT rowid,embedding FROM chunks_vec ORDER BY rowid").fetchall()
+            finally:
+                conn.execute("COMMIT")
+            ids = np.asarray([row["rowid"] for row in rows], dtype=np.int64)
+            if rows:
+                blob = b"".join(row["embedding"] for row in rows)
+                matrix = np.frombuffer(blob, dtype=np.float32).reshape(len(rows), self.dim).copy()
+                norms = np.einsum("ij,ij->i", matrix, matrix)
+            else:
+                matrix = np.empty((0, self.dim), dtype=np.float32)
+                norms = np.empty(0, dtype=np.float32)
+            self._chunk_vector_ids = ids
+            self._chunk_vector_matrix = matrix
+            self._chunk_vector_norms = norms
+            self._chunk_vector_positions = {int(item_id): index
+                                            for index, item_id in enumerate(ids)}
+            self._chunk_vector_revision = revision
+            log.info("warm chunk-vector snapshot loaded rows=%d dim=%d", len(ids), self.dim)
+            return ids, matrix, norms
+
+    def _update_chunk_vector_cache(self, rows: list[tuple[int, list[float]]], revision: str) -> None:
+        import numpy as np
+        with self._vector_cache_lock:
+            if self._chunk_vector_matrix is None:
+                return
+            additions: list[tuple[int, list[float]]] = []
+            for cid, vector in rows:
+                position = self._chunk_vector_positions.get(int(cid))
+                if position is None:
+                    additions.append((int(cid), vector))
+                else:
+                    array = np.asarray(vector, dtype=np.float32)
+                    self._chunk_vector_matrix[position] = array
+                    self._chunk_vector_norms[position] = float(array @ array)
+            if additions:
+                add_ids = np.asarray([cid for cid, _vector in additions], dtype=np.int64)
+                add_matrix = np.asarray([vector for _cid, vector in additions], dtype=np.float32)
+                self._chunk_vector_ids = np.concatenate((self._chunk_vector_ids, add_ids))
+                self._chunk_vector_matrix = np.vstack((self._chunk_vector_matrix, add_matrix))
+                self._chunk_vector_norms = np.concatenate((
+                    self._chunk_vector_norms, np.einsum("ij,ij->i", add_matrix, add_matrix)))
+                order = np.argsort(self._chunk_vector_ids, kind="stable")
+                self._chunk_vector_ids = self._chunk_vector_ids[order]
+                self._chunk_vector_matrix = self._chunk_vector_matrix[order]
+                self._chunk_vector_norms = self._chunk_vector_norms[order]
+                self._chunk_vector_positions = {int(item_id): index for index, item_id
+                                                in enumerate(self._chunk_vector_ids)}
+            self._chunk_vector_revision = revision
+
+    def _remove_chunk_vectors_from_cache(self, ids: list[int], revision: str) -> None:
+        import numpy as np
+        with self._vector_cache_lock:
+            if self._chunk_vector_matrix is None:
+                return
+            removed = {int(item_id) for item_id in ids}
+            keep = np.asarray([int(item_id) not in removed for item_id in self._chunk_vector_ids])
+            self._chunk_vector_ids = self._chunk_vector_ids[keep]
+            self._chunk_vector_matrix = self._chunk_vector_matrix[keep]
+            self._chunk_vector_norms = self._chunk_vector_norms[keep]
+            self._chunk_vector_positions = {int(item_id): index for index, item_id
+                                            in enumerate(self._chunk_vector_ids)}
+            self._chunk_vector_revision = revision
 
     @staticmethod
     def _row_to_chunk(r) -> Chunk:
@@ -313,6 +464,21 @@ class SqliteStore(Store):
         ph = ",".join("?" * len(ids))
         rows = self._read_conn().execute(f"SELECT * FROM chunks WHERE id IN ({ph})", ids).fetchall()
         return [self._row_to_chunk(r) for r in rows]
+
+    def chunks_for_sessions(self, session_ids: Sequence[str], *, limit_per_session: int = 40) -> list[Chunk]:
+        session_ids = list(dict.fromkeys(str(value) for value in session_ids if value))
+        if not session_ids:
+            return []
+        ph = ",".join("?" * len(session_ids))
+        rows = self._read_conn().execute(
+            f"""SELECT * FROM (
+                    SELECT chunks.*, row_number() OVER (
+                        PARTITION BY session_id ORDER BY ts DESC, id DESC) AS session_rank
+                    FROM chunks WHERE session_id IN ({ph})
+                ) WHERE session_rank <= ?
+                ORDER BY session_id, ts DESC, id DESC""",
+            [*session_ids, max(1, limit_per_session)]).fetchall()
+        return [self._row_to_chunk(row) for row in rows]
 
     # ---- curated facts ----
     def upsert_fact(self, *, path, project, name, title, description, type, tags, origin_session_id,
@@ -388,6 +554,12 @@ class SqliteStore(Store):
             r = self._conn.execute("SELECT * FROM facts WHERE id=?", (fact_id,)).fetchone()
             return self._row_to_fact(r) if r else None
 
+    def update_fact_meta(self, fact_id: int, meta: dict) -> None:
+        with self._locked():
+            self._conn.execute("UPDATE facts SET meta=? WHERE id=?",
+                               (json.dumps(meta or {}), int(fact_id)))
+            self._conn.commit()
+
     def delete_fact(self, path: str) -> None:
         with self._locked():
             r = self._conn.execute("SELECT id FROM facts WHERE path=?", (path,)).fetchone()
@@ -413,18 +585,23 @@ class SqliteStore(Store):
             self._conn.execute("DELETE FROM graph_edges;")
             self._conn.execute("DELETE FROM graph_nodes;")
             for n in nodes:
-                self._conn.execute("INSERT OR REPLACE INTO graph_nodes(id,label,type,grp) VALUES (?,?,?,?)",
-                                   (n["id"], n.get("label"), n.get("type"), n.get("group")))
+                self._conn.execute(
+                    "INSERT OR REPLACE INTO graph_nodes(id,label,type,grp,meta) VALUES (?,?,?,?,?)",
+                    (n["id"], n.get("label"), n.get("type"), n.get("group"),
+                     json.dumps(n.get("meta") or {})))
             for e in edges:
-                self._conn.execute("INSERT INTO graph_edges(source,target,kind) VALUES (?,?,?)",
-                                   (e["source"], e["target"], e.get("kind")))
+                self._conn.execute(
+                    "INSERT INTO graph_edges(source,target,kind,meta) VALUES (?,?,?,?)",
+                    (e["source"], e["target"], e.get("kind"), json.dumps(e.get("meta") or {})))
             self._conn.commit()
 
     def graph(self) -> dict:
         with self._locked():
-            nodes = [{"id": r["id"], "label": r["label"], "type": r["type"], "group": r["grp"]}
+            nodes = [{"id": r["id"], "label": r["label"], "type": r["type"], "group": r["grp"],
+                      "meta": json.loads(r["meta"] or "{}")}
                      for r in self._conn.execute("SELECT * FROM graph_nodes")]
-            edges = [{"source": r["source"], "target": r["target"], "kind": r["kind"]}
+            edges = [{"source": r["source"], "target": r["target"], "kind": r["kind"],
+                      "meta": json.loads(r["meta"] or "{}")}
                      for r in self._conn.execute("SELECT * FROM graph_edges")]
         return {"nodes": nodes, "edges": edges}
 
@@ -443,7 +620,15 @@ class SqliteStore(Store):
                                           (status,)).fetchall()
             else:
                 rows = self._conn.execute("SELECT * FROM promotion_candidates ORDER BY ts DESC").fetchall()
-            return [dict(r) for r in rows]
+            out = []
+            for row in rows:
+                item = dict(row)
+                try:
+                    item["support"] = json.loads(item.get("support") or "{}")
+                except (TypeError, json.JSONDecodeError):
+                    item["support"] = {}
+                out.append(item)
+            return out
 
     def update_promotion(self, pid, status) -> None:
         with self._locked():
@@ -473,8 +658,15 @@ class SqliteStore(Store):
 
     def recent_injections(self, limit=50) -> list[dict]:
         with self._locked():
-            return [dict(r) for r in self._conn.execute(
-                "SELECT * FROM injections ORDER BY ts DESC LIMIT ?", (limit,))]
+            rows = []
+            for row in self._conn.execute("SELECT * FROM injections ORDER BY ts DESC LIMIT ?", (limit,)):
+                item = dict(row)
+                try:
+                    item["details"] = json.loads(item.get("details") or "{}")
+                except (TypeError, json.JSONDecodeError):
+                    item["details"] = {}
+                rows.append(item)
+            return rows
 
     def log_memory_feedback(self, *, request_id, outcome, session_id=None, reason="",
                             details=None) -> int:
@@ -491,8 +683,16 @@ class SqliteStore(Store):
 
     def recent_memory_feedback(self, limit=50) -> list[dict]:
         with self._locked():
-            return [dict(r) for r in self._conn.execute(
-                "SELECT * FROM memory_feedback ORDER BY ts DESC, id DESC LIMIT ?", (limit,))]
+            rows = []
+            for row in self._conn.execute(
+                    "SELECT * FROM memory_feedback ORDER BY ts DESC, id DESC LIMIT ?", (limit,)):
+                item = dict(row)
+                try:
+                    item["details"] = json.loads(item.get("details") or "{}")
+                except (TypeError, json.JSONDecodeError):
+                    item["details"] = {}
+                rows.append(item)
+            return rows
 
     def record_metric(self, metric, value, *, run_id=None, details=None) -> None:
         with self._locked():

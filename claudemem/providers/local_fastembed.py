@@ -21,7 +21,7 @@ class FastEmbedProvider(EmbeddingProvider):
         self.model_name = cfg.embeddings.model
         self._model = TextEmbedding(model_name=self.model_name)
         # Probe native dimension once.
-        probe = np.asarray(next(iter(self._model.embed(["probe"]))), dtype=np.float32)
+        probe = np.asarray(next(iter(self._model.passage_embed(["probe"]))), dtype=np.float32)
         self._native_dim = int(probe.shape[0])
         want = int(cfg.embeddings.dim)
         if want > self._native_dim:
@@ -69,7 +69,10 @@ class FastEmbedProvider(EmbeddingProvider):
             batch = texts[start:start + size]
             self._acquire_lane(query=False)
             try:
-                out.extend(self._post(v) for v in self._model.embed(batch))
+                # Let FastEmbed apply model-specific passage semantics. For the current BGE model
+                # this is identical to embed(); for asymmetric models it is essential.
+                passage_embed = getattr(self._model, "passage_embed", self._model.embed)
+                out.extend(self._post(v) for v in passage_embed(batch))
             finally:
                 self._release_lane()
         return out
@@ -101,7 +104,10 @@ class FastEmbedProvider(EmbeddingProvider):
                 try:
                     self._acquire_lane(query=True)
                     try:
-                        vectors = list(self._model.embed([item["text"] for item in batch]))
+                        # query_embed is model-specific (prefixes/instructions may differ from
+                        # passages). Using generic embed() silently handicaps asymmetric models.
+                        query_embed = getattr(self._model, "query_embed", self._model.embed)
+                        vectors = list(query_embed([item["text"] for item in batch]))
                     finally:
                         self._release_lane()
                     if len(vectors) != len(batch):

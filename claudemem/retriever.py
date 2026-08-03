@@ -10,6 +10,7 @@ from __future__ import annotations
 import math
 import re
 from collections import defaultdict
+from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import datetime, timezone
 
@@ -30,11 +31,17 @@ class Result:
 
 class Retriever:
     def __init__(self, cfg: Config, store: Store,
-                 embedder: EmbeddingProvider | None = None, reranker: Reranker | None = None):
+                 embedder: EmbeddingProvider | None = None, reranker: Reranker | None = None,
+                 chunk_rank_multiplier: Callable[[Chunk], float] | None = None,
+                 fact_rank_multiplier: Callable[[Fact], float] | None = None):
         self.cfg = cfg
         self.store = store
         self.embedder = embedder or get_embedding_provider(cfg)
         self.reranker = reranker or get_reranker(cfg)
+        # Offline experiments may inject bounded multipliers. Production construction never does;
+        # learned feedback therefore cannot silently alter the prompt path.
+        self.chunk_rank_multiplier = chunk_rank_multiplier
+        self.fact_rank_multiplier = fact_rank_multiplier
 
     # ---- fusion + weighting ----
     def _rrf(self, lists: list[list]) -> dict[int, float]:
@@ -105,6 +112,11 @@ class Retriever:
             if ch is None:
                 continue
             w = f * (0.7 + 0.3 * self._recency(ch.ts))
+            if self.chunk_rank_multiplier is not None:
+                try:
+                    w *= max(0.5, min(1.5, float(self.chunk_rank_multiplier(ch))))
+                except Exception:
+                    pass
             scored.append((cid, w, f))
         scored.sort(key=lambda x: x[1], reverse=True)
 
@@ -147,6 +159,34 @@ class Retriever:
             qvec = self.embed_query(query)
         # Fetch beyond the final cap so expired/superseded notes cannot crowd out current ones.
         candidates = self.store.search_facts(query, max(k * 6, 24), qvec=qvec)
+        # Explicit author metadata can refine rank without model inference. Defaults are nearly
+        # neutral, so legacy notes preserve their established ordering.
+        weighted_candidates = list(enumerate(candidates, 1))
+        def authored_score(item):
+            rank, fact = item
+            meta = fact.meta or {}
+            try:
+                importance = max(0.0, min(1.0, float(meta.get("importance", 0.7))))
+                confidence = max(0.0, min(1.0, float(meta.get("confidence", 1.0))))
+            except (TypeError, ValueError):
+                importance, confidence = 0.7, 1.0
+            # RRF-scale rank gaps are intentionally small enough for strong explicit metadata to
+            # move an adjacent item, while the bounded factors cannot catapult distant noise.
+            return (1.0 / (self.cfg.recall.rrf_k + rank)) * (0.9 + 0.1 * importance) * (
+                0.95 + 0.05 * confidence)
+        weighted_candidates.sort(key=authored_score, reverse=True)
+        candidates = [fact for _rank, fact in weighted_candidates]
+        if self.fact_rank_multiplier is not None:
+            ranked = list(enumerate(candidates, 1))
+            def learned_score(item):
+                rank, fact = item
+                try:
+                    multiplier = max(0.5, min(1.5, float(self.fact_rank_multiplier(fact))))
+                except Exception:
+                    multiplier = 1.0
+                return (1.0 / (self.cfg.recall.rrf_k + rank)) * multiplier
+            ranked.sort(key=learned_score, reverse=True)
+            candidates = [fact for _rank, fact in ranked]
         out: list[Fact] = []
         seen: set[str] = set()
         for fact in candidates:

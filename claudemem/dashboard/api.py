@@ -15,9 +15,11 @@ from fastapi.responses import HTMLResponse, JSONResponse
 from sse_starlette.sse import EventSourceResponse
 
 from claudemem.indexer import index as run_index
+from claudemem.conflict_service import synchronize_fact_conflicts
 from claudemem.config import load_config
-from claudemem.facts import load_note
+from claudemem.facts import load_note, load_notes
 from claudemem.log import get_logger
+from claudemem.memory_types import find_claim_conflicts
 from claudemem.paths import is_curated_note_path, killed, project_from_cwd, set_killed
 from claudemem.recall_format import format_recall, format_unify
 from claudemem.security import redact_secrets
@@ -93,6 +95,21 @@ _last_index_finished = 0.0
 _last_index_error: str | None = None
 _last_retrieval = {"mode": "never", "ts": 0.0, "latency_ms": None, "completed": 0}
 _delivery = {"delivered": 0, "miss": 0, "last": None}
+
+
+def _positive_ids(values) -> list[int]:
+    """Normalize bounded evidence ids supplied by a local HTTP client."""
+    out: list[int] = []
+    for raw in values if isinstance(values, list) else []:
+        try:
+            item_id = int(raw)
+        except (TypeError, ValueError):
+            continue
+        if item_id > 0 and item_id not in out:
+            out.append(item_id)
+        if len(out) >= 50:
+            break
+    return out
 
 
 def _push(msg: str) -> None:
@@ -171,6 +188,9 @@ def _fact_brief(f) -> dict:
             "description": redact_secrets(f.description)[0],
             "project": f.project, "path": f.path,
             "tags": f.tags,
+            "memory_kind": (f.meta or {}).get("memory_kind", "semantic"),
+            "importance": (f.meta or {}).get("importance", 0.7),
+            "conflict_ids": list((f.meta or {}).get("conflict_ids") or []),
             "lifecycle": {key: (f.meta or {}).get(key) for key in (
                 "status", "visibility", "confidence", "valid_from", "valid_to",
                 "supersedes", "superseded_by", "provenance")}}
@@ -193,6 +213,10 @@ def _mcp_fact(f) -> dict:
         "description": redact_secrets(f.description)[0], "project": f.project,
         "tags": list(f.tags or []), "path": f.path,
         "origin_session_id": f.origin_session_id,
+        "memory_kind": (f.meta or {}).get("memory_kind", "semantic"),
+        "importance": (f.meta or {}).get("importance", 0.7),
+        "claims": list((f.meta or {}).get("claims") or []),
+        "conflict_ids": list((f.meta or {}).get("conflict_ids") or []),
         "lifecycle": {key: (f.meta or {}).get(key) for key in (
             "status", "visibility", "confidence", "valid_from", "valid_to",
             "supersedes", "superseded_by", "provenance")},
@@ -232,6 +256,8 @@ async def api_recall(req: Request):
                                completed=int(_last_retrieval.get("completed") or 0) + 1)
         return {"additionalContext": text, "n_recalled": len(results), "n_facts": len(facts),
                 "latency_ms": latency, "retrieval_mode": mode, "vector_used": bool(qv),
+                "chunk_ids": [result.chunk.id for result in results],
+                "fact_ids": [fact.id for fact in facts],
                 "request_id": request_id}
 
     return await _bounded("recall", work,
@@ -253,7 +279,9 @@ async def api_delivery(req: Request):
     mode = str(body.get("retrieval_mode") or "unknown")[:32]
     details = {"request_id": request_id, "delivery_status": status, "client": client,
                "kind": kind,
-               "retrieval_mode": mode, "vector_used": bool(body.get("vector_used"))}
+               "retrieval_mode": mode, "vector_used": bool(body.get("vector_used")),
+               "chunk_ids": _positive_ids(body.get("chunk_ids")),
+               "fact_ids": _positive_ids(body.get("fact_ids"))}
 
     def persist_receipt():
         get_state().store.log_injection(
@@ -352,9 +380,11 @@ async def api_mcp_index_note(req: Request):
             path=nd.path, project=nd.project, name=nd.name, title=nd.title,
             description=nd.description, type=nd.type, tags=nd.tags,
             origin_session_id=nd.origin_session_id, body=nd.body, embedding=embedding,
-            mtime=nd.mtime, meta={"wikilinks": nd.wikilinks, "lifecycle_schema": 1,
-                                 **nd.lifecycle},
+            mtime=nd.mtime, meta={"wikilinks": nd.wikilinks, "lifecycle_schema": 2,
+                                 "memory_kind": nd.memory_kind, "importance": nd.importance,
+                                 "claims": nd.claims, "conflict_ids": [], **nd.lifecycle},
         )
+        synchronize_fact_conflicts(st.cfg, st.store)
         return {"ok": True, "fact_id": fid, "vector_indexed": embedding is not None}
 
     return await asyncio.to_thread(work)
@@ -437,6 +467,14 @@ async def ui_fact(fid: int):
 @router.get("/api/graph")
 async def api_graph():
     return get_state().store.graph()
+
+
+@router.get("/api/conflicts")
+async def api_conflicts():
+    """Derived contradictions among explicit, single-valued temporal claims."""
+    notes = load_notes(get_state().cfg)
+    conflicts = find_claim_conflicts(notes)
+    return {"count": len(conflicts), "conflicts": conflicts}
 
 
 @router.get("/api/metrics")
@@ -578,10 +616,16 @@ async def api_feedback_add(req: Request):
     outcome = str(body.get("outcome") or "").strip().lower()
     if not request_id or outcome not in {"helpful", "neutral", "harmful", "stale"}:
         return JSONResponse({"ok": False, "error": "invalid feedback"}, status_code=400)
+    clean_chunks = _positive_ids(body.get("chunk_ids"))
+    clean_facts = _positive_ids(body.get("fact_ids"))
     feedback_id = get_state().store.log_memory_feedback(
         request_id=request_id, outcome=outcome, session_id=body.get("session_id"),
         reason=redact_secrets(str(body.get("reason") or ""))[0][:500],
-        details={"client": "http"},
+        details={"client": "http",
+                 "chunk_ids": clean_chunks,
+                 "fact_ids": clean_facts,
+                 "attribution": "explicit" if (clean_chunks or clean_facts)
+                                else "request-level"},
     )
     return {"ok": True, "feedback_id": feedback_id, "request_id": request_id,
             "outcome": outcome}

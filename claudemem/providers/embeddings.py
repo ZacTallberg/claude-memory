@@ -51,7 +51,8 @@ _cache: dict[str, EmbeddingProvider] = {}
 
 def get_embedding_provider(cfg: Config) -> EmbeddingProvider:
     """Singleton per provider+model. Lazy import so the package loads without heavy deps."""
-    key = f"{cfg.embeddings.provider}:{cfg.embeddings.model}:{cfg.embeddings.dim}"
+    key = (f"{cfg.embeddings.provider}:{cfg.embeddings.model}:{cfg.embeddings.dim}:"
+           f"{cfg.embeddings.query_prefix}:{cfg.embeddings.doc_prefix}")
     if key in _cache:
         return _cache[key]
 

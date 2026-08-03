@@ -112,6 +112,27 @@ last resort because a second model worsens memory pressure on this host.
   progress fragments or duplicates. The miner now requires recurrence for assistant-authored lessons;
   explicit one-off user corrections remain eligible for human review. A fresh run drafted zero.
 
+## 2026-08-03 evidence update
+
+- The loaded delivery gate exposed four concurrent exact SQLite vector scans as the remaining hot
+  bottleneck (p50 about 3.48s against the unchanged 3.0s SLO). A warm, revision-tracked exact matrix
+  now preserves sqlite-vec ordering. Repeated complete release gates ranged from p50 0.90–1.73s,
+  with a worst observed max of 1.91s. Three real hooks stayed hybrid and at or below 1.15s in the
+  final indexed run.
+- `mem model-bakeoff` now performs native-dimension, model-specific query/passage comparisons over
+  the same positive, hard-negative, and curated-fact pool without touching the live index.
+  `BAAI/bge-small-en-v1.5` beat `snowflake/snowflake-arctic-embed-s` locally: coverage 1.000 vs
+  0.955, strict recall 0.955 vs 0.818, and mean MRR 0.855 vs 0.816; both preserved 1.000 negative
+  safety. BGE remains deployed on evidence, not inertia.
+- `mem tune-ranking` swept RRF 30/60/90 and recency half-life 21/45/90. All nine settings tied, so
+  the harness now explicitly prefers the live configuration on ties and recommends no churn.
+- Typed semantic/episodic/procedural metadata, temporal claims, contradiction quarantine, review-
+  first consolidation, item-level feedback attribution, and background-only transcript adapters
+  close the major conceptual gaps from the cross-system review.
+- The meaningful remaining model-infrastructure upgrade is a complete separate shadow index plus
+  atomic activation after a candidate wins the bounded bake-off and the full release gate. Until
+  that exists, a bake-off winner is a recommendation, never permission to rewrite the live vectors.
+
 ## Non-goals (deliberate, not neglect)
 
 - **Cross-platform support.** Windows-only launchers, PowerShell supervisor, Scheduled Task — this

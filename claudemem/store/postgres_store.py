@@ -81,9 +81,11 @@ class PostgresStore(Store):
                     body text, search_text text NOT NULL, embedding vector({d}),
                     mtime double precision, meta jsonb DEFAULT '{{}}');""")
             c.execute("""CREATE TABLE IF NOT EXISTS graph_nodes(id text PRIMARY KEY, label text,
-                         type text, grp text);""")
+                         type text, grp text, meta jsonb DEFAULT '{}');""")
             c.execute("""CREATE TABLE IF NOT EXISTS graph_edges(id bigserial PRIMARY KEY,
-                         source text, target text, kind text);""")
+                         source text, target text, kind text, meta jsonb DEFAULT '{}');""")
+            c.execute("ALTER TABLE graph_nodes ADD COLUMN IF NOT EXISTS meta jsonb DEFAULT '{}';")
+            c.execute("ALTER TABLE graph_edges ADD COLUMN IF NOT EXISTS meta jsonb DEFAULT '{}';")
             c.execute("""CREATE TABLE IF NOT EXISTS injections(id bigserial PRIMARY KEY,
                          ts timestamptz DEFAULT now(), hook text, session_id text, prompt_excerpt text,
                          n_recalled int, n_facts int, chars int, latency_ms int, details jsonb);""")
@@ -239,6 +241,19 @@ class PostgresStore(Store):
                                 context_blurb, ordinal, meta FROM chunks WHERE id = ANY(%s)""", (ids,))
             return [self._row_to_chunk(r) for r in c.fetchall()]
 
+    def chunks_for_sessions(self, session_ids: Sequence[str], *, limit_per_session: int = 40) -> list[Chunk]:
+        session_ids = list(dict.fromkeys(str(value) for value in session_ids if value))
+        if not session_ids:
+            return []
+        with self._lock, self._cur() as c:
+            c.execute("""SELECT id,source_id,kind,role,session_id,project,cwd,ts,content,
+                                context_blurb,ordinal,meta
+                         FROM (SELECT chunks.*, row_number() OVER (
+                                   PARTITION BY session_id ORDER BY ts DESC NULLS LAST, id DESC) AS rn
+                               FROM chunks WHERE session_id = ANY(%s)) ranked
+                         WHERE rn <= %s""", (session_ids, max(1, limit_per_session)))
+            return [self._row_to_chunk(r) for r in c.fetchall()]
+
     # ---- curated facts ----
     def upsert_fact(self, *, path, project, name, title, description, type, tags, origin_session_id,
                     body, embedding, mtime, meta=None) -> int:
@@ -305,6 +320,10 @@ class PostgresStore(Store):
             r = c.fetchone()
             return self._row_to_fact(r) if r else None
 
+    def update_fact_meta(self, fact_id: int, meta: dict) -> None:
+        with self._lock, self._cur() as c:
+            c.execute("UPDATE facts SET meta=%s WHERE id=%s", (Json(meta or {}), int(fact_id)))
+
     def delete_fact(self, path: str) -> None:
         with self._lock, self._cur() as c:
             c.execute("DELETE FROM facts WHERE path=%s", (path,))
@@ -324,19 +343,22 @@ class PostgresStore(Store):
             c.execute("DELETE FROM graph_edges;")
             c.execute("DELETE FROM graph_nodes;")
             for n in nodes:
-                c.execute("""INSERT INTO graph_nodes(id,label,type,grp) VALUES (%s,%s,%s,%s)
+                c.execute("""INSERT INTO graph_nodes(id,label,type,grp,meta) VALUES (%s,%s,%s,%s,%s)
                              ON CONFLICT (id) DO UPDATE SET label=EXCLUDED.label, type=EXCLUDED.type,
-                             grp=EXCLUDED.grp""", (n["id"], n.get("label"), n.get("type"), n.get("group")))
+                             grp=EXCLUDED.grp, meta=EXCLUDED.meta""",
+                          (n["id"], n.get("label"), n.get("type"), n.get("group"),
+                           Json(n.get("meta") or {})))
             for e in edges:
-                c.execute("INSERT INTO graph_edges(source,target,kind) VALUES (%s,%s,%s)",
-                          (e["source"], e["target"], e.get("kind")))
+                c.execute("INSERT INTO graph_edges(source,target,kind,meta) VALUES (%s,%s,%s,%s)",
+                          (e["source"], e["target"], e.get("kind"), Json(e.get("meta") or {})))
 
     def graph(self) -> dict:
         with self._lock, self._cur() as c:
-            c.execute("SELECT id,label,type,grp FROM graph_nodes")
-            nodes = [{"id": r["id"], "label": r["label"], "type": r["type"], "group": r["grp"]}
+            c.execute("SELECT id,label,type,grp,meta FROM graph_nodes")
+            nodes = [{"id": r["id"], "label": r["label"], "type": r["type"], "group": r["grp"],
+                      "meta": r.get("meta") or {}}
                      for r in c.fetchall()]
-            c.execute("SELECT source,target,kind FROM graph_edges")
+            c.execute("SELECT source,target,kind,meta FROM graph_edges")
             edges = [dict(r) for r in c.fetchall()]
         return {"nodes": nodes, "edges": edges}
 

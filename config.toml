@@ -51,6 +51,14 @@ enrich_notes = true         # always enrich curated notes (small, high value)
 enrich_transcripts = false  # off by default (volume); flip on or sample later
 max_doc_chars = 60000
 
+[consolidation]
+# Background, review-first formation of typed semantic/episodic/procedural memories. This runs
+# only after indexing, at most daily; it never executes on a prompt and never auto-accepts a note.
+enabled = true
+auto_after_index = true
+min_interval_hours = 24
+candidate_cap = 15
+
 [recall]                    # hot path (UserPromptSubmit)
 top_k = 6
 bm25_k = 40

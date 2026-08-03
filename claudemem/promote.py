@@ -33,6 +33,8 @@ CUE_PHRASES: tuple[str, ...] = (
     "don't", "do not", "avoid", "instead of", "make sure to", "note that",
     "important:", "gotcha", "lesson", "in the future", "going forward",
     "next time", "the key is", "the trick is", "needs to", "has to",
+    "we decided", "decided to", "we use", "is configured as", "the requirement is",
+    "fixed by", "resolved by", "failed because", "worked because", "root cause was",
 )
 
 # A precompiled alternation for fast cue detection (longest-first so multi-word cues win).
@@ -70,6 +72,14 @@ _PROJECT_CUES = (
     "turns out", "decided", "we use", "we should use", "the key is", "the trick is",
 )
 
+_EPISODIC_CUES = {
+    "the issue was", "the problem was", "root cause", "root cause was", "the fix was",
+    "the bug was", "turns out", "fixed by", "resolved by", "failed because", "worked because",
+}
+_PROCEDURAL_CUES = set(_FEEDBACK_CUES) | {"gotcha", "lesson", "the key is", "the trick is"}
+_OUTCOME_PROBLEM_RE = re.compile(r"\b(issue|problem|bug|failure|failed|root cause|broke|broken)\b", re.I)
+_OUTCOME_RESULT_RE = re.compile(r"\b(fix(?:ed)?|resolv(?:e|ed)|pass(?:ed)?|worked|deployed|released)\b", re.I)
+
 def _cue_strength(cue: str) -> int:
     """Higher = a stronger/more durable rule cue (imperatives beat weak observations)."""
     try:
@@ -99,6 +109,7 @@ class _Lesson:
     sentence: str            # the salient lesson sentence (cleaned)
     terms: set[str]          # meaningful term set, for clustering / novelty
     cue: str                 # the strongest cue phrase matched
+    memory_kind: str = "semantic"  # semantic | episodic | procedural
 
 
 @dataclass
@@ -124,6 +135,13 @@ class _Cluster:
     @property
     def has_user(self) -> bool:
         return any(l.chunk.role == "user" for l in self.lessons)
+
+    @property
+    def has_complete_episode(self) -> bool:
+        return any(l.memory_kind == "episodic"
+                   and _OUTCOME_PROBLEM_RE.search(l.chunk.content or "")
+                   and _OUTCOME_RESULT_RE.search(l.chunk.content or "")
+                   for l in self.lessons)
 
 
 def _jaccard(a: set[str], b: set[str]) -> float:
@@ -221,6 +239,15 @@ def _guess_type(cue: str, terms: set[str]) -> str:
     return "reference"
 
 
+def _memory_kind(cue: str) -> str:
+    cue = cue.casefold()
+    if cue in _EPISODIC_CUES:
+        return "episodic"
+    if cue in _PROCEDURAL_CUES or any(cue.startswith(prefix) for prefix in _PROCEDURAL_CUES):
+        return "procedural"
+    return "semantic"
+
+
 def _title_from(sentence: str) -> str:
     """Condense a lesson sentence into a short imperative-ish title (<= ~80 chars)."""
     t = collapse_ws(sentence)
@@ -249,7 +276,7 @@ def _canonical(cluster: _Cluster) -> _Lesson:
 
 def _eligible_for_review(cluster: _Cluster) -> bool:
     """Single user corrections are signals; assistant-only lessons must recur."""
-    return cluster.has_user or cluster.support >= 2
+    return cluster.has_user or cluster.support >= 2 or cluster.has_complete_episode
 
 
 def _draft_body(cluster: _Cluster) -> str:
@@ -288,6 +315,7 @@ def _collect_lessons(cfg: Config, store: Store) -> list[_Lesson]:
         "the issue was the problem was root cause the fix was the bug was turns out",
         "should always should never in the future going forward next time note that important",
         "gotcha lesson the key is the trick is instead of decided we use needs to has to",
+        "fixed by resolved by failed because worked because root cause was configured requirement",
     ]
     chunk_ids: set[int] = set()
     ranked: list = []
@@ -310,7 +338,8 @@ def _collect_lessons(cfg: Config, store: Store) -> list[_Lesson]:
         terms = set(extract_terms(sentence))
         if len(terms) < _MIN_TERMS:
             continue
-        seen[ch.id] = _Lesson(chunk=ch, sentence=sentence, terms=terms, cue=cue)
+        seen[ch.id] = _Lesson(chunk=ch, sentence=sentence, terms=terms, cue=cue,
+                              memory_kind=_memory_kind(cue))
     return list(seen.values())
 
 
@@ -441,6 +470,7 @@ def mine_candidates(cfg: Config | None = None, store: Store | None = None,
         sample = cl.lessons[: min(8, len(cl.lessons))]
         support_meta = {
             "method": "keyword-cluster",
+            "memory_kind": canonical.memory_kind,
             "cluster_size": len(cl.lessons),
             "sessions": sorted({l.chunk.session_id for l in cl.lessons if l.chunk.session_id}),
             "projects": sorted({l.chunk.project for l in cl.lessons if l.chunk.project}),

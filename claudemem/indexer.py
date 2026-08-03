@@ -5,16 +5,18 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
+import time
 from typing import Callable
 
 from . import facts as facts_mod
-from . import codex_transcripts, paths, transcripts
 from .chunking import chunk_text, estimate_tokens
 from .config import Config
 from .log import get_logger
+from .memory_types import conflict_index, find_claim_conflicts
 from .providers.contextual import Contextualizer
 from .providers.embeddings import EmbeddingProvider, get_embedding_provider
 from .store.base import Store
+from .transcript_adapters import discover_transcripts, get_adapter
 
 log = get_logger(__name__)
 Progress = Callable[[str], None] | None
@@ -29,6 +31,7 @@ class IndexStats:
     notes_unchanged: int = 0
     notes_pruned: int = 0
     embedded: int = 0
+    candidates_drafted: int = 0
     errors: int = 0
 
     def as_dict(self) -> dict:
@@ -51,16 +54,14 @@ def index(cfg: Config, store: Store, *, full: bool = False, progress: Progress =
     stats = IndexStats()
 
     # --- transcripts (incremental) ---
-    tfiles = paths.iter_transcript_files(cfg)
-    if only_provider:
-        tfiles = [tf for tf in tfiles if tf.provider == only_provider]
+    tfiles = discover_transcripts(cfg, only_provider=only_provider)
     _emit(progress, f"scanning {len(tfiles)} transcripts...")
     for tf in tfiles:
         try:
             src = store.get_source(str(tf.path))
             start = 0 if full else (src["bytes_indexed"] if src else 0)
-            parser = codex_transcripts if tf.provider == "codex" else transcripts
-            units, new_off = parser.parse_new(tf.path, start, cfg)
+            adapter = get_adapter(tf.provider)
+            units, new_off = adapter.parse_new(tf.path, start, cfg)
             if full and src:
                 store.delete_source(str(tf.path))
             session_id = (units[0].session_id if units
@@ -102,6 +103,10 @@ def index(cfg: Config, store: Store, *, full: bool = False, progress: Progress =
     if only_provider is None:
         notes = facts_mod.load_notes(cfg)
         _emit(progress, f"indexing {len(notes)} curated notes...")
+        conflicts = find_claim_conflicts(notes)
+        conflicts_by_note = conflict_index(conflicts)
+        if conflicts:
+            _emit(progress, f"  {len(conflicts)} unresolved structured-claim conflicts held from automatic recall")
         try:
             existing_facts = {f.path: f for f in store.list_facts()}
         except Exception:
@@ -114,7 +119,8 @@ def index(cfg: Config, store: Store, *, full: bool = False, progress: Progress =
                              and abs(float(existing.mtime) - float(nd.mtime)) < 1e-6
                              and embedding_model
                              and existing.meta.get("embedding_model") == embedding_model
-                             and existing.meta.get("lifecycle_schema") == 1)
+                             and existing.meta.get("lifecycle_schema") == 2
+                             and existing.meta.get("conflict_ids", []) == conflicts_by_note.get(nd.path, []))
                 if unchanged:
                     stats.notes_unchanged += 1
                     continue
@@ -131,7 +137,11 @@ def index(cfg: Config, store: Store, *, full: bool = False, progress: Progress =
                                   origin_session_id=nd.origin_session_id, body=nd.body, embedding=emb,
                                   mtime=nd.mtime, meta={"wikilinks": nd.wikilinks,
                                                        "embedding_model": embedding_model,
-                                                       "lifecycle_schema": 1,
+                                                       "lifecycle_schema": 2,
+                                                       "memory_kind": nd.memory_kind,
+                                                       "importance": nd.importance,
+                                                       "claims": nd.claims,
+                                                       "conflict_ids": conflicts_by_note.get(nd.path, []),
                                                        **nd.lifecycle})
                 stats.notes += 1
             except Exception as e:
@@ -179,6 +189,29 @@ def index(cfg: Config, store: Store, *, full: bool = False, progress: Progress =
             store.record_metric(m, float(cnt.get(m, 0)))
     except Exception:
         pass
+
+    # Review-first consolidation is deliberately off the prompt path. It may draft typed
+    # semantic/episodic/procedural candidates after an index pass, but it never writes or activates
+    # a curated note. A durable KV timestamp bounds work across the frequent live-sync passes.
+    if (only_provider is None and cfg.consolidation.enabled
+            and cfg.consolidation.auto_after_index
+            and (stats.units or stats.notes or stats.chunks_added)):
+        try:
+            state = store.kv_get("consolidation:last_run") or {}
+            last = float(state.get("epoch") or 0.0)
+            due_s = cfg.consolidation.min_interval_hours * 3600.0
+            if time.time() - last >= due_s:
+                from .promote import mine_candidates
+                stats.candidates_drafted = mine_candidates(
+                    cfg, store, cap=cfg.consolidation.candidate_cap)
+                store.kv_set("consolidation:last_run", {
+                    "epoch": time.time(), "drafted": stats.candidates_drafted,
+                    "mode": "review-first", "memory_schema": 2,
+                })
+                _emit(progress, f"drafted {stats.candidates_drafted} typed memory candidates for review")
+        except Exception as e:
+            # Consolidation is nonessential background work; indexing remains successful.
+            log.exception("background consolidation failed: %s", e)
 
     _emit(progress, f"done: {stats.as_dict()}")
     return stats

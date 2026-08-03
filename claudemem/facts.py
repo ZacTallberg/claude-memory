@@ -7,6 +7,7 @@ from pathlib import Path
 from .config import Config
 from .lifecycle import normalize_lifecycle
 from .log import get_logger
+from .memory_types import normalize_memory_metadata
 from .paths import iter_note_files
 from .security import redact_secrets
 from .text import (collapse_ws, extract_wikilinks, normalize_note_type,
@@ -28,6 +29,9 @@ class NoteData:
     body: str
     wikilinks: list[str]
     lifecycle: dict
+    memory_kind: str
+    importance: float
+    claims: list[dict]
     mtime: float
 
 
@@ -56,6 +60,14 @@ def load_note(path: Path, project: str) -> NoteData | None:
         tags = [t.strip() for t in tags.split(",") if t.strip()]
     elif not isinstance(tags, list):
         tags = []
+    lifecycle = normalize_lifecycle(meta)
+    memory_meta = normalize_memory_metadata(meta, note_name=str(meta.get("name") or path.stem),
+                                            note_type=normalize_note_type(meta),
+                                            lifecycle=lifecycle)
+    for claim in memory_meta["claims"]:
+        for key in ("subject", "predicate", "object", "provenance"):
+            if claim.get(key):
+                claim[key] = redact_secrets(str(claim[key]))[0]
     return NoteData(
         path=str(path),
         project=project,
@@ -67,7 +79,10 @@ def load_note(path: Path, project: str) -> NoteData | None:
         origin_session_id=note_origin_session(meta),
         body=redact_secrets(body)[0].strip(),
         wikilinks=extract_wikilinks(body),
-        lifecycle=normalize_lifecycle(meta),
+        lifecycle=lifecycle,
+        memory_kind=memory_meta["memory_kind"],
+        importance=memory_meta["importance"],
+        claims=memory_meta["claims"],
         mtime=path.stat().st_mtime,
     )
 
@@ -81,21 +96,56 @@ def load_notes(cfg: Config) -> list[NoteData]:
     return out
 
 
+def _entity_id(value: str) -> str:
+    import hashlib
+    return "entity:" + hashlib.sha256(value.casefold().encode("utf-8")).hexdigest()[:20]
+
+
 def build_graph(notes: list[NoteData]) -> tuple[list[dict], list[dict]]:
-    """Nodes = notes (+ referenced-but-missing targets); edges = [[wikilink]] relations."""
+    """Build the inspectable note graph plus explicit typed temporal claims.
+
+    Wikilinks remain lightweight note-to-note edges. Structured claims add entity nodes and
+    predicate edges carrying validity, confidence, provenance, and source-note metadata.
+    """
     nodes: dict[str, dict] = {}
     for n in notes:
-        nodes[n.name] = {"id": n.name, "label": n.title, "type": n.type, "group": n.project}
+        nodes[n.name] = {"id": n.name, "label": n.title, "type": n.type, "group": n.project,
+                         "meta": {"node_kind": "note", "memory_kind": n.memory_kind,
+                                  "importance": n.importance,
+                                  "status": n.lifecycle.get("status")}}
     edges: list[dict] = []
     for n in notes:
         for target in n.wikilinks:
             if target not in nodes:
                 nodes[target] = {"id": target, "label": target, "type": "missing", "group": n.project}
-            edges.append({"source": n.name, "target": target, "kind": "links"})
+            edges.append({"source": n.name, "target": target, "kind": "links",
+                          "meta": {"source_note": n.name}})
         supersedes = n.lifecycle.get("supersedes")
         if supersedes:
             if supersedes not in nodes:
                 nodes[supersedes] = {"id": supersedes, "label": supersedes,
                                      "type": "missing", "group": n.project}
-            edges.append({"source": n.name, "target": supersedes, "kind": "supersedes"})
+            edges.append({"source": n.name, "target": supersedes, "kind": "supersedes",
+                          "meta": {"source_note": n.name,
+                                   "valid_from": n.lifecycle.get("valid_from")}})
+        for claim in n.claims:
+            subject_id = _entity_id(claim["subject"])
+            object_id = _entity_id(claim["object"])
+            nodes.setdefault(subject_id, {"id": subject_id, "label": claim["subject"],
+                                          "type": "entity", "group": n.project,
+                                          "meta": {"node_kind": "entity"}})
+            nodes.setdefault(object_id, {"id": object_id, "label": claim["object"],
+                                         "type": "entity", "group": n.project,
+                                         "meta": {"node_kind": "entity"}})
+            edges.append({"source": n.name, "target": subject_id, "kind": "asserts",
+                          "meta": {"source_note": n.name, "claim_id": claim["id"]}})
+            edges.append({"source": subject_id, "target": object_id,
+                          "kind": claim["predicate"],
+                          "meta": {"source_note": n.name, "claim_id": claim["id"],
+                                   "cardinality": claim["cardinality"],
+                                   "status": claim["status"],
+                                   "confidence": claim["confidence"],
+                                   "valid_from": claim["valid_from"],
+                                   "valid_to": claim["valid_to"],
+                                   "provenance": claim["provenance"]}})
     return list(nodes.values()), edges

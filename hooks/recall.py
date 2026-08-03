@@ -93,7 +93,9 @@ def _local_keyword(cfg, prompt: str, session_id: str | None, *, cwd: str | None,
                             latency_ms=int((time.time() - t0) * 1000),
                             details={"request_id": request_id, "delivery_status": "fallback",
                                      "failure_reason": reason, "retrieval_mode": "keyword-only",
-                                     "vector_used": False})
+                                     "vector_used": False,
+                                     "chunk_ids": [result.chunk.id for result in results],
+                                     "fact_ids": [fact.id for fact in facts]})
     except Exception:
         pass
     # Fell back to the local engine — still a healthy delivery; refresh the beacon (yellow "mem sq" state).
@@ -118,6 +120,8 @@ def _receipt(cfg, *, request_id: str, session_id: str | None, prompt: str,
         "latency_ms": int(res.get("latency_ms") or 0),
         "retrieval_mode": res.get("retrieval_mode") or "unknown",
         "vector_used": bool(res.get("vector_used")),
+        "chunk_ids": list(res.get("chunk_ids") or []),
+        "fact_ids": list(res.get("fact_ids") or []),
     }, timeout=cfg.delivery.receipt_timeout_seconds)
 
 

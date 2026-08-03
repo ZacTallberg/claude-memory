@@ -51,7 +51,8 @@ decisions and why they were made.
 ```
 
 `mcp/server.py` (optional) exposes the same store/retriever to MCP clients. `eval.py` / `selftest.py`
-exercise the whole stack and write to the `metrics` table the dashboard charts.
+exercise the whole stack and write to the `metrics` table the dashboard charts. Offline ranking,
+feedback, model, and LongMemEval instruments produce immutable JSON reports without a live cutover.
 
 ---
 
@@ -60,7 +61,9 @@ exercise the whole stack and write to the `metrics` table the dashboard charts.
 ### 2.1 Index path (write — single writer)
 
 ```
-transcripts.py: tail-read each *.jsonl from persisted byte offset (stop at first line w/o trailing \n)
+transcript_adapters.py: built-ins + background-only entry points discover normalized transcript files
+        │
+transcripts.py / codex_transcripts.py: tail-read each *.jsonl (stop at first line w/o trailing \n)
         │  skip isSidechain / isMeta / command echoes; strip our own injected blocks
         ▼
 chunking.py: notes → 1 chunk; transcript turns → ~400-token windows (~15% overlap) on code/para bounds
@@ -71,6 +74,10 @@ contextual.py (optional): ≤2-sentence situating blurb per chunk (prompt-cached
 embeddings.py: L2-normalized vectors (BAAI/bge-small, dim 384) over search_text = blurb + content
         ▼
 store.upsert_source / add_chunks / set_embeddings  +  set_bytes_indexed(offset)   (incremental, idempotent)
+        │
+typed note metadata → temporal conflict derivation → unresolved sides become manual-only
+        │
+interval-limited consolidation → review candidates only (never silent authoritative writes)
 ```
 
 Incrementality is keyed on `sources.bytes_indexed` (transcripts) and mtime (notes); a shrink/rotation
@@ -131,6 +138,12 @@ jump ahead of document indexing, and document embedding is microbatched so an in
 few chunks. Server work must finish before the earlier server deadline, leaving the hook time to fall
 back and record what actually happened.
 
+SQLite's vector extension is an exact flat index. Four independent SQL scans over the whole corpus
+were measurably wasteful under fleet load, so the warm process holds one exact NumPy chunk-vector
+snapshot. Matrix distance preserves the sqlite-vec order, same-process index batches update the
+snapshot incrementally, and a durable revision forces reload after another process writes. Facts are
+small enough to retain their direct sqlite-vec path. The snapshot is derived and disposable.
+
 ### 3.3 Files as truth, DB as derived index
 Claude Code already persists everything as JSONL transcripts and `memory/*.md` notes. Treating those as
 the **source of truth** and the database as a **rebuildable derived index** means the DB is disposable:
@@ -181,9 +194,14 @@ supervises all three. See `scripts/persistence_run.ps1` and the README's "Persis
   traversal is rejected.
 - **Secrets.** DB password and API keys come from the environment only — never config, never logs.
 - **Temporal truth.** Markdown frontmatter carries status, validity, confidence, provenance, and
-  supersession. Inactive history remains inspectable but is filtered before automatic delivery.
+  supersession. Explicit single-valued claims are checked for overlap; unresolved contradictions
+  remain inspectable but are withheld from automatic delivery.
 - **Outcome telemetry.** Delivery receipts measure transport; request-linked usefulness feedback
-  measures whether memory helped, harmed, or was stale.
+  measures whether memory helped, harmed, or was stale. Chunk/fact attribution can be evaluated
+  offline with shrinkage and golden-set safety gates; it never rewrites live rank by itself.
+- **Open model/source boundaries.** Transcript formats are adapters and embedding models are
+  native-dimension bake-off candidates. Neither a client vendor nor the initially deployed model is
+  embedded in the storage or retrieval contract.
 - **Local service boundary.** The API refuses remote binds/peers and hostile browser origins. Hooks
   execute only checked-in local scripts and never fetch bootstrap code.
 
@@ -192,7 +210,10 @@ supervises all three. See `scripts/persistence_run.ps1` and the README's "Persis
 ## 5. Where to look in the code
 - Contract: `docs/SPEC.md`. Config: `claudemem/config.py` + `config.toml`.
 - Retrieval/fusion: `claudemem/retriever.py`. Indexing: `claudemem/indexer.py`,
-  `claudemem/transcripts.py`, `claudemem/chunking.py`.
+  `claudemem/transcript_adapters.py`, `claudemem/transcripts.py`, `claudemem/chunking.py`.
+- Typed truth/conflicts: `claudemem/memory_types.py`. Offline learning and model selection:
+  `claudemem/feedback_learning.py`, `claudemem/ranking_experiment.py`,
+  `claudemem/model_bakeoff.py`, `claudemem/benchmarks/longmemeval.py`.
 - Store DAO + dataclasses: `claudemem/store/base.py`; backends in `store/postgres_store.py`,
   `store/sqlite_store.py`; selection in `store/factory.py`.
 - Hooks: `hooks/_common.py`, `hooks/recall.py`, `hooks/unify.py`, `hooks/index_trigger.py`.

@@ -77,6 +77,14 @@ class ContextualCfg:
 
 
 @dataclass(frozen=True)
+class ConsolidationCfg:
+    enabled: bool
+    auto_after_index: bool
+    min_interval_hours: float
+    candidate_cap: int
+
+
+@dataclass(frozen=True)
 class RecallCfg:
     top_k: int
     bm25_k: int
@@ -131,6 +139,7 @@ class Config:
     embeddings: EmbeddingsCfg
     reranker: RerankerCfg
     contextual: ContextualCfg
+    consolidation: ConsolidationCfg
     recall: RecallCfg
     unify: UnifyCfg
     delivery: DeliveryCfg
@@ -164,6 +173,8 @@ _DEFAULTS: dict = {
                  "hot_path": False, "candidates": 30},
     "contextual": {"enabled": True, "model": "claude-haiku-4-5", "enrich_notes": True,
                    "enrich_transcripts": False, "max_doc_chars": 60000},
+    "consolidation": {"enabled": True, "auto_after_index": True,
+                      "min_interval_hours": 24.0, "candidate_cap": 15},
     "recall": {"top_k": 6, "bm25_k": 40, "vector_k": 40, "rrf_k": 60, "min_terms": 3,
                "max_chars": 8000, "recency_half_life_days": 45.0, "snippet_chars": 600,
                "include_facts": True, "facts_k": 4},
@@ -225,6 +236,7 @@ def load_config() -> Config:
     em = raw["embeddings"]
     rr = raw["reranker"]
     ct = raw["contextual"]
+    co = raw["consolidation"]
     rc = raw["recall"]
     un = raw["unify"]
     dl = raw["delivery"]
@@ -262,6 +274,11 @@ def load_config() -> Config:
                                  enrich_notes=_b(ct["enrich_notes"]),
                                  enrich_transcripts=_b(ct["enrich_transcripts"]),
                                  max_doc_chars=int(ct["max_doc_chars"])),
+        consolidation=ConsolidationCfg(
+            enabled=_b(co["enabled"]), auto_after_index=_b(co["auto_after_index"]),
+            min_interval_hours=max(0.0, float(co["min_interval_hours"])),
+            candidate_cap=max(1, int(co["candidate_cap"])),
+        ),
         recall=RecallCfg(top_k=int(rc["top_k"]), bm25_k=int(rc["bm25_k"]), vector_k=int(rc["vector_k"]),
                          rrf_k=int(rc["rrf_k"]), min_terms=int(rc["min_terms"]),
                          max_chars=int(rc["max_chars"]),

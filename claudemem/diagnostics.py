@@ -19,6 +19,7 @@ from .config import ROOT, load_config
 from .hooks_install import status as claude_hook_status
 from .paths import in_scope
 from .store.factory import get_store
+from .transcript_adapters import adapter_status
 
 
 def _json_url(path: str, *, body: dict | None = None, timeout: float = 10.0) -> dict | None:
@@ -73,6 +74,7 @@ def integration_status() -> dict:
         "activation": cfg.scope.activation,
         "machine_wide": machine_wide,
         "indexed_transcript_providers": list(cfg.index.transcript_providers),
+        "transcript_adapters": adapter_status(cfg),
         "clients": clients,
         "all_known_clients_complete": all_clients,
         "warm_server_hybrid": server_ok,
