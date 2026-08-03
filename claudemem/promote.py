@@ -247,6 +247,11 @@ def _canonical(cluster: _Cluster) -> _Lesson:
     )
 
 
+def _eligible_for_review(cluster: _Cluster) -> bool:
+    """Single user corrections are signals; assistant-only lessons must recur."""
+    return cluster.has_user or cluster.support >= 2
+
+
 def _draft_body(cluster: _Cluster) -> str:
     """2-4 sentence body: the canonical lesson + supporting context across sessions."""
     canonical = _canonical(cluster)
@@ -395,6 +400,12 @@ def mine_candidates(cfg: Config | None = None, store: Store | None = None,
     max_cue = max((_cue_strength(c) for c in CUE_PHRASES), default=1)
     scored: list[tuple[float, _Cluster, float, float, str]] = []  # (score, cluster, support, novelty, type)
     for cl in clusters:
+        # One-off assistant prose is overwhelmingly progress narration with a lesson-shaped cue
+        # ("reporting the root cause", "capturing this so..."). It may be useful transcript data,
+        # but it is not durable-note material unless it recurs independently. A direct user
+        # correction remains reviewable after one occurrence.
+        if not _eligible_for_review(cl):
+            continue
         novelty = _novelty(cl.terms, fact_sets)
         if novelty < (1.0 - _FACT_OVERLAP_DROP):
             continue  # essentially already captured as a fact

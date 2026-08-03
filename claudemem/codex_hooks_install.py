@@ -56,7 +56,7 @@ def _desired() -> dict:
         "SessionStart": [{
             "matcher": "startup|resume|clear|compact",
             "hooks": [_handler("unify.py", 30, "Loading the shared memory map",
-                               context_limit=9000)]
+                               context_limit=10000)]
         }],
         "SessionEnd": [{
             "hooks": [_handler("index_trigger.py", 3, "Updating shared local memory")]

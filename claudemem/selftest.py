@@ -165,8 +165,12 @@ def run_selftest(verbose: bool = True) -> bool:
     # -- 1. config loads with the required shape -----------------------------
     def c_config():
         ok = (cfg.scope.workspace_roots and cfg.embeddings.dim > 0
-              and cfg.recall.max_chars <= 10000 and cfg.store.backend in ("auto", "postgres", "sqlite"))
-        return ok, f"backend={cfg.store.backend} dim={cfg.embeddings.dim} max_chars={cfg.recall.max_chars}"
+              and cfg.scope.activation in ("installed_clients", "workspace_roots")
+              and cfg.recall.max_chars <= 10000 and cfg.store.backend in ("auto", "postgres", "sqlite")
+              and cfg.delivery.server_deadline_seconds < cfg.delivery.client_timeout_seconds)
+        return ok, (f"backend={cfg.store.backend} activation={cfg.scope.activation} "
+                    f"deadline={cfg.delivery.server_deadline_seconds}s<"
+                    f"{cfg.delivery.client_timeout_seconds}s dim={cfg.embeddings.dim}")
     ctx.check("config loads (required sections + sane values)", c_config)
 
     # -- store: connect + migrate + health ----------------------------------
@@ -209,6 +213,53 @@ def run_selftest(verbose: bool = True) -> bool:
         ctx.check("embedder loads with correct dim", c_embed)
     else:
         ctx.skip("embedder loads with correct dim", f"embedder unavailable ({embedder.name})")
+
+    def c_embedding_query_priority():
+        import threading
+        import time as _t
+        from .providers.local_fastembed import FastEmbedProvider
+
+        first_started = threading.Event()
+        release_first = threading.Event()
+        order: list[str] = []
+
+        class FakeModel:
+            def embed(self, texts):
+                label = texts[0]
+                order.append(label)
+                if label == "document-one":
+                    first_started.set()
+                    release_first.wait(5)
+                return iter([[1.0, 0.0] for _ in texts])
+
+        provider = FastEmbedProvider.__new__(FastEmbedProvider)
+        provider._model = FakeModel()
+        provider._lane = threading.Condition()
+        provider._lane_busy = False
+        provider._waiting_queries = 0
+        provider._document_microbatch_size = 1
+        provider._dpref = ""
+        provider._qpref = ""
+        provider.dim = 2
+        doc = threading.Thread(target=lambda: provider.embed_documents(
+            ["document-one", "document-two"]), daemon=True)
+        query = threading.Thread(target=lambda: provider.embed_query(
+            "priority-query-selftest"), daemon=True)
+        doc.start()
+        first_started.wait(2)
+        query.start()
+        deadline = _t.time() + 2
+        while _t.time() < deadline:
+            with provider._lane:
+                if provider._waiting_queries:
+                    break
+            _t.sleep(0.01)
+        release_first.set()
+        doc.join(3); query.join(3)
+        return order == ["document-one", "priority-query-selftest", "document-two"], (
+            f"inference_order={order}")
+    ctx.check("embedding lane yields live indexing to waiting prompt queries",
+              c_embedding_query_priority)
 
     # -- chunking on a synthetic oversized turn -----------------------------
     def c_chunking():
@@ -303,12 +354,34 @@ def run_selftest(verbose: bool = True) -> bool:
 
     # -- meaningful_term_count gating ---------------------------------------
     def c_terms():
-        from .text import meaningful_term_count
+        from .text import meaningful_term_count, recall_query, should_recall
         trivial = meaningful_term_count("hi the a")          # all stopwords/short
         real = meaningful_term_count("postgres paradedb embedding retriever fusion")
-        return (trivial < cfg.recall.min_terms <= real,
-                f"trivial={trivial} real={real} min_terms={cfg.recall.min_terms}")
-    ctx.check("meaningful_term_count gating (trivial < min_terms <= real)", c_terms)
+        continuation = should_recall("continue", cfg.recall.min_terms)
+        expanded = recall_query("continue", "C:/code/claude-memory")
+        return (trivial < cfg.recall.min_terms <= real and continuation
+                and "prior work" in expanded and "claude-memory" in expanded,
+                f"trivial={trivial} real={real} continuation={continuation}")
+    ctx.check("recall gate drops noise but keeps and expands continuation cues", c_terms)
+
+    def c_promotion_signal_floor():
+        from .promote import _Cluster, _Lesson, _eligible_for_review
+        from .store.base import Chunk
+
+        def lesson(role: str, session: str) -> _Lesson:
+            ch = Chunk(id=len(session), source_id=1, kind="text", role=role,
+                       session_id=session, project="selftest", cwd=None, ts=None,
+                       content="root cause durable lesson", ordinal=0, meta={})
+            return _Lesson(ch, "root cause durable lesson", {"root", "cause", "durable", "lesson"},
+                           "root cause")
+
+        assistant_one = _Cluster(); assistant_one.add(lesson("assistant", "a"))
+        assistant_two = _Cluster(); assistant_two.add(lesson("assistant", "a")); assistant_two.add(lesson("assistant", "b"))
+        user_one = _Cluster(); user_one.add(lesson("user", "u"))
+        ok = (not _eligible_for_review(assistant_one)
+              and _eligible_for_review(assistant_two) and _eligible_for_review(user_one))
+        return ok, "one-off assistant rejected; recurring assistant/user correction retained"
+    ctx.check("promotion signal floor rejects one-off assistant narration", c_promotion_signal_floor)
 
     # -- strip_injected_blocks removes a <recalled-memory> block ------------
     def c_strip():
@@ -477,6 +550,19 @@ def run_selftest(verbose: bool = True) -> bool:
                 f"len={len(text)}")
     ctx.check("unify formats a <memory-map> of titles", c_unify_format)
 
+    def c_unify_overflow():
+        from .recall_format import format_unify
+        from .store.base import Fact
+        facts = [Fact(id=i, path=str(i), project="large-project", name=str(i),
+                      title=(f"Durable cross-machine memory title {i} " + "x" * 80),
+                      description="", type="reference", tags=[], origin_session_id=None,
+                      body="") for i in range(500)]
+        text = format_unify({"large-project": facts}, cfg)
+        ok = (len(text) <= 9500 and text.endswith("</memory-map>")
+              and "TRUNCATED:" in text)
+        return ok, f"len={len(text)} well_formed={text.endswith('</memory-map>')}"
+    ctx.check("unify map truncates truthfully without cutting its envelope", c_unify_overflow)
+
     # -- recall hook subprocess: in-scope -> valid additionalContext JSON ---
     # cwd must derive from config: a hardcoded path is out-of-scope the moment a user sets
     # different workspace_roots, and the hook then correctly emits nothing.
@@ -506,12 +592,25 @@ def run_selftest(verbose: bool = True) -> bool:
         return out.strip() == "", "no output for sub-min_terms prompt"
     ctx.check("recall hook: trivial prompt -> no output", c_recall_trivial)
 
-    # -- out-of-scope cwd -> no output --------------------------------------
-    def c_recall_oos():
+    # -- machine-wide hooks activate outside legacy workspace roots ----------
+    def c_recall_machine_wide():
         event = {"prompt": real_q, "cwd": "C:/Windows/Temp", "session_id": "selftest-live"}
         out = _run_hook("recall.py", event)
-        return out.strip() == "", "no output for out-of-scope cwd"
-    ctx.check("recall hook: out-of-scope cwd -> no output", c_recall_oos)
+        return bool(out.strip()), "context emitted outside legacy C:/code root"
+    if n_chunks == 0 and n_facts == 0:
+        ctx.skip("recall hook is machine-wide across client contexts", empty_skip)
+    else:
+        ctx.check("recall hook is machine-wide across client contexts", c_recall_machine_wide)
+
+    def c_constrained_scope_mode():
+        from dataclasses import replace
+        from .paths import in_scope
+        constrained = replace(cfg, scope=replace(cfg.scope, activation="workspace_roots"))
+        return (in_scope(cfg.scope.workspace_roots[0], constrained)
+                and not in_scope("C:/Windows/Temp", constrained),
+                "explicit workspace_roots mode still confines delivery")
+    ctx.check("optional workspace-roots activation remains safely confined",
+              c_constrained_scope_mode)
 
     # -- unify hook subprocess: emits a <memory-map> ------------------------
     def c_unify_hook():
@@ -576,10 +675,13 @@ def run_selftest(verbose: bool = True) -> bool:
         foreign_kept = any("other-tool.py" in x.get("command", "")
                            for e in ups for x in e.get("hooks", []))
         events_ok = all(k in h for k in ("UserPromptSubmit", "SessionStart", "SessionEnd", "PreCompact"))
+        starts_ok = {e.get("matcher") for e in h.get("SessionStart", [])
+                     if hooks_install._is_ours(e)} >= {"startup", "resume", "clear", "compact"}
         idempotent = len(ours) == 1  # exactly one of our recall entries despite two installs
         preserved = data.get("model") == "opus" and foreign_kept
-        return (events_ok and idempotent and preserved,
-                f"events_ok={events_ok} idempotent={idempotent} foreign_kept={foreign_kept}")
+        return (events_ok and starts_ok and idempotent and preserved,
+                f"events_ok={events_ok} starts_ok={starts_ok} idempotent={idempotent} "
+                f"foreign_kept={foreign_kept}")
     ctx.check("install-hooks: valid + idempotent + preserves existing (on a copy)", c_install_hooks)
 
     # -- uninstall-hooks removes only our entries (on the same copy) --------

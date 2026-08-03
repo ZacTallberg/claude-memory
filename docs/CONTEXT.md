@@ -18,9 +18,9 @@ said so. Root causes and the fixes that became load-bearing design:
 - `backend = "auto"` **forked the store** into diverging postgres/sqlite copies whenever ParadeDB
   flapped → backend pinned to **sqlite** (FTS5 + sqlite-vec). ParadeDB remains available by
   re-pinning, but auto is an anti-memory: never restore it.
-- Zero-result recalls were unlogged → **every** recall/unify now logs to the `injections` table,
-  including misses, with latency and source. Telemetry-first: a miss you can't see is a miss you
-  re-teach.
+- Zero-result recalls were unlogged → every client-observed recall/unify now records a delivery or
+  miss receipt, including latency and source. Telemetry-first: a miss you can't see is a miss you
+  re-teach. Server computation alone is not delivery.
 - Warm server death was invisible → supervisor (`persistence_run.ps1`, named-mutex singleton),
   re-armed at logon and by every SessionStart hook.
 - Promotion loop added (SessionEnd `index --promote` mines cue-phrases into candidates, reviewed
@@ -62,6 +62,22 @@ Also measured 2026-07-31: with 3+ concurrent Claude sessions, warm-server recall
 13–67s and hooks fall back to keyword-only exactly when the machine is busiest. The beacon reports
 it honestly (that part works as designed). This is the top open item in `OPTIMIZATIONS.md`.
 
+**2026-08-02 — machine-wide delivery repair.** A follow-up audit found two last-mile defects despite
+healthy corpus/eval numbers: activation was confined to `C:\code`, excluding projectless Codex tasks,
+and the serialized ONNX model let 64-document index batches run ahead of prompt queries. Server work
+also used a 12s deadline after its hook had already abandoned the request at 8s, and completion rows
+were being counted as if delivered. Repairs:
+
+- Installed user-level client hooks are now the trust boundary; every Claude/Codex context activates.
+  `workspace_roots` survives only as an explicit confinement mode.
+- ONNX document inference is microbatched and query-priority. Waiting prompts run before the next
+  indexing microbatch.
+- Server/client budgets are 6s/8s, leaving time for local fallback and a delivery receipt.
+- Recall/unify durable telemetry is client-observed. Late computation cannot claim success.
+- Continuation cues bypass the trivial-term gate and are expanded with cwd/project context.
+- The manual `delivery-check --load` gate exercises concurrent uncached hybrid recall and real hooks
+  across unrelated directories during live indexing; the full selftest/eval remain off the prompt path.
+
 ## Design invariants (violate these and you are rebuilding a repaired outage)
 
 1. **Files are the source of truth; the DB is derived.** Curated notes are plain markdown a human
@@ -94,8 +110,9 @@ it honestly (that part works as designed). This is the top open item in `OPTIMIZ
 - **Warm server owns the models** — hooks are thin clients; embedding load happens once, not per
   prompt. The dashboard and warm server are the same process (a known tension — see
   OPTIMIZATIONS #1/#6).
-- **Scope gating** (`workspace_roots`, `min_terms`) — recall activates only where it can help;
-  trivial prompts and foreign directories get nothing.
+- **Activation gating** (`installed_clients`, optional `workspace_roots`, `min_terms`) — trusted
+  user-level clients receive memory in every context; trivial noise is skipped, but genuine
+  continuation cues are never discarded for being short.
 
 ## Operating doctrine for the file layer (the memory-lifecycle protocol)
 

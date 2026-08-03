@@ -23,6 +23,7 @@ from __future__ import annotations
 import re
 import json
 import urllib.request
+import uuid
 from pathlib import Path
 
 from mcp.server.fastmcp import FastMCP
@@ -209,9 +210,24 @@ def recall(prompt: str, session_id: str | None = None) -> dict:
     p = (prompt or "")
     if not p.strip():
         return {"text": "", "n_recalled": 0, "n_facts": 0, "chars": 0}
-    warm = _warm_post("/api/recall", {"prompt": p, "session_id": session_id})
+    request_id = uuid.uuid4().hex
+    warm = _warm_post("/api/recall", {"prompt": p, "session_id": session_id,
+                                       "request_id": request_id})
+    failure_reason = "server-unavailable"
+    if warm is not None and any(warm.get(key) for key in ("timeout", "shed", "error")):
+        failure_reason = next(key for key in ("timeout", "shed", "error") if warm.get(key))
+        warm = None
     if warm is not None:
         text = warm.get("additionalContext") or ""
+        _warm_post("/api/delivery", {
+            "request_id": request_id, "client": "mcp",
+            "status": ("delivered" if text else "miss"), "session_id": session_id,
+            "prompt_excerpt": p[:200], "n_recalled": int(warm.get("n_recalled") or 0),
+            "n_facts": int(warm.get("n_facts") or 0), "chars": len(text),
+            "latency_ms": int(warm.get("latency_ms") or 0),
+            "retrieval_mode": warm.get("retrieval_mode") or "unknown",
+            "vector_used": bool(warm.get("vector_used")),
+        }, timeout=cfg.delivery.receipt_timeout_seconds)
         return {"text": text, "n_recalled": int(warm.get("n_recalled") or 0),
                 "n_facts": int(warm.get("n_facts") or 0), "chars": len(text)}
     ret = _ret()
@@ -219,14 +235,16 @@ def recall(prompt: str, session_id: str | None = None) -> dict:
                          k=cfg.recall.top_k, do_rerank=False)
     facts = ret.search_facts(p, cfg.recall.facts_k, qvec=None) if cfg.recall.include_facts else []
     text = format_recall(results, facts, cfg)
-    if text:
-        try:
-            _store().log_injection(
-                hook="mcp.recall", session_id=session_id, prompt_excerpt=p[:200],
-                n_recalled=len(results), n_facts=len(facts), chars=len(text), latency_ms=0,
-            )
-        except Exception:
-            pass
+    try:
+        _store().log_injection(
+            hook="mcp-recall-fallback", session_id=session_id, prompt_excerpt=p[:200],
+            n_recalled=len(results), n_facts=len(facts), chars=len(text), latency_ms=0,
+            details={"request_id": request_id, "delivery_status": "fallback",
+                     "failure_reason": failure_reason, "retrieval_mode": "keyword-only",
+                     "vector_used": False},
+        )
+    except Exception:
+        pass
     return {"text": text, "n_recalled": len(results), "n_facts": len(facts), "chars": len(text)}
 
 

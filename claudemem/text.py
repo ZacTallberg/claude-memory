@@ -36,6 +36,11 @@ such only own same than too very s t can't cannot about up down out off
 """.split())
 
 _WORD = re.compile(r"[A-Za-z0-9_][A-Za-z0-9_\-/.]*")
+_CONTINUATION = re.compile(
+    r"\b(continue|resume|proceed|carry\s+on|keep\s+going|pick\s+up|what(?:'s|\s+is)\s+next|"
+    r"finish\s+(?:it|this|the\s+work)|where\s+were\s+we)\b",
+    re.IGNORECASE,
+)
 
 
 def strip_injected_blocks(text: str) -> str:
@@ -62,6 +67,33 @@ def extract_terms(text: str) -> list[str]:
 
 def meaningful_term_count(text: str) -> int:
     return len(set(extract_terms(text)))
+
+
+def is_continuation_prompt(text: str) -> bool:
+    """True for a short cue whose meaning depends on durable prior-work context."""
+    return bool(_CONTINUATION.search(text or ""))
+
+
+def should_recall(text: str, min_terms: int) -> bool:
+    """Gate noise while never dropping a genuine continuation/resumption cue."""
+    return meaningful_term_count(text) >= min_terms or is_continuation_prompt(text)
+
+
+def recall_query(text: str, cwd: str | None = None) -> str:
+    """Expand context-dependent continuation cues into a useful semantic retrieval query."""
+    if not is_continuation_prompt(text):
+        return text
+    project = ""
+    if cwd:
+        try:
+            from pathlib import Path
+            project = Path(cwd).name
+        except Exception:
+            project = ""
+    suffix = "prior work current task pending decisions unfinished steps next actions"
+    if project:
+        suffix += f" project {project}"
+    return f"{text} {suffix}".strip()
 
 
 def collapse_ws(text: str) -> str:

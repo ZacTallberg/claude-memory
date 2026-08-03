@@ -46,7 +46,7 @@ def _desired() -> dict:
         ],
         "SessionStart": [
             {"matcher": m, "hooks": [{"type": "command", "command": _cmd("unify.py"), "timeout": 30}]}
-            for m in ("startup", "resume", "clear")
+            for m in ("startup", "resume", "clear", "compact")
         ] + [
             # Fleet carrier (isolated, stdlib, fail-safe): enrolls an un-enrolled Vigor
             # fleet machine from the hub's open bootstrap; instant no-op everywhere else.

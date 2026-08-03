@@ -54,6 +54,14 @@ contexts with zero shed/timeouts/fallbacks; p90 wall latency 908ms, max 1.054s. 
 ranked a Codex-sourced session first. The self-test includes guards proving reads bypass the writer
 lock and timed-out work retains admission until it actually exits.
 
+**Follow-up audit and second repair 2026-08-02:** live 24-hour telemetry still showed 24 hybrid
+computations finishing after the 8s caller timeout and 28 delivered keyword fallbacks versus only 21
+timely hybrid responses. The missing variable was live indexing: document and query embedding shared
+one serialized ONNX lock, and a 64-document batch could hold it for 15–40s. The server deadline was
+also 12s, longer than its 8s caller, so it knowingly produced abandoned answers. Repaired by strict
+query priority between four-document microbatches, a 6s server/8s client budget, client delivery
+receipts, and a focused `mem delivery-check --load` gate. Completion is no longer success telemetry.
+
 ## 2. Backup floor for the DB after porting — cheap, do immediately post-port
 
 On the original machine the DB is rebuildable (transcripts + notes exist). **After a port it is
@@ -86,13 +94,12 @@ agent.**
 The golden eval exists; a one-off parameter sweep (`mem eval` per variant) either improves recall@k
 or confirms the defaults. Zero risk: it's all read-only measurement.
 
-## 6. Dashboard and hot path share one process
+## 6. Dashboard and hot path share one process — mitigated, keep measuring
 
-A heavy dashboard action (graph render, full reindex, promotion mining) competes with recall for
-the GIL, the store, and RAM. Options, cheapest first: run `mem index` fully detached (already done
-via index_trigger) → priority-lane the hook endpoints ahead of dashboard endpoints → split the warm
-server from the dashboard process (clean but adds a second resident model unless they share via
-the same process boundary). Only worth doing if #1 shows the dashboard in the flame graph.
+A heavy dashboard action still shares RAM/GIL with recall, but the measured dominant contention—the
+ONNX lane—is now query-priority and indexing is interruptible between microbatches. Keep the single
+resident model unless `delivery-check --load` or delivery receipts regress; process separation is a
+last resort because a second model worsens memory pressure on this host.
 
 ## 7. Small coherence items
 
@@ -101,8 +108,9 @@ the same process boundary). Only worth doing if #1 shows the dashboard in the fl
 - README described ParadeDB as the primary store; the pinned reality is sqlite. Fixed alongside.
 - Selftest count drifts upward as guards are added — docs should say "30" only where a number is
   unavoidable; prefer "all checks pass".
-- 6 auto-mined promotion candidates are sitting unreviewed in the dashboard queue on the original
-  machine; review them before porting the DB so the queue doesn't fossilize.
+- The seven pending auto-mined candidates were reviewed on 2026-08-02 and rejected as contextless
+  progress fragments or duplicates. The miner now requires recurrence for assistant-authored lessons;
+  explicit one-off user corrections remain eligible for human review. A fresh run drafted zero.
 
 ## Non-goals (deliberate, not neglect)
 

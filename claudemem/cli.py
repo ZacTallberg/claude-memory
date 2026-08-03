@@ -79,6 +79,21 @@ def cmd_eval(args):
     run_eval()
 
 
+def cmd_integrations(args):
+    from .diagnostics import integration_status
+    status = integration_status()
+    print(json.dumps(status, indent=2, default=str))
+    sys.exit(0 if status["ok"] else 1)
+
+
+def cmd_delivery_check(args):
+    from .diagnostics import delivery_check
+    result = delivery_check(concurrency=args.concurrency, under_index_load=args.load,
+                            cwd=args.cwd)
+    print(json.dumps(result, indent=2, default=str))
+    sys.exit(0 if result["ok"] else 1)
+
+
 def cmd_backup(args):
     from pathlib import Path
     from .backup import create_backup, verify_snapshot
@@ -149,6 +164,12 @@ def main(argv: list[str] | None = None) -> None:
     s.set_defaults(fn=cmd_serve)
     s = sub.add_parser("selftest"); s.set_defaults(fn=cmd_selftest)
     s = sub.add_parser("eval"); s.set_defaults(fn=cmd_eval)
+    s = sub.add_parser("integrations"); s.set_defaults(fn=cmd_integrations)
+    s = sub.add_parser("delivery-check")
+    s.add_argument("--concurrency", type=int, default=4)
+    s.add_argument("--load", action="store_true", help="run while a live index pass is active")
+    s.add_argument("--cwd")
+    s.set_defaults(fn=cmd_delivery_check)
     s = sub.add_parser("backup"); s.add_argument("--if-due", action="store_true")
     s.add_argument("--retention", type=int, default=14); s.add_argument("--verify")
     s.set_defaults(fn=cmd_backup)

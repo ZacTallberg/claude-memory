@@ -9,22 +9,24 @@ Status: authoritative. If code and SPEC disagree, fix one of them deliberately �
 
 ## 0. Goals & non-negotiables
 
-1. **Recall** (hot path): on every user prompt, hybrid-search the corpus and inject the most relevant
-   snippets as *untrusted reference data* via the `UserPromptSubmit` hook. Hard 30 s timeout; must be fast.
+1. **Recall** (hot path): on every meaningful prompt or explicit continuation cue, hybrid-search the
+   corpus and inject the most relevant snippets as *untrusted reference data* via `UserPromptSubmit`.
+   The 6s server deadline is shorter than the 8s client budget; fallback remains inside that budget.
 2. **Unify** (session start): inject a cross-folder map of curated-fact *titles* so the agent knows what
    it knows everywhere, via the `SessionStart` hook.
 3. **Index**: incrementally index Claude Code JSONL transcripts + curated markdown notes across all
    per-project folders. Zero LLM required to index (Contextual Retrieval is an optional enrichment).
 4. **Dashboard**: a beautiful FastAPI + HTMX hub to search, browse, visualize, and curate memory.
-5. **Best-of-breed**: ParadeDB (Tantivy BM25 + pgvector) primary; strong local embeddings; cross-encoder
-   reranking; Anthropic Contextual Retrieval; full eval + observability.
+5. **Best-of-breed**: pinned SQLite FTS5 + sqlite-vec on this machine (optional ParadeDB when explicitly
+   re-pinned); strong local embeddings; cross-encoder reranking; full eval + observability.
 6. **Fail-safe & degrade-gracefully**: hooks never block/crash the prompt (always exit 0). If the vector
-   layer / embedder / Postgres is missing, fall back (keyword-only, or SQLite fallback store).
+   layer / embedder is missing, fall back to explicit keyword-only delivery.
 7. **Kill switch**: a single `DISABLED` sentinel file turns both hooks off instantly.
 
 Hard environment facts (verified): Windows 11, Python 3.12.2 (`C:\Users\zcobe\AppData\Local\Programs\Python\Python312\python.exe`),
 Node 24, CPU-only (Intel Iris Xe, **no CUDA**), ~14 GB RAM. WSL2 Ubuntu 26.04 with Docker 29.1.3,
-passwordless sudo, systemd. ParadeDB runs in WSL2 Docker, reachable from Windows at `localhost:5432`.
+passwordless sudo, systemd. Optional ParadeDB runs in WSL2 Docker at `localhost:55432`; the running
+installation is deliberately pinned to SQLite.
 
 ---
 
@@ -50,8 +52,8 @@ C:\code\claude-memory\
     store\
       __init__.py
       base.py                ← Store ABC (the DAO contract, §4)
-      postgres_store.py      ← ParadeDB backend (primary)
-      sqlite_store.py        ← SQLite + FTS5 + sqlite-vec backend (fallback)
+      postgres_store.py      ← optional explicitly pinned ParadeDB backend
+      sqlite_store.py        ← pinned SQLite + FTS5 + sqlite-vec backend
       factory.py             ← choose backend per config; auto-fallback
       sql\                   ← .sql DDL templates (pg + sqlite)
     providers\
@@ -104,16 +106,17 @@ frozen dataclass with nested sections. Required keys:
 
 ```toml
 [scope]
-# Recall/Unify only activate when cwd is under one of these roots.
+# User-level installed-client hooks activate in every client context.
+activation = "installed_clients" # or "workspace_roots" for deliberate confinement
 workspace_roots = ["C:/code"]
 # Where Claude Code stores per-project transcripts + auto-memory dirs.
 claude_projects_dir = "C:/Users/zcobe/.claude/projects"
 
 [store]
-backend = "auto"              # "postgres" | "sqlite" | "auto" (try postgres, fall back to sqlite)
+backend = "sqlite"            # one pinned backend; auto failover is forbidden (split-brain history)
 [store.postgres]
 host = "localhost"
-port = 5432
+port = 55432
 dbname = "claudemem"
 user = "claudemem"
 # password via env CLAUDEMEM_PG_PASSWORD (default "claudemem" for local dev)
@@ -126,17 +129,18 @@ model = "BAAI/bge-small-en-v1.5"   # see §5 for the resolution + upgrade path
 dim = 384                    # truncated (Matryoshka) embedding dim actually stored
 query_prefix = ""            # model-specific instruction prefix for queries
 doc_prefix = ""
+document_microbatch_size = 4  # yield ONNX inference to waiting prompt queries
 
 [reranker]
 enabled = true
 provider = "local"           # "local" | "cohere" | "none"
-model = "BAAI/bge-reranker-v2-m3"
+model = "Xenova/ms-marco-MiniLM-L-6-v2"
 hot_path = false             # CPU box → do NOT rerank on the prompt hot path by default
 candidates = 30              # how many fused candidates to rerank on the full path
 
 [contextual]
-enabled = true               # Anthropic Contextual Retrieval at index time
-model = "claude-haiku-4-5-20251001"
+enabled = false              # optional paid Anthropic Contextual Retrieval at index time
+model = "claude-haiku-4-5"
 enrich_notes = true          # always enrich curated notes (small, high value)
 enrich_transcripts = false   # off by default (volume); flip on or sample
 max_doc_chars = 60000        # cap document size sent for contextualization
@@ -154,8 +158,15 @@ include_facts = true         # also surface relevant curated notes
 facts_k = 4
 
 [unify]                      # session start
-max_facts = 120              # titles in the map (cap token budget)
+max_facts = 300              # attempt the complete catalog; character cap remains authoritative
 group_by = "project"         # project | type
+
+[delivery]
+client_timeout_seconds = 8.0
+server_deadline_seconds = 6.0
+receipt_timeout_seconds = 0.75
+hook_concurrency = 4
+hybrid_slo_ms = 3000
 
 [server]
 host = "127.0.0.1"
@@ -166,6 +177,8 @@ open_browser = true
 exclude_sidechains = true    # skip subagent/workflow transcripts
 strip_injected = true        # strip our own injected blocks before storing
 batch_size = 64
+transcript_providers = ["claude", "codex"]
+live_interval_seconds = 60
 ```
 
 Constants must be config-driven, not hardcoded. `paths.py` resolves relative paths against the package
@@ -269,7 +282,7 @@ class Store(ABC):
     def counts(self) -> dict
 ```
 
-### 4.1 Postgres / ParadeDB schema (primary)
+### 4.1 Postgres / ParadeDB schema (optional when explicitly re-pinned)
 - `sources(id bigserial pk, path text unique, kind text, project text, session_id text, bytes_indexed
   bigint default 0, mtime double precision, first_seen timestamptz default now(), last_indexed
   timestamptz, meta jsonb default '{}')`
@@ -352,10 +365,11 @@ class Reranker(ABC):
 - `emit_context(text, event_name)`: print `{"hookSpecificOutput":{"hookEventName":event_name,
   "additionalContext":text}}` to stdout; truncate text to ≤9500 chars (under the 10k cap).
 - `failsafe(main)`: wrap the hook body; ANY exception or timeout → print nothing, `sys.exit(0)`.
-- `in_scope(cwd, config) -> bool`: true iff `cwd` resolves under a `workspace_roots` entry.
+- `in_scope(cwd, config) -> bool`: true for every configured user-level client context when
+  `activation=installed_clients`; path-confined only in explicit `workspace_roots` mode.
 - `killed() -> bool`: true iff `DISABLED` sentinel exists in package root.
-- Guards (recall): `killed()` → no-op; bad stdin → no-op; out-of-scope cwd → no-op; `< min_terms`
-  meaningful terms → no-op.
+- Guards (recall): `killed()` → no-op; bad stdin → no-op; untrusted activation mode → no-op;
+  `< min_terms` noise → no-op, except continuation cues, which expand with cwd/project context.
 
 ### 6.2 recall.py (UserPromptSubmit)
 1. Read event → `prompt`, `cwd`, `session_id`. Apply all guards.
@@ -378,11 +392,16 @@ class Reranker(ABC):
    …
    </curated-notes>
    ```
-4. `log_injection(...)` with latency. Emit. Always exit 0. (No hits → emit nothing.)
+4. Emit, then post `/api/delivery`. Only that client receipt is a durable successful/miss injection
+   row. If the server times out, sheds, or is unavailable, run bounded keyword-only fallback and log
+   `recall-fallback`. Always exit 0.
 
 ### 6.3 unify.py (SessionStart)
-1. Read event → `cwd`, `source`. Guards: `killed()`, in-scope. (Run on all sources.)
-2. Build the cross-folder titles map (`facts_titles_map`, grouped by `unify.group_by`, ≤ `max_facts`):
+1. Read event → `cwd`, `source`. Guards: `killed()`, trusted installed client. (Run on startup,
+   resume, clear, and compact.)
+2. Build the cross-folder titles map (`facts_titles_map`, grouped by `unify.group_by`). Attempt every
+   title up to `max_facts`; if the 9500-character cap wins, append an exact `TRUNCATED` count and always
+   close the envelope:
    ```
    <memory-map trust="your-own-notes">
    What you've recorded across this machine (titles only — pull a full note via the hub or
@@ -393,7 +412,7 @@ class Reranker(ABC):
    …
    </memory-map>
    ```
-3. Log + emit. Exit 0.
+3. Emit + delivery receipt. Exit 0.
 
 ### 6.4 index_trigger.py (SessionEnd / PreCompact)
 - Spawn a **detached** background `python -m claudemem index` (don't block). Fail-safe, exit 0.
@@ -421,6 +440,8 @@ opens `http://127.0.0.1:7777`.
 - `GET /api/graph` → `{nodes:[{id,label,type,group}], edges:[{source,target,kind}]}` (Cytoscape)
 - `GET /api/metrics` → series for ECharts (recall@k history, corpus growth, db size, injections/day)
 - `GET /api/injections?limit=` ; `GET /api/injections/stream` (SSE live tail)
+- `POST /api/delivery` records client-observed recall/unify delivery or miss. Server computation alone
+  is not an injection and is excluded from the audit window.
 - `GET /api/promotions` ; `POST /api/promotions/{id}` `{action:accept|reject}` (accept → write a draft
   `.md` into the chosen project memory dir + index it)
 - `GET /api/anti` ; `POST /api/anti` (flag a snippet as misleading)
@@ -449,21 +470,24 @@ opens `http://127.0.0.1:7777`.
 
 ## 8. CLI (`mem`, via `python -m claudemem`)
 `index [--full] [--source P]` · `query "<q>" [--k N] [--rerank]` · `facts "<topic>"` · `embed`
-(backfill missing) · `eval` · `selftest` · `stats` · `serve [--port]` · `promote` ·
+(backfill missing) · `eval` · `selftest` · `delivery-check [--load]` · `integrations` · `stats` ·
+`serve [--port]` · `promote` ·
 `install-hooks` / `uninstall-hooks` · `db up|down|reset|status|psql` (delegates to scripts/db.sh via wsl).
 `mem.ps1`/`mem.cmd` wrap `python -m claudemem` with the right interpreter.
 
 ---
 
 ## 9. Eval & self-test
-- `eval/golden.jsonl`: `{"q": "...", "expect_sessions": [...], "expect_facts": [...]}` lines (seed ~10
-  from the real corpus during integration). `eval.py` computes recall@k, appends a timestamped row to
-  `metrics`, prints delta vs previous run (drift detector).
+- `eval/golden.jsonl`: positive session/fact targets plus optional rejected targets, continuation flag,
+  and cwd. `eval.py` reports coverage, strict recall, negative-target safety, useful@k, continuation
+  usefulness, latency, and drift.
 - `selftest.py` (≥18 checks): config load; store connect+migrate; embedder load+dim; index a synthetic
   transcript+note; bm25 hit; vector hit; hybrid hit; recall hook on synthetic stdin emits a valid
-  envelope; trivial-prompt no-op; out-of-scope no-op; live-session excluded; unify emits a map; kill
-  switch no-ops both hooks; char cap enforced; injected-block stripping; degrade-to-keyword path;
-  injection logged; install-hooks idempotent + settings.json valid. Exit non-zero on any failure.
+  envelope; trivial-prompt no-op; continuation expansion; machine-wide and optional confined activation;
+  prompt-query priority over indexing; live-session exclusion; well-formed unify cap; kill switch;
+  injected-block stripping; explicit keyword degradation; hook installers. Exit non-zero on failure.
+- These suites are opt-in/deployment gates, not prompt-path work. `delivery-check --load` is the narrow
+  live SLO gate and proves real hook receipts in unrelated directories while indexing runs.
 
 ---
 

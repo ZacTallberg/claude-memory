@@ -34,6 +34,14 @@ Use `/mcp` to confirm the `claude-memory` tools are available.
 - MCP provides explicit `memory_search`, `search_facts`, `get_fact`, `list_facts`, `recall`, and
   `write_note` operations at any point in a task.
 
+The hooks are user-level and machine-wide (`[scope].activation = "installed_clients"`), so generated
+projectless tasks under `Documents\Codex` receive the same recall as repositories under `C:\code`.
+The directory is retrieval context, not an activation boundary. Every accepted automatic recall/
+unify response posts a delivery receipt; `recall-fallback` remains an explicit degraded result.
+
+After installation or upgrades, run `mem integrations` for connector coverage and
+`mem delivery-check --load --cwd <any-project-or-projectless-directory>` for the focused live SLO.
+
 The Codex rollout format is documented as unstable. Its adapter is therefore narrow, fail-safe,
 and regression-tested. An unknown future record shape is skipped instead of poisoning or blocking
 memory delivery.

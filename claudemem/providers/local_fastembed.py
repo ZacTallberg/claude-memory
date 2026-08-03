@@ -32,12 +32,14 @@ class FastEmbedProvider(EmbeddingProvider):
         self.name = f"fastembed:{self.model_name}:{self.dim}"
         self._qpref = cfg.embeddings.query_prefix
         self._dpref = cfg.embeddings.doc_prefix
-        # ONNX Runtime already parallelizes one inference across CPU cores. Letting several
-        # hook threads enter the same model simultaneously oversubscribes this small Windows
-        # host, pages the model out, and turns sub-second queries into minute-long stragglers.
-        # Serialize inference in-process; the hook admission layer still accepts concurrent
-        # requests and each waiting query remains bounded.
-        self._model_lock = threading.Lock()
+        # ONNX Runtime already parallelizes one inference across CPU cores. The lane therefore
+        # stays serialized, but query waiters have strict priority over document indexing. A
+        # document list is split into small batches so live indexing can never monopolize the
+        # model for an entire 64-chunk batch while prompt hooks time out around it.
+        self._lane = threading.Condition()
+        self._lane_busy = False
+        self._waiting_queries = 0
+        self._document_microbatch_size = cfg.embeddings.document_microbatch_size
         log.info("FastEmbedProvider ready model=%s native_dim=%d use_dim=%d",
                  self.model_name, self._native_dim, self.dim)
 
@@ -55,8 +57,16 @@ class FastEmbedProvider(EmbeddingProvider):
             return []
         if self._dpref:
             texts = [self._dpref + t for t in texts]
-        with self._model_lock:
-            return [self._post(v) for v in self._model.embed(texts)]
+        out: list[list[float]] = []
+        size = self._document_microbatch_size
+        for start in range(0, len(texts), size):
+            batch = texts[start:start + size]
+            self._acquire_lane(query=False)
+            try:
+                out.extend(self._post(v) for v in self._model.embed(batch))
+            finally:
+                self._release_lane()
+        return out
 
     def embed_query(self, text: str) -> list[float]:
         t = (self._qpref + text) if self._qpref else text
@@ -65,6 +75,27 @@ class FastEmbedProvider(EmbeddingProvider):
     @lru_cache(maxsize=256)
     def _embed_query_cached(self, text: str) -> tuple[float, ...]:
         """Bounded hot-query cache; immutable values are safe to share across callers."""
-        with self._model_lock:
+        self._acquire_lane(query=True)
+        try:
             v = next(iter(self._model.embed([text])))
+        finally:
+            self._release_lane()
         return tuple(self._post(v))
+
+    def _acquire_lane(self, *, query: bool) -> None:
+        """Acquire one model-inference lane; queued queries jump ahead of documents."""
+        with self._lane:
+            if query:
+                self._waiting_queries += 1
+            try:
+                while self._lane_busy or (not query and self._waiting_queries):
+                    self._lane.wait()
+                self._lane_busy = True
+            finally:
+                if query:
+                    self._waiting_queries -= 1
+
+    def _release_lane(self) -> None:
+        with self._lane:
+            self._lane_busy = False
+            self._lane.notify_all()

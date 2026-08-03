@@ -80,7 +80,8 @@ Incrementality is keyed on `sources.bytes_indexed` (transcripts) and mtime (note
 
 ```
 UserPromptSubmit stdin {prompt, cwd, session_id}
-   │  guards: killed()? in_scope(cwd)? >= min_terms real terms?           ─── any fail → emit nothing, exit 0
+   │  guards: killed()? trusted installed client? meaningful OR continuation cue?
+   │  continuation cue → expand with cwd/project + prior-work concepts
    ▼
 retriever.search(tier="hot", exclude_session=session_id):
    store.search_bm25(k=bm25_k)  ┐
@@ -89,16 +90,17 @@ retriever.search(tier="hot", exclude_session=session_id):
    ▼
 recall_format.py: <recalled-memory trust="data-only"> … capped at max_chars …  (+ <curated-notes> if enabled)
    ▼
-store.log_injection(latency, counts)  →  emit additionalContext  →  exit 0
+server response → emit additionalContext → client delivery receipt → durable injection row → exit 0
+server slow/unavailable → local keyword fallback (explicit recall-fallback row) → exit 0
 ```
 
 ### 2.3 Unify path (read — session start)
 
 ```
 SessionStart stdin {cwd, source}
-   │  guards: killed()? in_scope(cwd)?
+   │  guards: killed()? trusted installed client?
    ▼
-store.facts_titles_map() grouped by unify.group_by, capped at max_facts
+store.facts_titles_map() grouped by unify.group_by, complete when it fits; truthful char-budget cap
    ▼
 <memory-map trust="your-own-notes"> titles only  →  emit  →  exit 0
 ```
@@ -117,11 +119,17 @@ ranking logic in one testable place. Recency decay and per-session dedupe run af
 repetitive sessions don't crowd out fresh, distinct context.
 
 ### 3.2 Warm-server hot path
-The recall hook fires on *every* prompt under a 20-30 s budget, on a CPU-only box. Cold-loading the
+The recall hook fires on every meaningful/continuation prompt with an 8s client budget and a 6s
+server deadline, on a CPU-only box. Cold-loading the
 ONNX embedder per prompt would blow that budget. So the dashboard process doubles as a **warm server**
 that keeps the embedder and store connection hot; the hook reuses that warmth. The reranker (a heavier
 cross-encoder) is therefore kept **off the hot path** by default and reserved for the dashboard and
 `mem query --rerank`, where latency is acceptable.
+
+The ONNX lane is serialized to avoid CPU oversubscription but scheduled by priority: query waiters
+jump ahead of document indexing, and document embedding is microbatched so an index pass yields every
+few chunks. Server work must finish before the earlier server deadline, leaving the hook time to fall
+back and record what actually happened.
 
 ### 3.3 Files as truth, DB as derived index
 Claude Code already persists everything as JSONL transcripts and `memory/*.md` notes. Treating those as
@@ -132,8 +140,8 @@ just markdown with YAML frontmatter; the graph comes from `[[wikilinks]]`).
 
 ### 3.4 Fail-safe, degrade-gracefully
 A memory layer must never make the editor worse. Every hook wraps its body in `failsafe()`: **any
-exception or timeout → emit nothing, exit 0.** The store backend is `auto`: if ParadeDB is unreachable
-it falls back to SQLite; if the vector layer/embedder is missing, retrieval degrades to keyword-only.
+exception or timeout → bounded keyword fallback or no context, then exit 0.** The store is pinned to
+SQLite to avoid split-brain failover; if the vector layer/embedder is missing, retrieval degrades to keyword-only.
 The kill switch (`DISABLED` sentinel) turns both hooks off instantly with no restart. Net effect: the
 worst case is "no memory injected," never "prompt blocked or crashed."
 
@@ -163,6 +171,9 @@ supervises all three. See `scripts/persistence_run.ps1` and the README's "Persis
 - **Many readers, one writer.** Hooks and the dashboard are readers; the indexer is the single writer.
   Postgres handles concurrency natively. SQLite uses WAL + `busy_timeout` and serializes writes through
   the indexer process.
+- **Delivery, not computation, is the success boundary.** Server completions are health telemetry;
+  only a client receipt or explicit fallback is a durable injection record. The dashboard audit view
+  therefore cannot count a result that arrived after its caller abandoned it.
 - **Idempotent everything.** `migrate()` creates extensions/tables/indexes `IF NOT EXISTS`;
   `install-hooks` and `fetch_vendor.ps1` and `install_persistence.ps1` are all safe to re-run.
 - **Path safety.** Every path is `resolve()`d; reads are confined to the configured roots /

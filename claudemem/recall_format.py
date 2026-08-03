@@ -67,6 +67,11 @@ def format_unify(titles_map: dict, cfg: Config, pending_promotions: int = 0) -> 
              'memory hub or `mem facts "<topic>"`).']
     count = 0
     cap = cfg.unify.max_facts
+    char_cap = 9500
+
+    def fits(*candidate: str) -> bool:
+        # Reserve room for a truthful truncation marker and a well-formed closing tag.
+        return len("\n".join([*lines, *candidate])) <= char_cap - 220
 
     if cfg.unify.group_by == "type":
         by_type: dict[str, list] = {}
@@ -77,28 +82,42 @@ def format_unify(titles_map: dict, cfg: Config, pending_promotions: int = 0) -> 
         for gname, facts in groups:
             if count >= cap:
                 break
-            lines.append(f"## {gname} ({len(facts)})")
+            header = f"## {gname} ({len(facts)})"
+            if not fits(header):
+                break
+            lines.append(header)
             for f in facts:
                 if count >= cap:
                     break
-                lines.append(f"- [{f.project}] {f.title}")
+                item = f"- [{f.project}] {f.title}"
+                if not fits(item):
+                    break
+                lines.append(item)
                 count += 1
     else:
         for project, facts in sorted(titles_map.items()):
             if count >= cap:
                 break
-            lines.append(f"## {project} ({len(facts)})")
+            header = f"## {project} ({len(facts)})"
+            if not fits(header):
+                break
+            lines.append(header)
             for f in facts:
                 if count >= cap:
                     break
-                lines.append(f"- [{f.type}] {f.title}")
+                item = f"- [{f.type}] {f.title}"
+                if not fits(item):
+                    break
+                lines.append(item)
                 count += 1
 
     if count < total:
         lines.append(f"TRUNCATED: {count}/{total} facts shown — {total - count} more exist; "
                      'find them with `mem facts "<topic>"` (never assume this map is complete).')
     if pending_promotions:
-        lines.append(f"{pending_promotions} auto-mined promotion candidate(s) await review — "
+        promotion = (f"{pending_promotions} auto-mined promotion candidate(s) await review — "
                      "accept/reject in the memory hub (http://127.0.0.1:7777).")
+        if fits(promotion):
+            lines.append(promotion)
     lines.append("</memory-map>")
-    return "\n".join(lines)[:9500]
+    return "\n".join(lines)

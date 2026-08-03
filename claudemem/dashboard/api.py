@@ -15,12 +15,13 @@ from fastapi.responses import HTMLResponse, JSONResponse
 from sse_starlette.sse import EventSourceResponse
 
 from claudemem.indexer import index as run_index
+from claudemem.config import load_config
 from claudemem.facts import load_note
 from claudemem.log import get_logger
 from claudemem.paths import killed, projects_root, safe_under, set_killed
 from claudemem.recall_format import format_recall, format_unify
 from claudemem.security import redact_secrets
-from claudemem.text import human_age, meaningful_term_count, snippet
+from claudemem.text import human_age, recall_query, should_recall, snippet
 
 log = get_logger(__name__)
 
@@ -36,8 +37,11 @@ router = APIRouter()
 # abandoned (measured p90 107s, max 240s) until the server answered nothing at all. Bounding
 # admission caps the damage, and a server-side deadline stops us computing an answer no client is
 # still waiting for.
-HOOK_CONCURRENCY = int(os.environ.get("CLAUDEMEM_HOOK_CONCURRENCY", "4"))
-HOOK_DEADLINE_S = float(os.environ.get("CLAUDEMEM_HOOK_DEADLINE_S", "12"))
+_delivery_cfg = load_config().delivery
+HOOK_CONCURRENCY = int(os.environ.get("CLAUDEMEM_HOOK_CONCURRENCY",
+                                      str(_delivery_cfg.hook_concurrency)))
+HOOK_DEADLINE_S = float(os.environ.get("CLAUDEMEM_HOOK_DEADLINE_S",
+                                       str(_delivery_cfg.server_deadline_seconds)))
 # A timeout cannot cancel work already running in a Python thread. The former asyncio
 # semaphore was released as soon as wait_for timed out, even though to_thread kept running,
 # so every abandoned request admitted a replacement and the process grew an unbounded queue
@@ -87,7 +91,8 @@ _index_lock = threading.Lock()
 _last_index_started = 0.0
 _last_index_finished = 0.0
 _last_index_error: str | None = None
-_last_retrieval = {"mode": "never", "ts": 0.0, "latency_ms": None}
+_last_retrieval = {"mode": "never", "ts": 0.0, "latency_ms": None, "completed": 0}
+_delivery = {"delivered": 0, "miss": 0, "last": None}
 
 
 def _push(msg: str) -> None:
@@ -196,35 +201,69 @@ async def api_recall(req: Request):
     cfg = st.cfg
     prompt = (body.get("prompt") or "")
     session_id = body.get("session_id")
-    if meaningful_term_count(prompt) < cfg.recall.min_terms:
+    request_id = str(body.get("request_id") or "")[:64]
+    if not should_recall(prompt, cfg.recall.min_terms):
         return {"additionalContext": "", "n_recalled": 0, "n_facts": 0,
                 "retrieval_mode": "skipped"}
+    query = recall_query(prompt, body.get("cwd"))
 
     def work():
         t0 = time.time()
         tier = "full" if cfg.reranker.hot_path else "hot"
-        qv = st.retriever.embed_query(prompt)  # embed once, reuse for chunks + facts
+        qv = st.retriever.embed_query(query)  # embed once, reuse for chunks + facts
         mode = "hybrid" if qv else "keyword-only"
-        results = st.retriever.search(prompt, tier=tier, exclude_session=session_id,
+        results = st.retriever.search(query, tier=tier, exclude_session=session_id,
                                       k=cfg.recall.top_k, qvec=qv)
-        facts = (st.retriever.search_facts(prompt, cfg.recall.facts_k, qvec=qv)
+        facts = (st.retriever.search_facts(query, cfg.recall.facts_k, qvec=qv)
                  if cfg.recall.include_facts else [])
         text = format_recall(results, facts, cfg)
         latency = int((time.time() - t0) * 1000)
-        # Log zero-result misses too — hit-rate is unmeasurable otherwise.
-        try:
-            st.store.log_injection(hook="recall", session_id=session_id, prompt_excerpt=prompt[:200],
-                                   n_recalled=len(results), n_facts=len(facts), chars=len(text),
-                                   latency_ms=latency,
-                                   details={"retrieval_mode": mode, "vector_used": bool(qv)})
-        except Exception:
-            pass
-        _last_retrieval.update(mode=mode, ts=time.time(), latency_ms=latency)
+        # Do not put telemetry writes on the prompt path. Completion and client delivery remain
+        # separate counters in /healthz; the hook receipt is the only durable injection row.
+        _last_retrieval.update(mode=mode, ts=time.time(), latency_ms=latency,
+                               completed=int(_last_retrieval.get("completed") or 0) + 1)
         return {"additionalContext": text, "n_recalled": len(results), "n_facts": len(facts),
-                "latency_ms": latency, "retrieval_mode": mode, "vector_used": bool(qv)}
+                "latency_ms": latency, "retrieval_mode": mode, "vector_used": bool(qv),
+                "request_id": request_id}
 
     return await _bounded("recall", work,
-                          {"additionalContext": "", "n_recalled": 0, "n_facts": 0})
+                          {"additionalContext": "", "n_recalled": 0, "n_facts": 0,
+                           "request_id": request_id})
+
+
+@router.post("/api/delivery")
+async def api_delivery(req: Request):
+    """Persist what a client accepted, separately from what the server computed."""
+    body = await req.json()
+    status = str(body.get("status") or "")
+    client = str(body.get("client") or "hook")
+    kind = str(body.get("kind") or "recall")
+    if (status not in ("delivered", "miss") or client not in ("hook", "mcp")
+            or kind not in ("recall", "unify")):
+        return JSONResponse({"ok": False, "error": "invalid delivery receipt"}, status_code=400)
+    request_id = str(body.get("request_id") or "")[:64]
+    mode = str(body.get("retrieval_mode") or "unknown")[:32]
+    details = {"request_id": request_id, "delivery_status": status, "client": client,
+               "kind": kind,
+               "retrieval_mode": mode, "vector_used": bool(body.get("vector_used"))}
+
+    def persist_receipt():
+        get_state().store.log_injection(
+            hook=f"{client}-{kind}-{status}", session_id=body.get("session_id"),
+            prompt_excerpt=str(body.get("prompt_excerpt") or "")[:200],
+            n_recalled=max(0, int(body.get("n_recalled") or 0)),
+            n_facts=max(0, int(body.get("n_facts") or 0)),
+            chars=max(0, int(body.get("chars") or 0)),
+            latency_ms=max(0, int(body.get("latency_ms") or 0)), details=details,
+        )
+
+    try:
+        await asyncio.wait_for(asyncio.to_thread(persist_receipt), timeout=0.5)
+        _delivery[status] += 1
+        _delivery["last"] = {"ts": time.time(), **details}
+    except Exception as e:
+        return JSONResponse({"ok": False, "error": type(e).__name__}, status_code=503)
+    return {"ok": True, "request_id": request_id}
 
 
 @router.post("/api/unify")
@@ -235,20 +274,15 @@ async def api_unify(req: Request):
     session_id = body.get("session_id")
 
     def work():
+        t0 = time.time()
         tmap = st.store.facts_titles_map()
         try:
             pending = len(st.store.list_promotions("pending"))
         except Exception:
             pending = 0
         text = format_unify(tmap, cfg, pending_promotions=pending)
-        if text:
-            try:
-                st.store.log_injection(hook="unify", session_id=session_id, prompt_excerpt="",
-                                       n_recalled=0, n_facts=sum(len(v) for v in tmap.values()),
-                                       chars=len(text), latency_ms=0)
-            except Exception:
-                pass
-        return {"additionalContext": text}
+        return {"additionalContext": text, "n_facts": sum(len(v) for v in tmap.values()),
+                "latency_ms": int((time.time() - t0) * 1000)}
 
     return await _bounded("unify", work, {"additionalContext": ""})
 
@@ -484,6 +518,7 @@ async def healthz():
     out.update(embedder_available=embedder_available,
                retrieval_mode=("hybrid" if embedder_available else "keyword-only"),
                last_retrieval=dict(_last_retrieval),
+               delivery=dict(_delivery),
                live_index={"running": _index_running,
                            "last_started": _last_index_started,
                            "last_finished": _last_index_finished,
@@ -504,10 +539,24 @@ async def api_stats():
 
 
 # ================= injections (audit window) =================
+_DELIVERY_HOOKS = {
+    "hook-recall-delivered", "hook-recall-miss", "mcp-recall-delivered", "mcp-recall-miss",
+    "hook-unify-delivered", "hook-unify-miss", "recall-fallback", "unify-fallback",
+    "mcp-recall-fallback",
+}
+
+
+def _is_delivery_row(row: dict) -> bool:
+    return row.get("hook") in _DELIVERY_HOOKS
+
+
 @router.get("/api/injections")
 async def api_injections(limit: int = 50):
-    return {"injections": [dict(r, ts=str(r.get("ts"))) for r in
-                           get_state().store.recent_injections(limit)]}
+    # This audit view answers "what reached a client?" Legacy server-side rows predate receipts
+    # and cannot prove delivery, so they remain stored but do not masquerade as injections here.
+    rows = get_state().store.recent_injections(max(limit * 20, limit))
+    delivered = [r for r in rows if _is_delivery_row(r)][:limit]
+    return {"injections": [dict(r, ts=str(r.get("ts"))) for r in delivered]}
 
 
 @router.get("/api/injections/stream")
@@ -515,7 +564,7 @@ async def api_injections_stream():
     async def gen():
         last = None
         while True:
-            rows = get_state().store.recent_injections(1)
+            rows = [r for r in get_state().store.recent_injections(20) if _is_delivery_row(r)]
             if rows and rows[0].get("id") != last:
                 last = rows[0].get("id")
                 import json as _j

@@ -3,6 +3,8 @@ knows what it knows everywhere. Warm server first, local fallback otherwise. Fai
 """
 from __future__ import annotations
 
+import uuid
+
 from _common import call_server, emit_context, read_event, run_failsafe, write_health
 
 EVENT = "SessionStart"
@@ -28,11 +30,23 @@ def main() -> None:
         return
 
     _ensure_server(cfg)
-    res = call_server("/api/unify", {"cwd": cwd, "session_id": session_id, "source": source},
-                      timeout=4.0)
-    if res and res.get("additionalContext"):
-        emit_context(res["additionalContext"], EVENT)
-        write_health(source="server", chars=len(res["additionalContext"]))
+    request_id = uuid.uuid4().hex
+    res = call_server("/api/unify", {"cwd": cwd, "session_id": session_id, "source": source,
+                                     "request_id": request_id},
+                      timeout=cfg.delivery.client_timeout_seconds)
+    if res is not None and not any(res.get(key) for key in ("timeout", "shed", "error")):
+        text = res.get("additionalContext") or ""
+        if text:
+            emit_context(text, EVENT)
+        call_server("/api/delivery", {
+            "request_id": request_id, "client": "hook", "kind": "unify",
+            "status": ("delivered" if text else "miss"), "session_id": session_id,
+            "prompt_excerpt": "", "n_recalled": 0,
+            "n_facts": int(res.get("n_facts") or 0), "chars": len(text),
+            "latency_ms": int(res.get("latency_ms") or 0),
+            "retrieval_mode": "titles-map", "vector_used": False,
+        }, timeout=cfg.delivery.receipt_timeout_seconds)
+        write_health(source="server", chars=len(text))
         return
 
     _local(cfg, session_id)
@@ -109,7 +123,9 @@ def _local(cfg, session_id: str | None) -> None:
     try:
         store.log_injection(hook="unify-fallback", session_id=session_id, prompt_excerpt="",
                             n_recalled=0, n_facts=sum(len(v) for v in tmap.values()),
-                            chars=len(text), latency_ms=0)
+                            chars=len(text), latency_ms=0,
+                            details={"delivery_status": "fallback",
+                                     "retrieval_mode": "titles-map"})
     except Exception:
         pass
     emit_context(text, EVENT)

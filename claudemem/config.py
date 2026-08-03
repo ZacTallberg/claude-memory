@@ -19,6 +19,7 @@ DATA_DIR = ROOT / "data"
 
 @dataclass(frozen=True)
 class ScopeCfg:
+    activation: str
     workspace_roots: tuple[str, ...]
     claude_projects_dir: str
     codex_home: str
@@ -52,6 +53,7 @@ class EmbeddingsCfg:
     dim: int
     query_prefix: str
     doc_prefix: str
+    document_microbatch_size: int
 
 
 @dataclass(frozen=True)
@@ -93,6 +95,15 @@ class UnifyCfg:
 
 
 @dataclass(frozen=True)
+class DeliveryCfg:
+    client_timeout_seconds: float
+    server_deadline_seconds: float
+    receipt_timeout_seconds: float
+    hook_concurrency: int
+    hybrid_slo_ms: int
+
+
+@dataclass(frozen=True)
 class ServerCfg:
     host: str
     port: int
@@ -120,6 +131,7 @@ class Config:
     contextual: ContextualCfg
     recall: RecallCfg
     unify: UnifyCfg
+    delivery: DeliveryCfg
     server: ServerCfg
     index: IndexCfg
 
@@ -130,6 +142,7 @@ class Config:
 
 _DEFAULTS: dict = {
     "scope": {
+        "activation": "installed_clients",
         "workspace_roots": ["C:/code"],
         "claude_projects_dir": str(Path.home() / ".claude" / "projects").replace("\\", "/"),
         "codex_home": str(Path.home() / ".codex").replace("\\", "/"),
@@ -142,7 +155,7 @@ _DEFAULTS: dict = {
         "sqlite": {"path": "data/claudemem.db"},
     },
     "embeddings": {"provider": "local", "model": "BAAI/bge-small-en-v1.5", "dim": 384,
-                   "query_prefix": "", "doc_prefix": ""},
+                   "query_prefix": "", "doc_prefix": "", "document_microbatch_size": 4},
     "reranker": {"enabled": True, "provider": "local", "model": "Xenova/ms-marco-MiniLM-L-6-v2",
                  "hot_path": False, "candidates": 30},
     "contextual": {"enabled": True, "model": "claude-haiku-4-5", "enrich_notes": True,
@@ -150,7 +163,10 @@ _DEFAULTS: dict = {
     "recall": {"top_k": 6, "bm25_k": 40, "vector_k": 40, "rrf_k": 60, "min_terms": 3,
                "max_chars": 8000, "recency_half_life_days": 45.0, "snippet_chars": 600,
                "include_facts": True, "facts_k": 4},
-    "unify": {"max_facts": 120, "group_by": "project"},
+    "unify": {"max_facts": 300, "group_by": "project"},
+    "delivery": {"client_timeout_seconds": 8.0, "server_deadline_seconds": 6.0,
+                 "receipt_timeout_seconds": 0.75, "hook_concurrency": 4,
+                 "hybrid_slo_ms": 3000},
     "server": {"host": "127.0.0.1", "port": 7777, "open_browser": True},
     "index": {"exclude_sidechains": True, "strip_injected": True, "tool_blobs": False,
               "batch_size": 64, "transcript_providers": ["claude", "codex"],
@@ -205,13 +221,20 @@ def load_config() -> Config:
     ct = raw["contextual"]
     rc = raw["recall"]
     un = raw["unify"]
+    dl = raw["delivery"]
     sv = raw["server"]
     ix = raw["index"]
+    client_timeout = max(0.5, float(dl["client_timeout_seconds"]))
+    receipt_timeout = max(0.1, float(dl["receipt_timeout_seconds"]))
+    # Preserve a real fallback/receipt window even when an override is misordered.
+    server_deadline = min(max(0.25, float(dl["server_deadline_seconds"])),
+                          max(0.25, client_timeout - max(1.0, receipt_timeout)))
 
     return Config(
         root=ROOT,
         data_dir=DATA_DIR,
         scope=ScopeCfg(
+            activation=str(s["activation"]),
             workspace_roots=tuple(s["workspace_roots"]),
             claude_projects_dir=s["claude_projects_dir"],
             codex_home=s["codex_home"],
@@ -223,7 +246,8 @@ def load_config() -> Config:
             sqlite=SqliteCfg(path=st["sqlite"]["path"]),
         ),
         embeddings=EmbeddingsCfg(provider=em["provider"], model=em["model"], dim=int(em["dim"]),
-                                 query_prefix=em["query_prefix"], doc_prefix=em["doc_prefix"]),
+                                 query_prefix=em["query_prefix"], doc_prefix=em["doc_prefix"],
+                                 document_microbatch_size=max(1, int(em["document_microbatch_size"]))),
         reranker=RerankerCfg(enabled=_b(rr["enabled"]), provider=rr["provider"], model=rr["model"],
                              hot_path=_b(rr["hot_path"]), candidates=int(rr["candidates"])),
         contextual=ContextualCfg(enabled=_b(ct["enabled"]), model=ct["model"],
@@ -237,6 +261,13 @@ def load_config() -> Config:
                          snippet_chars=int(rc["snippet_chars"]), include_facts=_b(rc["include_facts"]),
                          facts_k=int(rc["facts_k"])),
         unify=UnifyCfg(max_facts=int(un["max_facts"]), group_by=un["group_by"]),
+        delivery=DeliveryCfg(
+            client_timeout_seconds=client_timeout,
+            server_deadline_seconds=server_deadline,
+            receipt_timeout_seconds=receipt_timeout,
+            hook_concurrency=max(1, int(dl["hook_concurrency"])),
+            hybrid_slo_ms=max(100, int(dl["hybrid_slo_ms"])),
+        ),
         server=ServerCfg(host=sv["host"], port=int(sv["port"]), open_browser=_b(sv["open_browser"])),
         index=IndexCfg(exclude_sidechains=_b(ix["exclude_sidechains"]), strip_injected=_b(ix["strip_injected"]),
                        tool_blobs=_b(ix["tool_blobs"]), batch_size=int(ix["batch_size"]),

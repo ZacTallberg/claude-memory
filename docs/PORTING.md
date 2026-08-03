@@ -45,7 +45,8 @@ py -3.12 -m venv .venv
 
 Edit `config.toml`:
 
-- `[scope] workspace_roots` — the roots under which recall/unify activate on the new machine.
+- Keep `[scope] activation = "installed_clients"` for machine-wide Claude/Codex delivery. Configure
+  `workspace_roots` only if you deliberately select the confined activation mode.
 - `[scope] claude_projects_dir` — the new machine's `~/.claude/projects` absolute path.
 - Leave `[store] backend = "sqlite"` pinned. `"auto"` forked the store into two diverging copies
   whenever ParadeDB flapped — that is a repaired outage, not a preference.
@@ -130,11 +131,13 @@ Wire it via `~/.claude/settings.json` → `"statusLine": {"type": "command", "co
                                             # after migration expect zero corpus skips.
 .\mem.cmd stats                             # backend=sqlite, chunk/fact counts match the old box
 curl.exe -s http://127.0.0.1:7777/healthz   # {"ok": true, "store": "ok"}
+.\mem.cmd integrations                      # both known clients fully connected
+.\mem.cmd delivery-check --load             # hybrid SLO + real hooks across unrelated directories
 ```
 
-Then the end-to-end proof: open a Claude Code session under a workspace root, send a real prompt,
+Then the end-to-end proof: open a Claude Code or Codex session in any directory, send a real prompt,
 and confirm (a) a `<recalled-memory>` block appears, (b) the statusline shows `mem ok` (green —
-i.e. `source: "server"`, not fallback), (c) a new row lands in the `injections` table:
+  i.e. `source: "server"`, not fallback), (c) a `hook-recall-delivered` row lands in `injections`:
 
 ```powershell
 .\.venv\Scripts\python.exe -c "import sqlite3; print(sqlite3.connect('data/claudemem.db').execute('select ts, hook, latency_ms from injections order by rowid desc limit 3').fetchall())"

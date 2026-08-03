@@ -43,6 +43,10 @@ class Golden:
     q: str
     expect_sessions: list[str]
     expect_facts: list[str]
+    reject_sessions: list[str]
+    reject_facts: list[str]
+    continuation: bool = False
+    cwd: str | None = None
     note: str = ""
 
 
@@ -61,6 +65,10 @@ def load_golden(path=GOLDEN_PATH) -> list[Golden]:
                 q=d["q"],
                 expect_sessions=[str(s) for s in d.get("expect_sessions", [])],
                 expect_facts=[str(s) for s in d.get("expect_facts", [])],
+                reject_sessions=[str(s) for s in d.get("reject_sessions", [])],
+                reject_facts=[str(s) for s in d.get("reject_facts", [])],
+                continuation=bool(d.get("continuation", False)),
+                cwd=d.get("cwd"),
                 note=d.get("note", ""),
             ))
         except Exception as e:  # noqa: BLE001 - one bad line shouldn't abort the run
@@ -129,19 +137,36 @@ def run_eval() -> dict:
     fact_rr: list[float] = []
     keyword_session_hits = 0
     query_latencies: list[float] = []
+    negative_total = 0
+    negative_violations = 0
+    useful_hits = 0
+    continuation_total = 0
+    continuation_hits = 0
     t0 = time.time()
     for g in golden:
+        from .text import recall_query
+        effective_q = recall_query(g.q, g.cwd)
         q0 = time.perf_counter()
-        qvec = retr.embed_query(g.q)
-        results = retr.search(g.q, tier="hot", k=max(cutoffs), qvec=qvec)
+        qvec = retr.embed_query(effective_q)
+        results = retr.search(effective_q, tier="hot", k=max(cutoffs), qvec=qvec)
         sessions = [r.chunk.session_id for r in results]
-        fact_objs = retr.search_facts(g.q, k=max(cutoffs), qvec=qvec)
+        fact_objs = retr.search_facts(effective_q, k=max(cutoffs), qvec=qvec)
         query_latencies.append((time.perf_counter() - q0) * 1000)
         facts = [f"{f.title} {f.name}" for f in fact_objs]
 
         per = _score_query(g, sessions, facts, cutoffs)
         strict = _score_query(g, sessions, facts, cutoffs, require_all=True)
         rows.append((g.q, per))
+        has_negative = bool(g.reject_sessions or g.reject_facts)
+        negative_hit = (_session_hit(g.reject_sessions, sessions, k)
+                        or _fact_hit(g.reject_facts, facts, k))
+        if has_negative:
+            negative_total += 1
+            negative_violations += int(negative_hit)
+        useful_hits += int(per[k] and not negative_hit)
+        if g.continuation:
+            continuation_total += 1
+            continuation_hits += int(per[k] and not negative_hit)
         for n in cutoffs:
             if per[n]:
                 agg[n] += 1
@@ -154,7 +179,7 @@ def run_eval() -> dict:
         if g.expect_sessions:
             rank = _first_session_rank(g.expect_sessions, sessions)
             session_rr.append(1.0 / rank if rank else 0.0)
-            keyword = retr.search(g.q, tier="hot", k=k, qvec=[], use_vector=False)
+            keyword = retr.search(effective_q, tier="hot", k=k, qvec=[], use_vector=False)
             if _session_hit(g.expect_sessions, [x.chunk.session_id for x in keyword], k):
                 keyword_session_hits += 1
         if g.expect_facts:
@@ -194,6 +219,13 @@ def run_eval() -> dict:
         ordered = sorted(query_latencies)
         p95 = ordered[min(len(ordered) - 1, int(0.95 * len(ordered)))]
         print(f"query latency p50={statistics.median(ordered):.0f}ms p95={p95:.0f}ms")
+    print(f"useful@{k}={useful_hits/n:.3f} (positive target present, rejected target absent)")
+    if negative_total:
+        print(f"negative-judgment safety@{k}={1-(negative_violations/negative_total):.3f} "
+              f"({negative_violations}/{negative_total} violations)")
+    if continuation_total:
+        print(f"continuation usefulness@{k}={continuation_hits/continuation_total:.3f} "
+              f"({continuation_hits}/{continuation_total})")
 
     recall_at_k = overall[k]
 
@@ -210,6 +242,11 @@ def run_eval() -> dict:
         "session_mrr": statistics.fmean(session_rr) if session_rr else None,
         "fact_mrr": statistics.fmean(fact_rr) if fact_rr else None,
         "keyword_session_recall_at_k": (keyword_session_hits / sess_total if sess_total else None),
+        "useful_at_k": useful_hits / n,
+        "negative_safety_at_k": (1 - negative_violations / negative_total
+                                  if negative_total else None),
+        "continuation_usefulness_at_k": (continuation_hits / continuation_total
+                                          if continuation_total else None),
         "sessions": {str(nn): sess_agg[nn] for nn in cutoffs},
         "facts": {str(nn): fact_agg[nn] for nn in cutoffs},
         "elapsed_ms": elapsed_ms,

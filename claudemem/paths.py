@@ -36,7 +36,16 @@ def _norm(p: str | os.PathLike) -> str:
 
 
 def in_scope(cwd: str | None, cfg: Config) -> bool:
-    """True iff cwd resolves under one of the configured workspace roots."""
+    """Whether an installed lifecycle hook should activate for this context.
+
+    ``installed_clients`` is machine-wide by design: the user-level hook registration is the
+    trust boundary, not an arbitrary filesystem prefix. ``workspace_roots`` remains available
+    for deliberately constrained installations and for path-policy regression tests.
+    """
+    if cfg.scope.activation == "installed_clients":
+        return True
+    if cfg.scope.activation != "workspace_roots":
+        return False
     if not cwd:
         return False
     c = _norm(cwd)

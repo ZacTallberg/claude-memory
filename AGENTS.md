@@ -7,8 +7,12 @@ retrieval, or indexing behavior.
 - Hooks are fail-safe: bounded work, exit zero on failure, and never block a prompt.
 - Hybrid/vector delivery is the healthy path. `recall-fallback` is visible keyword-only
   degradation and must never be counted as successful vector recall.
+- Client delivery receipts—not server computation completion—are the success boundary. Keep the
+  installed-client activation machine-wide unless the operator explicitly selects confinement.
 - Keep heavy embedding and reranking models only in the singleton supervised warm server.
   Every per-client MCP process stays lightweight.
+- Prompt-query inference has priority over document indexing; indexing must remain interruptible
+  between small embedding microbatches.
 - Files are source truth; SQLite is a rebuildable derived index. Preserve path confinement,
   partial-line handling, injected-context stripping, and live-session exclusion.
 - Run `mem selftest` before and after changes. All checks must pass. The `tests/` directory is

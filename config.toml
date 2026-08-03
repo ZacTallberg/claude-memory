@@ -2,8 +2,10 @@
 # Secrets (DB password, API keys) come from the environment, never this file.
 
 [scope]
-# Recall/Unify only activate when Claude Code's cwd is under one of these roots.
-# EDIT THIS on a new machine to wherever your projects live.
+# These are user-level hooks installed into trusted local agent clients, so memory is active in
+# every context those clients open (including projectless Codex tasks under Documents). Switch to
+# "workspace_roots" only when deliberately constraining delivery to the roots below.
+activation = "installed_clients" # "installed_clients" | "workspace_roots"
 workspace_roots = ["C:/code"]
 # claude_projects_dir defaults to <home>/.claude/projects — set it here only if yours differs.
 # Codex session rollouts are indexed alongside Claude transcripts. This path defaults to
@@ -29,6 +31,7 @@ model = "BAAI/bge-small-en-v1.5"   # guaranteed in fastembed; upgrade via this k
 dim = 384                   # stored embedding dimension (Matryoshka-truncate if model is larger)
 query_prefix = ""
 doc_prefix = ""
+document_microbatch_size = 4 # yield the serialized ONNX lane to waiting prompt queries frequently
 
 [reranker]
 enabled = true
@@ -58,8 +61,17 @@ include_facts = true
 facts_k = 4
 
 [unify]                     # session start (SessionStart)
-max_facts = 120
+max_facts = 300
 group_by = "project"        # "project" | "type"
+
+[delivery]
+# The server must give up before its caller does, leaving enough time for a keyword fallback and
+# an end-to-end delivery receipt. These are prompt-path budgets, not model-quality settings.
+client_timeout_seconds = 8.0
+server_deadline_seconds = 6.0
+receipt_timeout_seconds = 0.75
+hook_concurrency = 4
+hybrid_slo_ms = 3000
 
 [server]
 host = "127.0.0.1"
