@@ -113,7 +113,8 @@ def index(cfg: Config, store: Store, *, full: bool = False, progress: Progress =
                 unchanged = (not full and existing is not None and existing.mtime is not None
                              and abs(float(existing.mtime) - float(nd.mtime)) < 1e-6
                              and embedding_model
-                             and existing.meta.get("embedding_model") == embedding_model)
+                             and existing.meta.get("embedding_model") == embedding_model
+                             and existing.meta.get("lifecycle_schema") == 1)
                 if unchanged:
                     stats.notes_unchanged += 1
                     continue
@@ -129,7 +130,9 @@ def index(cfg: Config, store: Store, *, full: bool = False, progress: Progress =
                                   description=nd.description, type=nd.type, tags=nd.tags,
                                   origin_session_id=nd.origin_session_id, body=nd.body, embedding=emb,
                                   mtime=nd.mtime, meta={"wikilinks": nd.wikilinks,
-                                                       "embedding_model": embedding_model})
+                                                       "embedding_model": embedding_model,
+                                                       "lifecycle_schema": 1,
+                                                       **nd.lifecycle})
                 stats.notes += 1
             except Exception as e:
                 stats.errors += 1

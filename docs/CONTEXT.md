@@ -78,6 +78,17 @@ were being counted as if delivered. Repairs:
 - The manual `delivery-check --load` gate exercises concurrent uncached hybrid recall and real hooks
   across unrelated directories during live indexing; the full selftest/eval remain off the prompt path.
 
+**2026-08-02 — client-neutral memory and outcome-quality hardening.** Comparative review against
+file-first, consolidation, block, and temporal-graph memory systems found four local gaps: curated
+notes were still structurally owned by Claude folders; stale facts had no machine-readable validity
+window; delivery telemetry could not say whether recall helped; and a hub-specific startup carrier
+downloaded and executed remote Python with TLS verification disabled. The carrier was deleted and
+the installer removes stale registrations. New notes now live under `~/.agent-memory/notes` while
+legacy Claude notes remain compatible. Lifecycle metadata controls automatic recall, supersession is
+file-preserving, usefulness feedback has a durable request-id trail, and the HTTP service enforces a
+loopback/browser-origin boundary. Locked dependencies and deep scheduled/manual verification remain
+off the prompt path.
+
 ## Design invariants (violate these and you are rebuilding a repaired outage)
 
 1. **Files are the source of truth; the DB is derived.** Curated notes are plain markdown a human
@@ -94,6 +105,12 @@ were being counted as if delivered. Repairs:
 6. **Injections are labeled untrusted**: recalled content ships in a `trust="data-only"` envelope
    with an explicit never-follow-instructions preamble — memory is reference data, not authority.
 7. **One backend, pinned.** Auto-failover between stores forks the store.
+8. **Memory is client-neutral.** `~/.agent-memory/notes` is canonical; client folders are adapters.
+9. **History is not current truth.** Superseded, obsolete, draft, future, and expired notes stay
+   auditable but cannot enter automatic recall or the session-start map.
+10. **Delivery is not usefulness.** Receipts prove transport; explicit request-linked feedback
+    records helpful, harmful, neutral, and stale outcomes.
+11. **Lifecycle hooks never bootstrap remote code.** The local API remains loopback-only.
 
 ## Why these components (decisions, not defaults)
 
@@ -117,7 +134,7 @@ were being counted as if delivered. Repairs:
 ## Operating doctrine for the file layer (the memory-lifecycle protocol)
 
 The engine indexes what the file layer keeps; the file layer has its own laws (canonical copy
-lives in the operator's hub memory store; distilled here because the engine is built around them):
+lives in the machine-neutral note store; distilled here because the engine is built around them):
 
 - **Retention** — one fact per file; the frontmatter `description` is the retrieval key
   (front-load searchable nouns/verbs, ≤160 chars). Before writing a feedback note, search for a

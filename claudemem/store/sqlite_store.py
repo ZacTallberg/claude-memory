@@ -146,6 +146,10 @@ class SqliteStore(Store):
                     chars INTEGER, latency_ms INTEGER, details TEXT);
                 CREATE TABLE IF NOT EXISTS metrics(id INTEGER PRIMARY KEY, ts TEXT DEFAULT (datetime('now')),
                     metric TEXT, value REAL, run_id TEXT, details TEXT);
+                CREATE TABLE IF NOT EXISTS memory_feedback(id INTEGER PRIMARY KEY,
+                    ts TEXT DEFAULT (datetime('now')), request_id TEXT NOT NULL, session_id TEXT,
+                    outcome TEXT NOT NULL CHECK(outcome IN ('helpful','neutral','harmful','stale')),
+                    reason TEXT, details TEXT DEFAULT '{}');
                 CREATE TABLE IF NOT EXISTS promotion_candidates(id INTEGER PRIMARY KEY,
                     ts TEXT DEFAULT (datetime('now')), title TEXT, body TEXT, type TEXT, support TEXT,
                     score REAL, status TEXT DEFAULT 'pending');
@@ -153,6 +157,7 @@ class SqliteStore(Store):
                     key TEXT, reason TEXT, chunk_id INTEGER);
                 CREATE TABLE IF NOT EXISTS kv(key TEXT PRIMARY KEY, value TEXT);
                 CREATE INDEX IF NOT EXISTS chunks_session ON chunks(session_id);
+                CREATE INDEX IF NOT EXISTS memory_feedback_request ON memory_feedback(request_id);
             """)
             if self._vec:
                 c.execute(f"CREATE VIRTUAL TABLE IF NOT EXISTS chunks_vec USING vec0(embedding float[{self.dim}]);")
@@ -394,8 +399,11 @@ class SqliteStore(Store):
                 self._conn.commit()
 
     def facts_titles_map(self) -> dict[str, list[Fact]]:
+        from ..lifecycle import fact_is_recallable
         out: dict[str, list[Fact]] = {}
         for f in self.list_facts():
+            if not fact_is_recallable(f):
+                continue
             out.setdefault(f.project, []).append(f)
         return out
 
@@ -468,6 +476,24 @@ class SqliteStore(Store):
             return [dict(r) for r in self._conn.execute(
                 "SELECT * FROM injections ORDER BY ts DESC LIMIT ?", (limit,))]
 
+    def log_memory_feedback(self, *, request_id, outcome, session_id=None, reason="",
+                            details=None) -> int:
+        if outcome not in {"helpful", "neutral", "harmful", "stale"}:
+            raise ValueError("invalid memory feedback outcome")
+        with self._locked():
+            cur = self._conn.execute(
+                "INSERT INTO memory_feedback(request_id,session_id,outcome,reason,details) "
+                "VALUES (?,?,?,?,?)",
+                (request_id, session_id, outcome, reason, json.dumps(details or {})),
+            )
+            self._conn.commit()
+            return int(cur.lastrowid)
+
+    def recent_memory_feedback(self, limit=50) -> list[dict]:
+        with self._locked():
+            return [dict(r) for r in self._conn.execute(
+                "SELECT * FROM memory_feedback ORDER BY ts DESC, id DESC LIMIT ?", (limit,))]
+
     def record_metric(self, metric, value, *, run_id=None, details=None) -> None:
         with self._locked():
             self._conn.execute("INSERT INTO metrics(metric,value,run_id,details) VALUES (?,?,?,?)",
@@ -488,7 +514,8 @@ class SqliteStore(Store):
                     "chunks": n("SELECT count(*) FROM chunks"),
                     "chunks_embedded": n("SELECT count(*) FROM chunks_vec") if self._vec else 0,
                     "facts": n("SELECT count(*) FROM facts"),
-                    "injections": n("SELECT count(*) FROM injections")}
+                    "injections": n("SELECT count(*) FROM injections"),
+                    "feedback": n("SELECT count(*) FROM memory_feedback")}
 
     def kv_get(self, key: str) -> dict | None:
         with self._locked():

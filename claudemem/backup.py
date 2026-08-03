@@ -12,7 +12,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from .config import Config
-from .paths import iter_memory_dirs, safe_under
+from .paths import canonical_memory_root, iter_memory_dirs, safe_under
 from .security import redact_secrets
 
 
@@ -36,10 +36,19 @@ def verify_snapshot(snapshot_dir: Path) -> dict:
             f"declared={sorted(declared)}")
     actual_files = {path.name for path in snapshot_dir.iterdir() if path.is_file()}
     expected_files = declared | {"manifest.json"}
-    if actual_files != expected_files:
+    # A read-only SQLite viewer may create coordination sidecars beside an otherwise immutable
+    # snapshot. They contain no backup payload: accept only these exact names, and only while WAL
+    # is empty. Every declared payload is still hash-verified below; unknown extras remain fatal.
+    allowed_sidecars = {"claudemem.db-shm", "claudemem.db-wal"}
+    unknown_files = actual_files - expected_files - allowed_sidecars
+    missing_files = expected_files - actual_files
+    wal_path = snapshot_dir / "claudemem.db-wal"
+    if wal_path.exists() and wal_path.stat().st_size:
+        raise RuntimeError("backup snapshot has a non-empty SQLite WAL")
+    if unknown_files or missing_files:
         raise RuntimeError(
-            f"backup directory payload set differs: expected={sorted(expected_files)} "
-            f"actual={sorted(actual_files)}")
+            f"backup directory payload set differs: missing={sorted(missing_files)} "
+            f"unknown={sorted(unknown_files)}")
     for name, expected in manifest["sha256"].items():
         path = snapshot_dir / name
         if not path.is_file() or path.stat().st_size <= 0 or _sha256(path) != expected:
@@ -99,7 +108,8 @@ def verify_snapshot(snapshot_dir: Path) -> dict:
             + json.dumps(dict(sorted(secret_counts.items())), sort_keys=True))
     return {"ok": True, "snapshot": str(snapshot_dir), "counts": counts,
             "notes": manifest.get("notes", 0), "created_at": manifest.get("created_at"),
-            "secret_scan": "clean"}
+            "secret_scan": "clean",
+            "benign_sidecars": sorted(actual_files & allowed_sidecars)}
 
 
 def create_backup(cfg: Config, *, if_due: bool = False, retention: int = 14,
@@ -159,15 +169,18 @@ def create_backup(cfg: Config, *, if_due: bool = False, retention: int = 14,
         with zipfile.ZipFile(notes_zip, "w", compression=zipfile.ZIP_DEFLATED,
                              compresslevel=6) as archive:
             for memory_dir in iter_memory_dirs(cfg):
+                family = ("canonical" if safe_under(memory_dir.path, [canonical_memory_root(cfg)])
+                          else "legacy-claude")
                 for note in sorted(memory_dir.path.glob("*.md")):
                     raw = note.read_text(encoding="utf-8", errors="replace")
                     sanitized, findings = redact_secrets(raw)
                     note_redactions.update(finding.kind for finding in findings)
-                    archive.writestr(f"{memory_dir.encoded_dir}/memory/{note.name}", sanitized)
+                    archive.writestr(
+                        f"{family}/{memory_dir.encoded_dir}/memory/{note.name}", sanitized)
                     note_count += 1
 
         manifest = {
-            "format": 1,
+            "format": 2,
             "created_at": datetime.now(timezone.utc).isoformat(),
             "source_db": str(source),
             "embedding_model": cfg.embeddings.model,

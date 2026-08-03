@@ -40,6 +40,12 @@ class FastEmbedProvider(EmbeddingProvider):
         self._lane_busy = False
         self._waiting_queries = 0
         self._document_microbatch_size = cfg.embeddings.document_microbatch_size
+        # Coalesce a burst of distinct hook queries into one ONNX invocation. Without this,
+        # hook_concurrency=4 serialized four single-item inferences and routinely exceeded the
+        # delivery SLO even though the model handles a four-item batch efficiently.
+        self._query_batch_lock = threading.Lock()
+        self._query_batch: list[dict] = []
+        self._query_batch_active = False
         log.info("FastEmbedProvider ready model=%s native_dim=%d use_dim=%d",
                  self.model_name, self._native_dim, self.dim)
 
@@ -74,13 +80,49 @@ class FastEmbedProvider(EmbeddingProvider):
 
     @lru_cache(maxsize=256)
     def _embed_query_cached(self, text: str) -> tuple[float, ...]:
-        """Bounded hot-query cache; immutable values are safe to share across callers."""
-        self._acquire_lane(query=True)
-        try:
-            v = next(iter(self._model.embed([text])))
-        finally:
-            self._release_lane()
-        return tuple(self._post(v))
+        """Bounded cache plus a tiny concurrent-query batching window."""
+        waiter = {"text": text, "event": threading.Event(), "vector": None, "error": None}
+        with self._query_batch_lock:
+            self._query_batch.append(waiter)
+            leader = not self._query_batch_active
+            if leader:
+                self._query_batch_active = True
+
+        if leader:
+            # Concurrent hooks are launched together; six milliseconds is enough for their threads
+            # to join the batch and is negligible beside one ONNX inference.
+            threading.Event().wait(0.006)
+            while True:
+                with self._query_batch_lock:
+                    batch = self._query_batch
+                    self._query_batch = []
+                error = None
+                vectors = []
+                try:
+                    self._acquire_lane(query=True)
+                    try:
+                        vectors = list(self._model.embed([item["text"] for item in batch]))
+                    finally:
+                        self._release_lane()
+                    if len(vectors) != len(batch):
+                        raise RuntimeError("embedding provider returned the wrong batch size")
+                except Exception as exc:  # wake every waiter before propagating
+                    error = exc
+                for index, item in enumerate(batch):
+                    item["error"] = error
+                    if error is None:
+                        item["vector"] = tuple(self._post(vectors[index]))
+                    item["event"].set()
+                with self._query_batch_lock:
+                    if self._query_batch:
+                        continue
+                    self._query_batch_active = False
+                    break
+
+        waiter["event"].wait()
+        if waiter["error"] is not None:
+            raise waiter["error"]
+        return waiter["vector"]
 
     def _acquire_lane(self, *, query: bool) -> None:
         """Acquire one model-inference lane; queued queries jump ahead of documents."""

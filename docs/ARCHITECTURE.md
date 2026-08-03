@@ -177,8 +177,15 @@ supervises all three. See `scripts/persistence_run.ps1` and the README's "Persis
 - **Idempotent everything.** `migrate()` creates extensions/tables/indexes `IF NOT EXISTS`;
   `install-hooks` and `fetch_vendor.ps1` and `install_persistence.ps1` are all safe to re-run.
 - **Path safety.** Every path is `resolve()`d; reads are confined to the configured roots /
-  `claude_projects_dir`; note writes are confined to a chosen `.../memory/` dir; traversal is rejected.
+  canonical `memory_root` or compatible legacy Claude roots; note writes are one-level and atomic;
+  traversal is rejected.
 - **Secrets.** DB password and API keys come from the environment only — never config, never logs.
+- **Temporal truth.** Markdown frontmatter carries status, validity, confidence, provenance, and
+  supersession. Inactive history remains inspectable but is filtered before automatic delivery.
+- **Outcome telemetry.** Delivery receipts measure transport; request-linked usefulness feedback
+  measures whether memory helped, harmed, or was stale.
+- **Local service boundary.** The API refuses remote binds/peers and hostile browser origins. Hooks
+  execute only checked-in local scripts and never fetch bootstrap code.
 
 ---
 

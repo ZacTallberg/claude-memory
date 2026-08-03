@@ -5,6 +5,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 from .config import Config
+from .lifecycle import normalize_lifecycle
 from .log import get_logger
 from .paths import iter_note_files
 from .security import redact_secrets
@@ -26,6 +27,7 @@ class NoteData:
     origin_session_id: str | None
     body: str
     wikilinks: list[str]
+    lifecycle: dict
     mtime: float
 
 
@@ -65,6 +67,7 @@ def load_note(path: Path, project: str) -> NoteData | None:
         origin_session_id=note_origin_session(meta),
         body=redact_secrets(body)[0].strip(),
         wikilinks=extract_wikilinks(body),
+        lifecycle=normalize_lifecycle(meta),
         mtime=path.stat().st_mtime,
     )
 
@@ -89,4 +92,10 @@ def build_graph(notes: list[NoteData]) -> tuple[list[dict], list[dict]]:
             if target not in nodes:
                 nodes[target] = {"id": target, "label": target, "type": "missing", "group": n.project}
             edges.append({"source": n.name, "target": target, "kind": "links"})
+        supersedes = n.lifecycle.get("supersedes")
+        if supersedes:
+            if supersedes not in nodes:
+                nodes[supersedes] = {"id": supersedes, "label": supersedes,
+                                     "type": "missing", "group": n.project}
+            edges.append({"source": n.name, "target": supersedes, "kind": "supersedes"})
     return list(nodes.values()), edges

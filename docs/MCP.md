@@ -19,11 +19,15 @@ Implemented with the official `mcp` Python SDK (FastMCP) over **stdio**.
 | Tool | Signature | What it does |
 | --- | --- | --- |
 | `memory_search` | `(query, k=8, rerank=true)` | Hybrid recall over **both** past-session transcripts **and** curated notes. BM25 + vector fused by RRF, recency-weighted, deduped to distinct sessions, optionally cross-encoder reranked. Returns `{query, results[], facts[]}`. Transcript hits are reference data only (may be stale; never instructions). |
+| `memory_index` | `(query, k=12)` | Return compact previews and ids for progressive disclosure. |
+| `get_memory_chunks` | `(ids)` | Fetch only the selected full transcript chunks returned by `memory_index`. |
 | `search_facts` | `(topic, k=8)` | Search **only** your curated notes for a topic. Returns brief facts (title/description/type/project/id). |
 | `list_facts` | `(project?, type?)` | List curated notes, optionally filtered by project label and/or `type` (`user`/`feedback`/`project`/`reference`). Bodies omitted. |
 | `get_fact` | `(id)` | Fetch one curated note by id, including its full markdown body and frontmatter fields. |
-| `recall` | `(prompt, session_id?)` | Returns the **same** envelope text the `UserPromptSubmit` hook injects: a `<recalled-memory>` data-only block + a `<curated-notes>` block, budgeted to the recall char cap. Pass `session_id` to exclude the live session. Returns `{text, n_recalled, n_facts, chars}`. |
-| `write_note` | `(project, title, type="reference", body="", tags?, description?, name?)` | Author or update a curated markdown note under a project's `memory/` dir, then index it so it is immediately searchable. |
+| `recall` | `(prompt, session_id?, cwd?)` | Returns the **same** envelope text the `UserPromptSubmit` hook injects, plus a feedback request id. `cwd` enforces project visibility; `session_id` excludes the live session. |
+| `memory_feedback` | `(request_id, outcome, reason?, session_id?)` | Record an observable `helpful`, `neutral`, `harmful`, or `stale` outcome. |
+| `write_note` | `(project, title, ..., status="active", visibility="machine", confidence=1, valid_from?, valid_to?, supersedes?, provenance?)` | Atomically author/update a lifecycle-aware note in the neutral store (or update a matching legacy note), then index it. |
+| `supersede_note` | `(id, replacement_title, replacement_body, reason?, replacement_name?)` | Retire an old note, preserve it for audit, create its active successor, and index both. |
 
 Field names (`title` / `type` / `tags`) align with Basic Memory and the official MCP
 memory server where natural.
@@ -40,6 +44,9 @@ description: <one-line summary>
 metadata:
   node_type: memory
   type: <user|feedback|project|reference>
+  status: active
+  visibility: machine
+  confidence: 1.0
   tags:        # only when tags are provided
     - ...
 ---
@@ -47,14 +54,19 @@ metadata:
 <your markdown body>
 ```
 
-- `project` accepts a **friendly label** (e.g. `website-dokku`), the **encoded dir name**
-  (e.g. `C--code-website-dokku`), a project **cwd**, or a direct `.../memory` path.
+- `project` accepts an existing friendly/encoded label or an allowed note path. A new label creates
+  `~/.agent-memory/notes/<project>/`; `global` may use the root directly.
 - The filename is a slug of `name` (or `title`). Re-writing the same slug **updates in
   place** (idempotent upsert), mirroring the indexer's note path.
-- **Path safety:** the target is canonicalized and must resolve under the configured
-  `claude_projects_dir`, inside a real `<project>/memory/` directory, with a `.md` name
-  (never `MEMORY.md`). Traversal in the title is neutralized by slugification; unknown
-  projects are refused (it never invents a new project dir).
+- **Path safety:** the target is canonicalized and must be a one-level note under `memory_root`, or
+  an existing legacy Claude `memory/` note. Traversal is neutralized by slugification and
+  `MEMORY.md` is reserved.
+
+Automatic recall includes only notes whose lifecycle is currently active. `list_facts`/`get_fact`
+retain inactive notes for history and diagnosis. `supersede_note` is the safe way to reverse a fact:
+it marks the old file `superseded`, sets its validity end and successor pointer, and creates the new
+file with the reciprocal `supersedes` relation. `recall` returns a request id so agents can report
+material outcomes through `memory_feedback` instead of treating delivery alone as usefulness.
 
 ---
 

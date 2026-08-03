@@ -4,9 +4,13 @@ from __future__ import annotations
 import re
 from pathlib import Path
 
+import yaml
+
 from claudemem.config import Config
 from claudemem.facts import load_note
-from claudemem.paths import iter_memory_dirs
+from claudemem.note_io import atomic_write_text
+from claudemem.paths import canonical_memory_root, is_curated_note_path, iter_memory_dirs
+from claudemem.security import redact_secrets
 from claudemem.store.base import Store
 
 
@@ -22,20 +26,27 @@ def accept_candidate(cfg: Config, store: Store, pid: int, project: str | None = 
     target = None
     if project:
         target = next((d.path for d in dirs if d.project == project), None)
-    if target is None and dirs:
-        target = dirs[0].path
     if target is None:
-        store.update_promotion(pid, "accepted")
+        root = canonical_memory_root(cfg)
+        target = root if not project or project == "global" else root / _slug(project)
+    target.mkdir(parents=True, exist_ok=True)
+    safe_title = redact_secrets(str(cand["title"]))[0]
+    safe_body = redact_secrets(str(cand["body"]))[0]
+    fp = Path(target) / f"promoted_{_slug(safe_title)}.md"
+    if not is_curated_note_path(fp, cfg):
         return
-    fp = Path(target) / f"promoted_{_slug(cand['title'])}.md"
-    fp.write_text(
-        f"---\nname: {cand['title']}\ndescription: {cand['title']}\n"
-        f"metadata:\n  type: {cand.get('type', 'reference')}\n  source: claude-memory-promotion\n---\n\n"
-        f"{cand['body']}\n", encoding="utf-8")
+    front = {"name": safe_title, "title": safe_title, "description": safe_title,
+             "metadata": {"node_type": "memory", "type": cand.get("type", "reference"),
+                          "status": "active", "visibility": "machine", "confidence": 0.8,
+                          "provenance": "promotion-review"}}
+    frontmatter = yaml.safe_dump(front, sort_keys=False, allow_unicode=True,
+                                 default_flow_style=False)
+    atomic_write_text(fp, f"---\n{frontmatter}---\n\n{safe_body}\n")
     nd = load_note(fp, project or "code")
     if nd:
         store.upsert_fact(path=nd.path, project=nd.project, name=nd.name, title=nd.title,
                           description=nd.description, type=nd.type, tags=nd.tags,
                           origin_session_id=nd.origin_session_id, body=nd.body, embedding=None,
-                          mtime=nd.mtime, meta={"wikilinks": nd.wikilinks})
+                          mtime=nd.mtime, meta={"wikilinks": nd.wikilinks,
+                                               "lifecycle_schema": 1, **nd.lifecycle})
     store.update_promotion(pid, "accepted")

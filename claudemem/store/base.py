@@ -143,6 +143,12 @@ class Store(ABC):
     @abstractmethod
     def recent_injections(self, limit: int = 50) -> list[dict]: ...
     @abstractmethod
+    def log_memory_feedback(self, *, request_id: str, outcome: str,
+                            session_id: str | None = None, reason: str = "",
+                            details: dict | None = None) -> int: ...
+    @abstractmethod
+    def recent_memory_feedback(self, limit: int = 50) -> list[dict]: ...
+    @abstractmethod
     def record_metric(self, metric: str, value: float, *, run_id: str | None = None,
                       details: dict | None = None) -> None: ...
     @abstractmethod
@@ -151,7 +157,7 @@ class Store(ABC):
     # --- misc ---
     @abstractmethod
     def counts(self) -> dict:
-        """{'sources','chunks','chunks_embedded','facts','injections',...}"""
+        """{'sources','chunks','chunks_embedded','facts','injections','feedback',...}"""
     @abstractmethod
     def kv_get(self, key: str) -> dict | None: ...
     @abstractmethod

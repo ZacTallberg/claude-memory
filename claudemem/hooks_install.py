@@ -25,7 +25,11 @@ def _cmd(script: str) -> str:
     return f'"{_py()}" "{str(_HOOKS_DIR / script).replace(chr(92), "/")}"'
 
 
-_OUR_SCRIPTS = ("recall.py", "unify.py", "index_trigger.py", "fleet_autoenroll.py")
+_ACTIVE_SCRIPTS = ("recall.py", "unify.py", "index_trigger.py")
+# Recognize and remove the retired carrier from existing user settings. It is intentionally
+# absent from _desired and from the repository, but cleanup must survive one upgrade cycle.
+_LEGACY_SCRIPTS = ("fleet_autoenroll.py",)
+_OUR_SCRIPTS = _ACTIVE_SCRIPTS + _LEGACY_SCRIPTS
 
 
 def _is_ours(entry: dict) -> bool:
@@ -47,10 +51,6 @@ def _desired() -> dict:
         "SessionStart": [
             {"matcher": m, "hooks": [{"type": "command", "command": _cmd("unify.py"), "timeout": 30}]}
             for m in ("startup", "resume", "clear", "compact")
-        ] + [
-            # Fleet carrier (isolated, stdlib, fail-safe): enrolls an un-enrolled Vigor
-            # fleet machine from the hub's open bootstrap; instant no-op everywhere else.
-            {"matcher": "startup", "hooks": [{"type": "command", "command": _cmd("fleet_autoenroll.py"), "timeout": 90}]}
         ],
         "SessionEnd": [
             {"matcher": "", "hooks": [{"type": "command", "command": _cmd("index_trigger.py"), "timeout": 10}]}

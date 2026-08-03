@@ -126,6 +126,10 @@ def _synthetic_note(tmpdir: Path) -> Path:
         "description: How the recall envelope respects the character cap.\n"
         "metadata:\n"
         "  type: feedback\n"
+        "  status: active\n"
+        "  visibility: machine\n"
+        "  confidence: 0.9\n"
+        "  valid_from: 2026-01-01T00:00:00Z\n"
         "  originSessionId: sess-xyz\n"
         "  tags: [recall, budget]\n"
         "---\n"
@@ -164,7 +168,7 @@ def run_selftest(verbose: bool = True) -> bool:
 
     # -- 1. config loads with the required shape -----------------------------
     def c_config():
-        ok = (cfg.scope.workspace_roots and cfg.embeddings.dim > 0
+        ok = (cfg.scope.workspace_roots and cfg.scope.memory_root and cfg.embeddings.dim > 0
               and cfg.scope.activation in ("installed_clients", "workspace_roots")
               and cfg.recall.max_chars <= 10000 and cfg.store.backend in ("auto", "postgres", "sqlite")
               and cfg.delivery.server_deadline_seconds < cfg.delivery.client_timeout_seconds)
@@ -238,6 +242,9 @@ def run_selftest(verbose: bool = True) -> bool:
         provider._lane_busy = False
         provider._waiting_queries = 0
         provider._document_microbatch_size = 1
+        provider._query_batch_lock = threading.Lock()
+        provider._query_batch = []
+        provider._query_batch_active = False
         provider._dpref = ""
         provider._qpref = ""
         provider.dim = 2
@@ -260,6 +267,43 @@ def run_selftest(verbose: bool = True) -> bool:
             f"inference_order={order}")
     ctx.check("embedding lane yields live indexing to waiting prompt queries",
               c_embedding_query_priority)
+
+    def c_embedding_query_batching():
+        import threading
+        from .providers.local_fastembed import FastEmbedProvider
+
+        batches: list[list[str]] = []
+
+        class FakeModel:
+            def embed(self, texts):
+                batches.append(list(texts))
+                return iter([[1.0, 0.0] for _ in texts])
+
+        provider = FastEmbedProvider.__new__(FastEmbedProvider)
+        provider._model = FakeModel()
+        provider._lane = threading.Condition()
+        provider._lane_busy = False
+        provider._waiting_queries = 0
+        provider._query_batch_lock = threading.Lock()
+        provider._query_batch = []
+        provider._query_batch_active = False
+        provider._qpref = ""
+        provider.dim = 2
+        barrier = threading.Barrier(4)
+        vectors: list[list[float]] = []
+
+        def query(i):
+            barrier.wait()
+            vectors.append(provider.embed_query(f"concurrent-query-{i}"))
+
+        threads = [threading.Thread(target=query, args=(i,), daemon=True) for i in range(4)]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(3)
+        return (len(vectors) == 4 and len(batches) == 1 and len(batches[0]) == 4,
+                f"onnx_batches={[len(batch) for batch in batches]} for {len(vectors)} queries")
+    ctx.check("concurrent hook queries coalesce into one ONNX batch", c_embedding_query_batching)
 
     # -- chunking on a synthetic oversized turn -----------------------------
     def c_chunking():
@@ -348,9 +392,136 @@ def run_selftest(verbose: bool = True) -> bool:
             nd = load_note(p, "synthetic-project")
         return (nd is not None and nd.title == "Synthetic Character Cap"
                 and nd.type == "feedback" and nd.origin_session_id == "sess-xyz"
-                and "recall-hook" in nd.wikilinks and "recall" in nd.tags,
+                and "recall-hook" in nd.wikilinks and "recall" in nd.tags
+                and nd.lifecycle["status"] == "active"
+                and nd.lifecycle["visibility"] == "machine"
+                and nd.lifecycle["confidence"] == 0.9,
                 f"type={nd.type if nd else None} links={nd.wikilinks if nd else None}")
-    ctx.check("curated note parse: nested type, origin, wikilinks, tags", c_note_parse)
+    ctx.check("curated note parse: fields, lifecycle, provenance links", c_note_parse)
+
+    def c_note_lifecycle():
+        from .lifecycle import fact_is_active, fact_is_recallable, normalize_lifecycle
+        from .store.base import Fact
+        base = dict(id=1, path="p", project="global", name="n", title="n",
+                    description="", type="reference", tags=[], origin_session_id=None, body="")
+        active = Fact(**base, meta=normalize_lifecycle({"metadata": {"status": "active"}}))
+        stale = Fact(**base, meta=normalize_lifecycle({"metadata": {
+            "status": "active", "valid_to": "2020-01-01T00:00:00Z"}}))
+        retired = Fact(**base, meta=normalize_lifecycle({"metadata": {"status": "superseded"}}))
+        private = Fact(**base, meta=normalize_lifecycle({"metadata": {
+            "status": "active", "visibility": "private"}}))
+        scoped = Fact(**base, meta=normalize_lifecycle({"metadata": {
+            "status": "active", "visibility": "project"}}))
+        uncertain = Fact(**base, meta=normalize_lifecycle({"metadata": {
+            "status": "active", "confidence": 0.2}}))
+        return (fact_is_active(active) and not fact_is_active(stale)
+                and not fact_is_active(retired) and not fact_is_recallable(private)
+                and fact_is_recallable(scoped, project="global")
+                and not fact_is_recallable(scoped, project="another")
+                and not fact_is_recallable(uncertain),
+                "temporal and visibility rules constrain automatic recall")
+    ctx.check("temporal lifecycle and visibility constrain automatic recall", c_note_lifecycle)
+
+    def c_neutral_note_roots():
+        from dataclasses import replace
+        from .paths import iter_note_files
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            neutral = root / "agent-notes"
+            (neutral / "alpha").mkdir(parents=True)
+            (neutral / "global.md").write_text("global", encoding="utf-8")
+            (neutral / "alpha" / "alpha.md").write_text("alpha", encoding="utf-8")
+            legacy = root / "claude-projects"
+            old = legacy / "C--code-legacy" / "memory"
+            old.mkdir(parents=True)
+            (old / "old.md").write_text("old", encoding="utf-8")
+            test_cfg = replace(cfg, scope=replace(
+                cfg.scope, memory_root=str(neutral), claude_projects_dir=str(legacy),
+                include_legacy_claude_notes=True))
+            found = {(path.name, project) for path, project in iter_note_files(test_cfg)}
+        expected = {("global.md", "global"), ("alpha.md", "alpha"), ("old.md", "legacy")}
+        return found == expected, f"found={sorted(found)}"
+    ctx.check("agent-neutral note root coexists with legacy Claude notes", c_neutral_note_roots)
+
+    def c_local_http_boundary():
+        from .local_security import is_loopback_host, is_safe_origin
+        ok = (is_loopback_host("127.0.0.1") and is_loopback_host("::1")
+              and is_loopback_host("localhost") and not is_loopback_host("0.0.0.0")
+              and not is_loopback_host("192.168.1.10")
+              and is_safe_origin("http://127.0.0.1:7777")
+              and not is_safe_origin("https://attacker.example"))
+        return ok, "loopback accepted; LAN bind and cross-origin browser access rejected"
+    ctx.check("local HTTP boundary rejects remote bind and hostile origins", c_local_http_boundary)
+
+    def c_feedback_roundtrip():
+        from dataclasses import replace
+        from .store.sqlite_store import SqliteStore
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            test_cfg = replace(
+                cfg, root=root, data_dir=root,
+                store=replace(cfg.store, backend="sqlite",
+                              sqlite=replace(cfg.store.sqlite, path=str(root / "feedback.db"))))
+            test_store = SqliteStore(test_cfg)
+            test_store.connect()
+            try:
+                test_store.migrate()
+                fid = test_store.log_memory_feedback(
+                    request_id="selftest-request", outcome="helpful", reason="resolved ambiguity")
+                rows = test_store.recent_memory_feedback(5)
+                count = test_store.counts().get("feedback")
+            finally:
+                test_store.close()
+        return (fid > 0 and count == 1 and rows[0]["outcome"] == "helpful",
+                f"feedback_id={fid} count={count}")
+    ctx.check("memory usefulness feedback persists and is observable", c_feedback_roundtrip)
+
+    def c_mcp_note_supersession():
+        from dataclasses import replace
+        from .lifecycle import fact_is_active
+        from .store.sqlite_store import SqliteStore
+        from .store import factory
+        from .mcp import server as mcp_server
+
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            neutral = root / "agent-notes"
+            test_cfg = replace(
+                cfg, root=root, data_dir=root,
+                scope=replace(cfg.scope, memory_root=str(neutral),
+                              claude_projects_dir=str(root / "legacy")),
+                store=replace(cfg.store, backend="sqlite",
+                              sqlite=replace(cfg.store.sqlite, path=str(root / "notes.db"))))
+            test_store = SqliteStore(test_cfg)
+            test_store.connect(); test_store.migrate()
+            previous = (factory._singleton, mcp_server._cfg, mcp_server._keyword_retriever,
+                        mcp_server._warm_post)
+            factory._singleton = test_store
+            mcp_server._cfg = test_cfg
+            mcp_server._keyword_retriever = None
+            mcp_server._warm_post = lambda *args, **kwargs: None
+            try:
+                made = mcp_server.write_note(
+                    "alpha", "Current endpoint", body="Use endpoint v1.",
+                    provenance="selftest")
+                changed = mcp_server.supersede_note(
+                    made.get("fact_id"), "Current endpoint v2", "Use endpoint v2.",
+                    reason="v1 was retired")
+                facts = test_store.list_facts(project="alpha")
+            finally:
+                (factory._singleton, mcp_server._cfg, mcp_server._keyword_retriever,
+                 mcp_server._warm_post) = previous
+                test_store.close()
+        active = [f for f in facts if fact_is_active(f)]
+        retired = [f for f in facts if (f.meta or {}).get("status") == "superseded"]
+        ok = (made.get("ok") and changed.get("ok") and len(facts) == 2
+              and len(active) == 1 and len(retired) == 1
+              and active[0].meta.get("supersedes") == retired[0].name
+              and retired[0].meta.get("superseded_by") == active[0].name)
+        return ok, (f"created={made.get('ok')} superseded={changed.get('ok')} "
+                    f"active={len(active)} retired={len(retired)}")
+    ctx.check("MCP note writes are neutral, atomic, and preserve supersession history",
+              c_mcp_note_supersession)
 
     # -- meaningful_term_count gating ---------------------------------------
     def c_terms():
@@ -514,10 +685,10 @@ def run_selftest(verbose: bool = True) -> bool:
         facts = [Fact(id=1, path="p", project="claude-memory", name="n", title="Char Cap",
                       description="how the cap works", type="feedback", tags=[],
                       origin_session_id=None, body="body")]
-        text = format_recall(results, facts, cfg)
+        text = format_recall(results, facts, cfg, request_id="selftest-receipt")
         ok = (len(text) <= cfg.recall.max_chars and len(text) <= 10000
               and '<recalled-memory trust="data-only">' in text
-              and "<curated-notes" in text)
+              and "<curated-notes" in text and "memory-recall-id:selftest-receipt" in text)
         return ok, f"len={len(text)} <= max_chars={cfg.recall.max_chars}"
     ctx.check("recall envelope formats + respects char cap (<=10000)", c_envelope_cap)
 
@@ -656,8 +827,12 @@ def run_selftest(verbose: bool = True) -> bool:
             # seed a pre-existing unrelated setting + a foreign hook to prove preservation
             tmp.write_text(json.dumps({
                 "model": "opus",
-                "hooks": {"UserPromptSubmit": [
-                    {"matcher": "", "hooks": [{"type": "command", "command": "other-tool.py"}]}]},
+                "hooks": {
+                    "UserPromptSubmit": [
+                        {"matcher": "", "hooks": [{"type": "command", "command": "other-tool.py"}]}],
+                    "SessionStart": [
+                        {"matcher": "startup", "hooks": [{"type": "command",
+                         "command": "C:/code/claude-memory/hooks/fleet_autoenroll.py"}]}]},
             }), encoding="utf-8")
             try:
                 hooks_install.SETTINGS = tmp
@@ -678,11 +853,14 @@ def run_selftest(verbose: bool = True) -> bool:
         starts_ok = {e.get("matcher") for e in h.get("SessionStart", [])
                      if hooks_install._is_ours(e)} >= {"startup", "resume", "clear", "compact"}
         idempotent = len(ours) == 1  # exactly one of our recall entries despite two installs
+        no_fleet = not any("fleet_autoenroll.py" in x.get("command", "")
+                           for e in h.get("SessionStart", []) for x in e.get("hooks", []))
         preserved = data.get("model") == "opus" and foreign_kept
-        return (events_ok and starts_ok and idempotent and preserved,
+        return (events_ok and starts_ok and idempotent and no_fleet and preserved,
                 f"events_ok={events_ok} starts_ok={starts_ok} idempotent={idempotent} "
-                f"foreign_kept={foreign_kept}")
-    ctx.check("install-hooks: valid + idempotent + preserves existing (on a copy)", c_install_hooks)
+                f"legacy_carrier_removed={no_fleet} foreign_kept={foreign_kept}")
+    ctx.check("install-hooks is idempotent, preserves foreign hooks, removes retired carrier",
+              c_install_hooks)
 
     # -- uninstall-hooks removes only our entries (on the same copy) --------
     def c_uninstall_hooks():
@@ -761,7 +939,8 @@ def run_selftest(verbose: bool = True) -> bool:
             (memory / "note.md").write_text("durable note\n", encoding="utf-8")
             test_cfg = replace(
                 cfg, data_dir=root / "data",
-                scope=replace(cfg.scope, claude_projects_dir=str(projects)),
+                scope=replace(cfg.scope, claude_projects_dir=str(projects),
+                              memory_root=str(root / "agent-notes")),
                 store=replace(cfg.store, backend="sqlite",
                               sqlite=replace(cfg.store.sqlite, path=str(db))),
             )
@@ -769,6 +948,16 @@ def run_selftest(verbose: bool = True) -> bool:
             checked = verify_snapshot(Path(made["snapshot"]))
             due = create_backup(test_cfg, if_due=True, retention=2)
             snapshot = Path(made["snapshot"])
+            (snapshot / "claudemem.db-shm").write_bytes(b"coordination only")
+            (snapshot / "claudemem.db-wal").write_bytes(b"")
+            benign_sidecars_accepted = verify_snapshot(snapshot).get("ok") is True
+            (snapshot / "claudemem.db-wal").write_bytes(b"uncommitted payload")
+            nonempty_wal_rejected = False
+            try:
+                verify_snapshot(snapshot)
+            except RuntimeError as exc:
+                nonempty_wal_rejected = "non-empty SQLite WAL" in str(exc)
+            (snapshot / "claudemem.db-wal").write_bytes(b"")
             payload = snapshot / "claudemem.db"
             held = snapshot / "claudemem.db.held"
             payload.rename(held)
@@ -781,9 +970,11 @@ def run_selftest(verbose: bool = True) -> bool:
                 held.rename(payload)
         ok = (made.get("created") and checked.get("ok") and checked.get("notes") == 1
               and due.get("created") is False and checked["counts"]["chunks"] == 1
-              and checked.get("secret_scan") == "clean" and missing_rejected)
+              and checked.get("secret_scan") == "clean" and benign_sidecars_accepted
+              and nonempty_wal_rejected and missing_rejected)
         return ok, (f"created={made.get('created')} verified={checked.get('ok')} "
-                    f"due_skipped={not due.get('created')} missing_rejected={missing_rejected}")
+                    f"due_skipped={not due.get('created')} sidecars_safe={benign_sidecars_accepted} "
+                    f"wal_rejected={nonempty_wal_rejected} missing_rejected={missing_rejected}")
     ctx.check("SQLite and curated-note backup is atomic, checksummed, verified, and debounced",
               c_verified_backup)
 

@@ -80,9 +80,12 @@ def _local_keyword(cfg, prompt: str, session_id: str | None, *, cwd: str | None,
     query = recall_query(prompt, cwd)
     results = r.search(query, tier="hot", exclude_session=session_id,
                        k=cfg.recall.top_k, do_rerank=False)
-    facts = r.search_facts(query, cfg.recall.facts_k) if cfg.recall.include_facts else []
+    from claudemem.paths import project_from_cwd
+    facts = (r.search_facts(query, cfg.recall.facts_k, automatic=True,
+                            project=project_from_cwd(cwd))
+             if cfg.recall.include_facts else [])
     # Log even a zero-result miss — recall hit-rate is unmeasurable otherwise.
-    text = format_recall(results, facts, cfg) if (results or facts) else ""
+    text = format_recall(results, facts, cfg, request_id=request_id) if (results or facts) else ""
     try:
         store.log_injection(hook="recall-fallback", session_id=session_id,
                             prompt_excerpt=prompt[:200], n_recalled=len(results),

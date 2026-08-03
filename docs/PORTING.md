@@ -17,7 +17,8 @@ The engine is more than this repo. On a configured machine the install consists 
 | venv + package | `<repo>/.venv` | step 2 |
 | derived DB (chunks, facts, injections, metrics, promotion queue, anti-memory) | `<repo>/data/claudemem.db` | copied from old machine, or rebuilt |
 | embedding model cache | `<repo>/.fastembed_cache/` | auto-downloaded on first embed (~130 MB, needs internet once) |
-| curated note stores (**the source of truth**) | `~/.claude/projects/<store>/memory/*.md` + `MEMORY.md` per store | copied from old machine |
+| canonical curated notes (**the source of truth**) | `~/.agent-memory/notes/*.md` and `~/.agent-memory/notes/<project>/*.md` | copied from old machine |
+| legacy curated notes (compatible input) | `~/.claude/projects/<store>/memory/*.md` | copied during migration until consolidated |
 | raw transcripts (optional reindex source) | `~/.claude/projects/<store>/*.jsonl` | copied only if you want transcript-derived recall rebuilt from source |
 | hook wiring | `~/.claude/settings.json` (UserPromptSubmit → `hooks/recall.py`; SessionStart startup/resume/clear → `hooks/unify.py`; SessionEnd + PreCompact → `hooks/index_trigger.py`) | `mem install-hooks` (regenerates absolute paths from the repo's location — never copy these entries between machines) |
 | supervisor | Scheduled Task `ClaudeMemoryPersistence` → `scripts/persistence_run.ps1` | `install_persistence.ps1` (elevated) |
@@ -47,6 +48,7 @@ Edit `config.toml`:
 
 - Keep `[scope] activation = "installed_clients"` for machine-wide Claude/Codex delivery. Configure
   `workspace_roots` only if you deliberately select the confined activation mode.
+- `[scope] memory_root` — the new machine's agent-neutral `~/.agent-memory/notes` path.
 - `[scope] claude_projects_dir` — the new machine's `~/.claude/projects` absolute path.
 - Leave `[store] backend = "sqlite"` pinned. `"auto"` forked the store into two diverging copies
   whenever ParadeDB flapped — that is a repaired outage, not a preference.
@@ -58,14 +60,17 @@ prunes facts whose backing file is absent from disk — run it against a copied 
 stores missing and it will wipe the facts index it was supposed to serve.
 
 ```powershell
-# 4a. curated note stores (source of truth) — every per-project store you care about
+# 4a. canonical curated notes (source of truth)
+robocopy \\old\c$\Users\<olduser>\.agent-memory\notes $env:USERPROFILE\.agent-memory\notes /E
+
+# 4b. legacy curated note stores still being migrated
 robocopy \\old\c$\Users\<olduser>\.claude\projects $env:USERPROFILE\.claude\projects /E /XF *.jsonl
 
-# 4b. the derived DB — carries transcript-derived memory the new machine cannot rebuild
+# 4c. the derived DB — carries transcript-derived memory the new machine cannot rebuild
 #     (it has no old transcripts), plus injections history, metrics, promotion queue, anti-memory
 robocopy \\old\C$\code\claude-memory\data C:\code\claude-memory\data claudemem.db
 
-# 4c. (optional, heavy) raw transcripts, only if you want reindex-from-source ability
+# 4d. (optional, heavy) raw transcripts, only if you want reindex-from-source ability
 #     — drop the /XF *.jsonl filter in 4a instead
 ```
 

@@ -90,6 +90,10 @@ class PostgresStore(Store):
             c.execute("""CREATE TABLE IF NOT EXISTS metrics(id bigserial PRIMARY KEY,
                          ts timestamptz DEFAULT now(), metric text, value double precision,
                          run_id text, details jsonb);""")
+            c.execute("""CREATE TABLE IF NOT EXISTS memory_feedback(id bigserial PRIMARY KEY,
+                         ts timestamptz DEFAULT now(), request_id text NOT NULL, session_id text,
+                         outcome text NOT NULL CHECK(outcome IN ('helpful','neutral','harmful','stale')),
+                         reason text, details jsonb DEFAULT '{}');""")
             c.execute("""CREATE TABLE IF NOT EXISTS promotion_candidates(id bigserial PRIMARY KEY,
                          ts timestamptz DEFAULT now(), title text, body text, type text,
                          support jsonb, score double precision, status text DEFAULT 'pending');""")
@@ -107,6 +111,7 @@ class PostgresStore(Store):
             c.execute("""CREATE INDEX IF NOT EXISTS facts_vec ON facts
                          USING hnsw (embedding vector_cosine_ops);""")
             c.execute("CREATE INDEX IF NOT EXISTS chunks_session ON chunks(session_id);")
+            c.execute("CREATE INDEX IF NOT EXISTS memory_feedback_request ON memory_feedback(request_id);")
 
     def health(self) -> dict:
         try:
@@ -305,8 +310,11 @@ class PostgresStore(Store):
             c.execute("DELETE FROM facts WHERE path=%s", (path,))
 
     def facts_titles_map(self) -> dict[str, list[Fact]]:
+        from ..lifecycle import fact_is_recallable
         out: dict[str, list[Fact]] = {}
         for f in self.list_facts():
+            if not fact_is_recallable(f):
+                continue
             out.setdefault(f.project, []).append(f)
         return out
 
@@ -378,6 +386,21 @@ class PostgresStore(Store):
             c.execute("SELECT * FROM injections ORDER BY ts DESC LIMIT %s", (limit,))
             return [dict(r) for r in c.fetchall()]
 
+    def log_memory_feedback(self, *, request_id, outcome, session_id=None, reason="",
+                            details=None) -> int:
+        if outcome not in {"helpful", "neutral", "harmful", "stale"}:
+            raise ValueError("invalid memory feedback outcome")
+        with self._lock, self._cur() as c:
+            c.execute("""INSERT INTO memory_feedback(request_id,session_id,outcome,reason,details)
+                         VALUES (%s,%s,%s,%s,%s) RETURNING id""",
+                      (request_id, session_id, outcome, reason, Json(details or {})))
+            return c.fetchone()["id"]
+
+    def recent_memory_feedback(self, limit=50) -> list[dict]:
+        with self._lock, self._cur() as c:
+            c.execute("SELECT * FROM memory_feedback ORDER BY ts DESC, id DESC LIMIT %s", (limit,))
+            return [dict(r) for r in c.fetchall()]
+
     def record_metric(self, metric, value, *, run_id=None, details=None) -> None:
         with self._lock, self._cur() as c:
             c.execute("INSERT INTO metrics(metric,value,run_id,details) VALUES (%s,%s,%s,%s)",
@@ -395,7 +418,8 @@ class PostgresStore(Store):
                                 (SELECT count(*) FROM chunks) AS chunks,
                                 (SELECT count(*) FROM chunks WHERE embedding IS NOT NULL) AS chunks_embedded,
                                 (SELECT count(*) FROM facts) AS facts,
-                                (SELECT count(*) FROM injections) AS injections""")
+                                (SELECT count(*) FROM injections) AS injections,
+                                (SELECT count(*) FROM memory_feedback) AS feedback""")
             return dict(c.fetchone())
 
     def kv_get(self, key: str) -> dict | None:

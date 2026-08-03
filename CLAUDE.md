@@ -9,3 +9,6 @@ Hard rules:
   test suite; `tests/` is empty.
 - The warm server is the only process that may hold heavy embedding/reranking models. Per-client
   MCP processes must remain thin proxies so a worker fleet cannot multiply model memory.
+- Canonical curated notes live in the client-neutral `~/.agent-memory/notes` tree. Historical
+  Claude memory folders are compatibility inputs. Do not make the harness hub- or client-specific.
+- Lifecycle hooks must never fetch or execute remote code. The dashboard/API is loopback-only.

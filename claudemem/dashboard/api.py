@@ -18,7 +18,7 @@ from claudemem.indexer import index as run_index
 from claudemem.config import load_config
 from claudemem.facts import load_note
 from claudemem.log import get_logger
-from claudemem.paths import killed, projects_root, safe_under, set_killed
+from claudemem.paths import is_curated_note_path, killed, project_from_cwd, set_killed
 from claudemem.recall_format import format_recall, format_unify
 from claudemem.security import redact_secrets
 from claudemem.text import human_age, recall_query, should_recall, snippet
@@ -170,7 +170,10 @@ def _fact_brief(f) -> dict:
             "title": redact_secrets(f.title)[0],
             "description": redact_secrets(f.description)[0],
             "project": f.project, "path": f.path,
-            "tags": f.tags}
+            "tags": f.tags,
+            "lifecycle": {key: (f.meta or {}).get(key) for key in (
+                "status", "visibility", "confidence", "valid_from", "valid_to",
+                "supersedes", "superseded_by", "provenance")}}
 
 
 def _mcp_result(x) -> dict:
@@ -190,6 +193,9 @@ def _mcp_fact(f) -> dict:
         "description": redact_secrets(f.description)[0], "project": f.project,
         "tags": list(f.tags or []), "path": f.path,
         "origin_session_id": f.origin_session_id,
+        "lifecycle": {key: (f.meta or {}).get(key) for key in (
+            "status", "visibility", "confidence", "valid_from", "valid_to",
+            "supersedes", "superseded_by", "provenance")},
     }
 
 
@@ -214,9 +220,11 @@ async def api_recall(req: Request):
         mode = "hybrid" if qv else "keyword-only"
         results = st.retriever.search(query, tier=tier, exclude_session=session_id,
                                       k=cfg.recall.top_k, qvec=qv)
-        facts = (st.retriever.search_facts(query, cfg.recall.facts_k, qvec=qv)
+        facts = (st.retriever.search_facts(
+                 query, cfg.recall.facts_k, qvec=qv, automatic=True,
+                 project=project_from_cwd(body.get("cwd")))
                  if cfg.recall.include_facts else [])
-        text = format_recall(results, facts, cfg)
+        text = format_recall(results, facts, cfg, request_id=request_id)
         latency = int((time.time() - t0) * 1000)
         # Do not put telemetry writes on the prompt path. Completion and client delivery remain
         # separate counters in /healthz; the hook receipt is the only durable injection row.
@@ -327,10 +335,7 @@ async def api_mcp_index_note(req: Request):
         path = Path(str(body.get("path") or "")).resolve()
     except Exception:
         return JSONResponse({"ok": False, "error": "invalid path"}, status_code=400)
-    base = projects_root(st.cfg).resolve()
-    if (not path.is_file() or not safe_under(path, [base])
-            or path.parent.name.lower() != "memory" or path.suffix.lower() != ".md"
-            or path.name.upper() == "MEMORY.MD"):
+    if not path.is_file() or not is_curated_note_path(path, st.cfg):
         return JSONResponse({"ok": False, "error": "refused note path"}, status_code=400)
     project = str(body.get("project") or path.parent.parent.name)
 
@@ -347,7 +352,8 @@ async def api_mcp_index_note(req: Request):
             path=nd.path, project=nd.project, name=nd.name, title=nd.title,
             description=nd.description, type=nd.type, tags=nd.tags,
             origin_session_id=nd.origin_session_id, body=nd.body, embedding=embedding,
-            mtime=nd.mtime, meta={"wikilinks": nd.wikilinks},
+            mtime=nd.mtime, meta={"wikilinks": nd.wikilinks, "lifecycle_schema": 1,
+                                 **nd.lifecycle},
         )
         return {"ok": True, "fact_id": fid, "vector_indexed": embedding is not None}
 
@@ -557,6 +563,28 @@ async def api_injections(limit: int = 50):
     rows = get_state().store.recent_injections(max(limit * 20, limit))
     delivered = [r for r in rows if _is_delivery_row(r)][:limit]
     return {"injections": [dict(r, ts=str(r.get("ts"))) for r in delivered]}
+
+
+@router.get("/api/feedback")
+async def api_feedback(limit: int = 50):
+    rows = get_state().store.recent_memory_feedback(max(1, min(limit, 500)))
+    return {"feedback": [dict(row, ts=str(row.get("ts"))) for row in rows]}
+
+
+@router.post("/api/feedback")
+async def api_feedback_add(req: Request):
+    body = await req.json()
+    request_id = str(body.get("request_id") or "").strip()[:64]
+    outcome = str(body.get("outcome") or "").strip().lower()
+    if not request_id or outcome not in {"helpful", "neutral", "harmful", "stale"}:
+        return JSONResponse({"ok": False, "error": "invalid feedback"}, status_code=400)
+    feedback_id = get_state().store.log_memory_feedback(
+        request_id=request_id, outcome=outcome, session_id=body.get("session_id"),
+        reason=redact_secrets(str(body.get("reason") or ""))[0][:500],
+        details={"client": "http"},
+    )
+    return {"ok": True, "feedback_id": feedback_id, "request_id": request_id,
+            "outcome": outcome}
 
 
 @router.get("/api/injections/stream")

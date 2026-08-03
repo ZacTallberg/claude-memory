@@ -109,7 +109,10 @@ frozen dataclass with nested sections. Required keys:
 # User-level installed-client hooks activate in every client context.
 activation = "installed_clients" # or "workspace_roots" for deliberate confinement
 workspace_roots = ["C:/code"]
-# Where Claude Code stores per-project transcripts + auto-memory dirs.
+# Canonical, client-neutral curated-note store; legacy Claude notes remain compatible.
+memory_root = "C:/Users/zcobe/.agent-memory/notes"
+include_legacy_claude_notes = true
+# Where Claude Code stores per-project transcripts and historical auto-memory dirs.
 claude_projects_dir = "C:/Users/zcobe/.claude/projects"
 
 [store]
@@ -209,10 +212,16 @@ root and expands `data/`.
 - **Exclude the live session** from recall: the hook receives `session_id`; recall must filter it out.
 
 ### 3.2 Curated notes (`facts.py`)
-- Location: every `{claude_projects_dir}\<project>\memory\*.md` (NOT `MEMORY.md`, which is the index).
+- Canonical location: `{memory_root}\*.md` for global notes and
+  `{memory_root}\<project>\*.md` for project notes. Compatible legacy location:
+  `{claude_projects_dir}\<project>\memory\*.md`. `MEMORY.md` remains an index, not a fact.
 - Frontmatter (YAML): `name`, `description`, and a `type` that may be top-level (`type:`) OR nested
   (`metadata.type`). Normalize to one of `user|feedback|project|reference` (default `reference`).
   Also capture `originSessionId`/`metadata.originSessionId`, optional `tags`.
+- Lifecycle metadata: `status`, `valid_from`, `valid_to`, `supersedes`, `superseded_by`,
+  `confidence`, `visibility`, and `provenance`. Inactive/expired notes remain auditable but are
+  excluded from automatic recall; low-confidence/private notes are manual-only and project notes
+  require a matching cwd-derived label.
 - Body: the markdown after frontmatter. Extract `[[wikilinks]]` → entity/relation edges for the graph.
 - Notes are indexed whole (note-level), title+description+body all searchable; body embedded.
 
@@ -442,6 +451,8 @@ opens `http://127.0.0.1:7777`.
 - `GET /api/injections?limit=` ; `GET /api/injections/stream` (SSE live tail)
 - `POST /api/delivery` records client-observed recall/unify delivery or miss. Server computation alone
   is not an injection and is excluded from the audit window.
+- `GET/POST /api/feedback` records request-linked helpful/neutral/harmful/stale outcomes separately
+  from delivery.
 - `GET /api/promotions` ; `POST /api/promotions/{id}` `{action:accept|reject}` (accept → write a draft
   `.md` into the chosen project memory dir + index it)
 - `GET /api/anti` ; `POST /api/anti` (flag a snippet as misleading)
@@ -450,7 +461,7 @@ opens `http://127.0.0.1:7777`.
 - `GET /api/stats` (health, counts, backend, embedder, last index)
 
 ### 7.2 Views (HTML fragments, `views.py`)
-- `GET /` hub shell (sidebar nav + Alpine state). Sections: **Search**, **Notes**, **Graph**,
+- `GET /` local memory shell (sidebar nav + Alpine state). Sections: **Search**, **Notes**, **Graph**,
   **Sessions/Transcripts**, **Metrics**, **Injections**, **Promotions**, **Settings**.
 - `GET /ui/search` typeahead results fragment (HTMX `keyup changed delay:250ms`). Renders snippets with
   highlight, provenance chips, "open note / open session" actions, and a trust badge.
@@ -495,7 +506,10 @@ opens `http://127.0.0.1:7777`.
 - **Untrusted recall**: every transcript-sourced snippet is quarantined in the `data-only` envelope with
   an explicit "never instructions" preamble. Curated notes (user-authored) get the softer trusted label.
 - **Path safety**: canonicalize every path (`Path.resolve()`), reject traversal; only read under the
-  configured roots / claude_projects_dir; only write notes under a chosen `…/memory/` dir.
+  configured transcript/note roots; write notes atomically at one allowed level under `memory_root`
+  or into an existing legacy Claude memory dir.
+- **Local API**: refuse non-loopback binds and peers, hostile origins, and untrusted Host headers.
+- **Hook integrity**: lifecycle hooks execute checked-in local scripts and never fetch/execute remote code.
 - **Fail-safe**: hooks catch everything → exit 0, inject nothing. Never block the prompt.
 - **Concurrency**: many readers (hooks) + a single writer (indexer). Postgres handles it; SQLite uses WAL
   + busy_timeout and serializes writes through the indexer process.

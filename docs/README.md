@@ -1,12 +1,14 @@
 # claude-memory
 
-A local, best-of-breed **agent-memory layer shared by Claude Code and Codex on Windows**. It gives both
-clients a persistent, searchable memory of work across every project on this machine, and
+A local, best-of-breed **machine-wide agent-memory layer on Windows**. Claude Code and Codex have
+automatic lifecycle integrations; any local MCP client can use the same search and curation tools. It gives
+agents a persistent, searchable memory of work across every project on this machine, and
 injects the most relevant past context into each prompt automatically — without sending anything to a
 cloud (recall, indexing, and embeddings all run locally).
 
 > **Files are the source of truth; the database is a rebuildable derived index.** Delete the DB and
-> `mem index` rebuilds it from your Claude Code transcripts and curated notes.
+> `mem index` rebuilds it from agent transcripts and curated notes. New curated notes live under
+> `~/.agent-memory/notes`; historical Claude note folders remain compatible inputs.
 
 ---
 
@@ -45,8 +47,8 @@ claudemem package
 Dashboard (mem serve): FastAPI + HTMX + Alpine + Cytoscape + ECharts, warm models, shares store/retriever.
 ```
 
-The dashboard process is also the **warm server**: it keeps the embedder and store hot so the recall
-hook can stay fast.
+The dashboard process is also the **warm server**: it prewarms the real embedding, BM25, vector, and
+fact-search paths before readiness, then keeps the embedder and store hot so recall stays fast.
 
 ---
 
@@ -60,7 +62,8 @@ backend — the pinned default is sqlite and needs neither. Porting to a new mac
 ```powershell
 # 0. (one time) create + activate a venv and install the package editable
 py -3.12 -m venv .venv
-.\.venv\Scripts\python.exe -m pip install -e .
+.\.venv\Scripts\python.exe -m pip install -r requirements-lock.txt
+.\.venv\Scripts\python.exe -m pip install --no-deps -e .
 
 # 1. (ONLY if you re-pin [store].backend = "postgres") bring ParadeDB up
 # wsl -d Ubuntu -- bash /mnt/c/code/claude-memory/scripts/db.sh up
@@ -129,7 +132,9 @@ Key sections (see `config.toml` for the full annotated set):
 
 - `[scope]` — `activation = "installed_clients"` makes the user-level hook registration the trust
   boundary and enables every client context. The optional `workspace_roots` mode deliberately
-  confines delivery. `claude_projects_dir` and `codex_home` control source discovery, not delivery.
+  confines delivery. `memory_root` is the agent-neutral home for new curated notes;
+  `include_legacy_claude_notes` keeps historical Claude note stores compatible.
+  `claude_projects_dir` and `codex_home` control transcript/legacy discovery, not delivery.
 - `[store]` — `backend` is **pinned to `"sqlite"`**. `"auto"` forked the store into two diverging
   copies whenever ParadeDB flapped (repaired outage — see `docs/CONTEXT.md`); keep it pinned to one
   backend. `[store.postgres]` points at `localhost:55432` for the optional ParadeDB path
@@ -143,7 +148,8 @@ Key sections (see `config.toml` for the full annotated set):
 - `[recall]` / `[unify]` — hot-path and session-start budgets (top-k, char caps, min terms, recency).
 - `[delivery]` — the 8s hook budget, earlier 6s server deadline, receipt budget, concurrency, and
   focused hybrid latency SLO. The server deadline must remain shorter than the client deadline.
-- `[server]` — dashboard host/port (`127.0.0.1:7777`) and `open_browser`.
+- `[server]` — dashboard host/port (`127.0.0.1:7777`) and `open_browser`. The service refuses
+  non-loopback binds, non-loopback peers, hostile browser origins, and untrusted Host headers.
 - `[index]` — `exclude_sidechains`, `strip_injected` (strips our own injected blocks before storing,
   so recall never eats its own tail), batch size.
 
@@ -180,10 +186,17 @@ response, the client posts a delivery receipt. A completed server computation is
 injection by itself. **No hits → emits nothing but records a delivered miss. Any error → bounded local
 keyword fallback, then exit 0.**
 
+Curated notes may declare `status`, `valid_from`, `valid_to`, `supersedes`, `superseded_by`,
+`confidence`, `visibility`, and `provenance` in frontmatter. Expired, draft, obsolete, and superseded
+notes remain auditable but are excluded from automatic recall and the session-start map.
+Private notes are manual-only, project notes require a matching working directory, and confidence
+below 0.5 is manual-only.
+
 **Unify** (`hooks/unify.py`, `SessionStart`): builds a `<memory-map>` of your curated-note titles
 across the whole machine, grouped by project (or type). It attempts the complete catalog and uses a
 truthful `TRUNCATED` marker if the hard character budget prevents it; the XML-like envelope is never
-cut mid-tag. Titles only — full notes are pulled on demand via the hub or `mem facts "<topic>"`.
+cut mid-tag. Titles only — full notes are pulled on demand via memory tools/dashboard or
+`mem facts "<topic>"`.
 
 **Indexing** is incremental: provider adapters normalize Claude and Codex transcripts, tail-reading
 from persisted byte offsets and stopping before half-written lines. The Codex adapter retains only
@@ -213,7 +226,8 @@ embedder status, kill-switch toggle, reindex). The UI is fully offline — all J
 The MCP server (`mcp/server.py`) exposes search/browse/curate tools to MCP-aware clients. Each MCP
 process is a lightweight stdio proxy to the singleton warm vector service, preventing a worker fleet
 from loading one embedding model per worker. It degrades explicitly to local keyword search only when
-the supervised warm service is unavailable.
+the supervised warm service is unavailable. Progressive disclosure (`memory_index` then
+`get_memory_chunks`), temporal supersession, and explicit usefulness feedback are first-class tools.
 
 ---
 
@@ -232,6 +246,9 @@ the supervised warm service is unavailable.
 - `mem delivery-check --load` is the focused operational gate: uncached concurrent hybrid requests
   plus real hooks in unrelated directories while a live index pass runs. These checks are manual/
   deployment-time; none execute on every prompt.
+- `scripts/release_check.ps1` composes compilation, self-test, eval, integration census, and loaded
+  delivery checks. GitHub's `Memory quality (offline)` workflow runs manually and weekly, never on
+  the prompt or merge critical paths.
 
 ---
 

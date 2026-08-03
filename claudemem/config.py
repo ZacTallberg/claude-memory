@@ -21,6 +21,8 @@ DATA_DIR = ROOT / "data"
 class ScopeCfg:
     activation: str
     workspace_roots: tuple[str, ...]
+    memory_root: str
+    include_legacy_claude_notes: bool
     claude_projects_dir: str
     codex_home: str
 
@@ -144,6 +146,8 @@ _DEFAULTS: dict = {
     "scope": {
         "activation": "installed_clients",
         "workspace_roots": ["C:/code"],
+        "memory_root": str(Path.home() / ".agent-memory" / "notes").replace("\\", "/"),
+        "include_legacy_claude_notes": True,
         "claude_projects_dir": str(Path.home() / ".claude" / "projects").replace("\\", "/"),
         "codex_home": str(Path.home() / ".codex").replace("\\", "/"),
     },
@@ -211,6 +215,8 @@ def load_config() -> Config:
         raw["embeddings"]["dim"] = int(env["CLAUDEMEM_EMBED_DIM"])
     if "CLAUDEMEM_CODEX_HOME" in env:
         raw["scope"]["codex_home"] = env["CLAUDEMEM_CODEX_HOME"]
+    if "CLAUDEMEM_MEMORY_ROOT" in env:
+        raw["scope"]["memory_root"] = env["CLAUDEMEM_MEMORY_ROOT"]
 
     pg_pw = env.get("CLAUDEMEM_PG_PASSWORD", "claudemem")
 
@@ -236,6 +242,8 @@ def load_config() -> Config:
         scope=ScopeCfg(
             activation=str(s["activation"]),
             workspace_roots=tuple(s["workspace_roots"]),
+            memory_root=s["memory_root"],
+            include_legacy_claude_notes=_b(s["include_legacy_claude_notes"]),
             claude_projects_dir=s["claude_projects_dir"],
             codex_home=s["codex_home"],
         ),

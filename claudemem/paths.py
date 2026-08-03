@@ -70,6 +70,16 @@ def friendly_project(encoded_dir_name: str) -> str:
     return name or encoded_dir_name
 
 
+def project_from_cwd(cwd: str | None) -> str | None:
+    """Best-effort project label for visibility checks on live prompt delivery."""
+    if not cwd:
+        return None
+    try:
+        return Path(cwd).resolve().name or None
+    except Exception:
+        return Path(str(cwd)).name or None
+
+
 @dataclass(frozen=True)
 class TranscriptFile:
     path: Path
@@ -87,6 +97,19 @@ class MemoryDir:
 
 def projects_root(cfg: Config) -> Path:
     return Path(cfg.scope.claude_projects_dir)
+
+
+def canonical_memory_root(cfg: Config) -> Path:
+    """Agent-neutral source of truth for newly authored curated notes."""
+    return Path(cfg.scope.memory_root)
+
+
+def memory_write_roots(cfg: Config) -> list[Path]:
+    """All roots in which an existing note may be updated safely."""
+    roots = [canonical_memory_root(cfg)]
+    if cfg.scope.include_legacy_claude_notes:
+        roots.append(projects_root(cfg))
+    return roots
 
 
 def iter_transcript_files(cfg: Config) -> list[TranscriptFile]:
@@ -114,15 +137,29 @@ def iter_transcript_files(cfg: Config) -> list[TranscriptFile]:
 
 
 def iter_memory_dirs(cfg: Config) -> list[MemoryDir]:
-    """Every per-project '.../memory' dir that holds curated notes."""
+    """Every curated-note directory, canonical first and legacy Claude dirs second."""
     out: list[MemoryDir] = []
-    base = projects_root(cfg)
-    if not base.exists():
-        return out
-    for proj_dir in sorted(base.iterdir()):
-        mem = proj_dir / "memory"
-        if mem.is_dir():
-            out.append(MemoryDir(path=mem, encoded_dir=proj_dir.name, project=friendly_project(proj_dir.name)))
+    seen: set[str] = set()
+
+    neutral = canonical_memory_root(cfg)
+    if neutral.is_dir():
+        if any(p.is_file() and p.suffix.lower() == ".md" for p in neutral.iterdir()):
+            out.append(MemoryDir(path=neutral, encoded_dir="global", project="global"))
+            seen.add(_norm(neutral))
+        for project_dir in sorted(p for p in neutral.iterdir() if p.is_dir()):
+            out.append(MemoryDir(path=project_dir, encoded_dir=project_dir.name,
+                                 project=project_dir.name))
+            seen.add(_norm(project_dir))
+
+    if cfg.scope.include_legacy_claude_notes:
+        base = projects_root(cfg)
+        if base.exists():
+            for proj_dir in sorted(base.iterdir()):
+                mem = proj_dir / "memory"
+                if mem.is_dir() and _norm(mem) not in seen:
+                    out.append(MemoryDir(path=mem, encoded_dir=proj_dir.name,
+                                         project=friendly_project(proj_dir.name)))
+                    seen.add(_norm(mem))
     return out
 
 
@@ -145,3 +182,20 @@ def safe_under(path: str | os.PathLike, roots: list[str | os.PathLike]) -> bool:
         if p == rr or p.startswith(rr + os.sep):
             return True
     return False
+
+
+def is_curated_note_path(path: str | os.PathLike, cfg: Config) -> bool:
+    """True only for an allowed one-level canonical or legacy curated-note Markdown path."""
+    try:
+        p = Path(path).resolve()
+        neutral = canonical_memory_root(cfg).resolve()
+        legacy = projects_root(cfg).resolve()
+    except Exception:
+        return False
+    if p.suffix.lower() != ".md" or p.name.upper() == "MEMORY.MD":
+        return False
+    if p.parent == neutral or p.parent.parent == neutral:
+        return True
+    return (cfg.scope.include_legacy_claude_notes
+            and p.parent.name.lower() == "memory"
+            and p.parent.parent.parent == legacy)

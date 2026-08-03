@@ -22,6 +22,16 @@ class AppState:
         self.embedder = get_embedding_provider(self.cfg)
         self.reranker = get_reranker(self.cfg)  # cached; cross-encoder loads on first use
         self.retriever = Retriever(self.cfg, self.store, self.embedder, self.reranker)
+        # Touch the real query + SQLite vector/FTS paths before readiness. The model constructor's
+        # tiny probe warms ONNX itself but not the database pages; without this, the first four-way
+        # worker burst after a restart paid paging costs and narrowly missed the delivery SLO.
+        try:
+            warm_query = "shared agent memory retrieval continuity"
+            qvec = self.retriever.embed_query(warm_query)
+            self.retriever.search(warm_query, tier="hot", k=1, do_rerank=False, qvec=qvec)
+            self.retriever.search_facts(warm_query, k=1, qvec=qvec)
+        except Exception as exc:
+            log.warning("AppState retrieval prewarm degraded: %s", exc)
         log.info("AppState warm: backend=%s embedder=%s avail=%s",
                  self.store.name, getattr(self.embedder, "name", "?"), self.embedder.available())
 

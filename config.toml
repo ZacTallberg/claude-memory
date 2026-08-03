@@ -7,10 +7,13 @@
 # "workspace_roots" only when deliberately constraining delivery to the roots below.
 activation = "installed_clients" # "installed_clients" | "workspace_roots"
 workspace_roots = ["C:/code"]
+# Canonical, client-neutral curated-note store defaults to <home>/.agent-memory/notes. Direct .md
+# files are global; each child directory is a project. CLAUDEMEM_MEMORY_ROOT overrides the default.
+# Index and update historical ~/.claude/projects/*/memory notes during migration.
+include_legacy_claude_notes = true
 # claude_projects_dir defaults to <home>/.claude/projects — set it here only if yours differs.
 # Codex session rollouts are indexed alongside Claude transcripts. This path defaults to
 # <home>/.codex and can also be overridden with CLAUDEMEM_CODEX_HOME.
-codex_home = "C:/Users/zcobe/.codex"
 
 [store]
 backend = "sqlite"           # "postgres" | "sqlite" | "auto" — auto forks the store into two diverging copies whenever ParadeDB flaps; keep pinned to one backend

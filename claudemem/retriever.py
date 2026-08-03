@@ -14,6 +14,7 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 
 from .config import Config
+from .lifecycle import fact_is_active, fact_is_recallable
 from .providers.embeddings import EmbeddingProvider, get_embedding_provider
 from .providers.reranker import Reranker, get_reranker
 from .store.base import Chunk, Fact, Store
@@ -139,14 +140,22 @@ class Retriever:
 
     # ---- curated facts ----
     def search_facts(self, query: str, k: int | None = None,
-                     qvec: list[float] | None = None) -> list[Fact]:
+                     qvec: list[float] | None = None, *, automatic: bool = False,
+                     project: str | None = None) -> list[Fact]:
         k = k or self.cfg.recall.facts_k
         if qvec is None:
             qvec = self.embed_query(query)
-        candidates = self.store.search_facts(query, max(k * 3, 12), qvec=qvec)
+        # Fetch beyond the final cap so expired/superseded notes cannot crowd out current ones.
+        candidates = self.store.search_facts(query, max(k * 6, 24), qvec=qvec)
         out: list[Fact] = []
         seen: set[str] = set()
         for fact in candidates:
+            if automatic:
+                eligible = fact_is_recallable(fact, project=project)
+            else:
+                eligible = fact_is_active(fact)
+            if not eligible:
+                continue
             key = " ".join(re.findall(r"[a-z0-9]+", (fact.name or fact.title).lower()))
             if key and key in seen:
                 continue

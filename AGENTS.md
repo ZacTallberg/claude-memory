@@ -13,7 +13,12 @@ retrieval, or indexing behavior.
   Every per-client MCP process stays lightweight.
 - Prompt-query inference has priority over document indexing; indexing must remain interruptible
   between small embedding microbatches.
-- Files are source truth; SQLite is a rebuildable derived index. Preserve path confinement,
-  partial-line handling, injected-context stripping, and live-session exclusion.
+- Files are source truth; SQLite is a rebuildable derived index. The canonical note root is
+  `~/.agent-memory/notes`; Claude project memory dirs are compatibility inputs, never the identity
+  of the system. Preserve lifecycle filtering, path confinement, partial-line handling,
+  injected-context stripping, and live-session exclusion.
+- Never download or execute code from lifecycle hooks. The HTTP service stays loopback-only.
+- Deep verification stays scheduled/manual and off the prompt path; observable usefulness feedback
+  complements delivery receipts.
 - Run `mem selftest` before and after changes. All checks must pass. The `tests/` directory is
   intentionally empty; the self-test is the regression suite.
