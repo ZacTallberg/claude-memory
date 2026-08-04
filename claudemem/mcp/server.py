@@ -449,6 +449,11 @@ def write_note(project: str, title: str, type: str = "reference", body: str = ""
         return {"error": f"could not resolve a memory dir for project {project!r}",
                 "hint": "pass a known project label, encoded dir name, cwd, or .../memory path",
                 "known_projects": [m.project for m in iter_memory_dirs(cfg)]}
+    # Resolve BEFORE the containment compare: an existing project dir comes back from
+    # iter_memory_dirs unresolved, and on Windows a root containing an 8.3 short segment
+    # (e.g. %TEMP% under ZACHAR~1.OBE) then never equals the resolved target's parent —
+    # the second-and-later writes to a project were refused as "invalid note filename".
+    mem_dir = mem_dir.resolve()
 
     slug = _slug(name or title)
     if not slug:
