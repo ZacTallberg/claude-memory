@@ -1,4 +1,5 @@
-# claude-memory configuration. Built-in defaults < this file < CLAUDEMEM_* env vars.
+# claude-memory configuration. Built-in defaults < this file < config.local.toml (gitignored,
+# per-machine sizing) < CLAUDEMEM_* env vars.
 # Secrets (DB password, API keys) come from the environment, never this file.
 
 [scope]

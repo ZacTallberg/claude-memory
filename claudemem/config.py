@@ -211,6 +211,13 @@ def load_config() -> Config:
     if CONFIG_PATH.exists():
         with open(CONFIG_PATH, "rb") as f:
             raw = _deep_merge(raw, tomllib.load(f))
+    # Machine-local overlay (gitignored): per-box sizing — a 64GB workstation and a RAM-starved
+    # laptop cannot share one tracked config, and a locally edited config.toml fights every pull.
+    # Precedence: defaults < config.toml < config.local.toml < CLAUDEMEM_* env vars.
+    local = CONFIG_PATH.with_name("config.local.toml")
+    if local.exists():
+        with open(local, "rb") as f:
+            raw = _deep_merge(raw, tomllib.load(f))
 
     # Environment overrides (highest precedence) for the keys most likely to vary.
     env = os.environ
