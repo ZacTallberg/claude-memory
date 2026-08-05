@@ -9,7 +9,7 @@ import json
 import shutil
 from pathlib import Path
 
-from .config import ROOT
+from .config import ROOT, load_config
 
 HOOKS_FILE = Path.home() / ".codex" / "hooks.json"
 _HOOKS_DIR = ROOT / "hooks"
@@ -48,10 +48,13 @@ def _handler(script: str, timeout: int, status: str, *, context_limit: int | Non
 
 
 def _desired() -> dict:
+    # The recall envelope is capped at recall.max_chars (recall_format), which machine-local
+    # config overlays may raise — the registered limit must always cover it.
+    recall_limit = load_config().recall.max_chars + 500
     return {
         "UserPromptSubmit": [{
             "hooks": [_handler("recall.py", 15, "Recalling shared local memory",
-                               context_limit=9000)]
+                               context_limit=recall_limit)]
         }],
         "SessionStart": [{
             "matcher": "startup|resume|clear|compact",

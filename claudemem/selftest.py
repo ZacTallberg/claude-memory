@@ -778,19 +778,36 @@ def run_selftest(verbose: bool = True) -> bool:
             if hasattr(store, "_chunk_vector_matrix") and getattr(store, "_vec", False):
                 import sqlite_vec
                 raw = store._read_conn().execute(
-                    "SELECT rowid FROM chunks_vec WHERE embedding MATCH ? ORDER BY distance LIMIT ?",
+                    "SELECT rowid,distance FROM chunks_vec WHERE embedding MATCH ? "
+                    "ORDER BY distance LIMIT ?",
                     (sqlite_vec.serialize_float32(qv), cfg.recall.vector_k)).fetchall()
-                parity = [hit.chunk_id for hit in hits] == [row["rowid"] for row in raw]
+                raw_ids = [row["rowid"] for row in raw]
+                raw_dist = [float(row["distance"]) for row in raw]
+                snap_ids = [hit.chunk_id for hit in hits]
+                snap_dist = [1.0 - hit.score for hit in hits]
+                # Duplicate chunks embed to identical vectors, and the two engines round
+                # float32 distances differently, so ordering inside an exact-tie band is
+                # arbitrary. Parity therefore means: same distance at every rank, and any
+                # membership drift confined to the tie band at the k-th boundary.
+                tol = 1e-3
+                seq_ok = (len(snap_ids) == len(raw_ids)
+                          and all(abs(a - b) <= tol for a, b in zip(snap_dist, raw_dist)))
+                dist_of = {**dict(zip(raw_ids, raw_dist)), **dict(zip(snap_ids, snap_dist))}
+                tail = raw_dist[-1] if raw_dist else 0.0
+                band_ok = all(abs(dist_of[cid] - tail) <= tol
+                              for cid in set(snap_ids) ^ set(raw_ids))
+                parity = seq_ok and band_ok
                 original = store._chunk_vector_snapshot
                 try:
                     store._chunk_vector_snapshot = lambda _conn: (_ for _ in ()).throw(
                         MemoryError("synthetic snapshot failure"))
                     degraded = store.search_vector(qv, cfg.recall.vector_k)
-                    fallback = [hit.chunk_id for hit in degraded] == [row["rowid"] for row in raw]
+                    fallback = [hit.chunk_id for hit in degraded] == raw_ids
                 finally:
                     store._chunk_vector_snapshot = original
             return (len(hits) > 0 and parity and fallback,
-                    f"{len(hits)} vector hits exact_parity={parity} sqlite_fallback={fallback}")
+                    f"{len(hits)} vector hits distance_parity={parity} "
+                    f"sqlite_fallback={fallback}")
         ctx.check("vector search returns hits (populated DB)", c_vec)
 
     # -- hybrid fuse returns hits (real DB) ---------------------------------
