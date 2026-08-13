@@ -99,8 +99,29 @@ def index(cfg: Config, store: Store, *, full: bool = False, progress: Progress =
             log.exception("transcript index failed: %s (%s)", tf.path, e)
 
     # --- curated notes (facts) ---
+    # The note phase (parse every note, cross-note conflict analysis, two list_facts() passes over
+    # a multi-GB store, and a full graph rewrite) ran on EVERY live-sync pass — every 60s, almost
+    # always reporting notes_unchanged=N and changing nothing. It shared the store lock and the
+    # single ONNX lane with prompt recall, which is why the same query cost ~1.8s in an idle
+    # process and ~5.5s inside the server, pushing 56% of prompts past the delivery deadline. A
+    # stat-only fingerprint skips the whole phase when the notes provably have not changed.
     notes = []
+    notes_changed = True
+    fingerprint = None
     if only_provider is None:
+        embedding_model_id = getattr(provider, "name", None) if provider.available() else None
+        try:
+            fingerprint = f"{facts_mod.notes_fingerprint(cfg)}|{embedding_model_id}"
+            previous = (store.kv_get("index:notes_fingerprint") or {}).get("value")
+            notes_changed = full or previous != fingerprint
+        except Exception:
+            notes_changed = True  # never skip on a broken signal; fail toward doing the work
+        if not notes_changed:
+            stats.notes_unchanged = len((store.kv_get("index:notes_fingerprint") or {})
+                                        .get("paths") or [])
+            _emit(progress, "curated notes unchanged; skipping note + graph phase")
+
+    if only_provider is None and notes_changed:
         notes = facts_mod.load_notes(cfg)
         _emit(progress, f"indexing {len(notes)} curated notes...")
         conflicts = find_claim_conflicts(notes)
@@ -172,12 +193,23 @@ def index(cfg: Config, store: Store, *, full: bool = False, progress: Progress =
         log.exception("fact prune failed: %s", e)
 
     # --- graph from wikilinks ---
-    if only_provider is None:
+    # Guarded by notes_changed as well as only_provider: `notes` is empty on a skipped pass, and
+    # replace_graph([], []) would erase the entire graph rather than leave it untouched.
+    if only_provider is None and notes_changed:
         try:
             nodes, edges = facts_mod.build_graph(notes)
             store.replace_graph(nodes, edges)
         except Exception as e:
             log.exception("graph build failed: %s", e)
+
+    # Record the signature only after the phase actually completed, and only if nothing errored —
+    # a failed pass must be retried next cycle, never marked clean.
+    if only_provider is None and notes_changed and fingerprint and not stats.errors:
+        try:
+            store.kv_set("index:notes_fingerprint",
+                         {"value": fingerprint, "paths": [nd.path for nd in notes]})
+        except Exception:
+            log.exception("could not record note fingerprint; next pass will redo the note phase")
 
     # --- embed pending chunks ---
     stats.embedded = embed_pending(cfg, store, provider, progress=progress)
@@ -189,6 +221,17 @@ def index(cfg: Config, store: Store, *, full: bool = False, progress: Progress =
             store.record_metric(m, float(cnt.get(m, 0)))
     except Exception:
         pass
+
+    # --- keep the WAL small so reads stay fast ---
+    # This pass is the writer, so it is the right place to clean up after itself. Left alone the
+    # WAL file grows without bound (60 MB when this was found) and every prompt-path read pays
+    # for it. Only worth doing when this pass actually wrote something.
+    if stats.chunks_added or stats.notes or stats.embedded or stats.notes_pruned:
+        checkpoint = getattr(store, "checkpoint_wal", None)
+        if checkpoint:
+            result = checkpoint()
+            if result and result[0]:  # busy: readers held it open, next pass retries
+                log.debug("wal checkpoint busy: %s", result)
 
     # Review-first consolidation is deliberately off the prompt path. It may draft typed
     # semantic/episodic/procedural candidates after an index pass, but it never writes or activates

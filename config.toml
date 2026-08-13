@@ -36,6 +36,11 @@ dim = 384                   # stored embedding dimension (Matryoshka-truncate if
 query_prefix = ""
 doc_prefix = ""
 document_microbatch_size = 4 # yield the serialized ONNX lane to waiting prompt queries frequently
+# ONNX Runtime intra-op threads (0 = ORT's default). ORT sizes its pool from the core count and
+# spin-waits in it, which is a large LOSS for models this small: measured 2026-08-13 on a 32-core
+# box, embedding one query took 76ms unbounded vs 8ms at 4 threads. It is also why the warm server
+# burned ~10 cores while idle.
+threads = 4
 
 [reranker]
 enabled = true
@@ -43,6 +48,8 @@ provider = "local"          # "local" (fastembed cross-encoder) | "cohere" | "no
 model = "Xenova/ms-marco-MiniLM-L-6-v2"
 hot_path = false            # CPU box: do NOT rerank on the prompt hot path by default
 candidates = 30             # fused candidates to rerank on the full/on-demand path
+threads = 4                 # see [embeddings].threads — reranking 30 candidates measured
+                            # 1462ms at ORT's default vs 478ms at 4 threads
 
 [contextual]
 enabled = false             # Anthropic Contextual Retrieval at index time — needs ANTHROPIC_API_KEY
@@ -84,6 +91,12 @@ server_deadline_seconds = 6.0
 receipt_timeout_seconds = 0.75
 hook_concurrency = 4
 hybrid_slo_ms = 3000
+# Hard wall-clock ceiling the hook process enforces on ITSELF via a watchdog that exits it.
+# Everything above is a target a transient stall can overrun (a measured recall once spent 38.1s
+# against a 20s harness limit, because the keyword FALLBACK — the fast rescue path — is what ran
+# long). This is the only bound that cannot be overrun, so keep it comfortably BELOW the harness
+# hook timeout; the harness must never be the thing that fires.
+hook_budget_seconds = 20.0
 
 [server]
 host = "127.0.0.1"

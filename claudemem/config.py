@@ -56,6 +56,11 @@ class EmbeddingsCfg:
     query_prefix: str
     doc_prefix: str
     document_microbatch_size: int
+    # ONNX Runtime intra-op threads. Left unset, ORT sizes a pool from the core count and
+    # spin-waits in it; on a 32-core box that coordination cost DOMINATES these small models
+    # (measured 2026-08-13: rerank of 30 candidates 1462ms at the default vs 478ms at 4 threads,
+    # and embedding one query 76ms vs 8ms). 0 keeps ORT's default.
+    threads: int
 
 
 @dataclass(frozen=True)
@@ -65,6 +70,7 @@ class RerankerCfg:
     model: str
     hot_path: bool
     candidates: int
+    threads: int  # see EmbeddingsCfg.threads; 0 keeps ORT's default
 
 
 @dataclass(frozen=True)
@@ -111,6 +117,10 @@ class DeliveryCfg:
     receipt_timeout_seconds: float
     hook_concurrency: int
     hybrid_slo_ms: int
+    # Hard wall-clock ceiling a hook process imposes on ITSELF. Every other budget here is a
+    # target that a transient stall can overrun; this one is enforced by a watchdog that exits
+    # the process, so the harness hook timeout can never be reached no matter what is slow.
+    hook_budget_seconds: float
 
 
 @dataclass(frozen=True)
@@ -168,9 +178,10 @@ _DEFAULTS: dict = {
         "sqlite": {"path": "data/claudemem.db"},
     },
     "embeddings": {"provider": "local", "model": "BAAI/bge-small-en-v1.5", "dim": 384,
-                   "query_prefix": "", "doc_prefix": "", "document_microbatch_size": 4},
+                   "query_prefix": "", "doc_prefix": "", "document_microbatch_size": 4,
+                   "threads": 4},
     "reranker": {"enabled": True, "provider": "local", "model": "Xenova/ms-marco-MiniLM-L-6-v2",
-                 "hot_path": False, "candidates": 30},
+                 "hot_path": False, "candidates": 30, "threads": 4},
     "contextual": {"enabled": True, "model": "claude-haiku-4-5", "enrich_notes": True,
                    "enrich_transcripts": False, "max_doc_chars": 60000},
     "consolidation": {"enabled": True, "auto_after_index": True,
@@ -181,7 +192,7 @@ _DEFAULTS: dict = {
     "unify": {"max_facts": 300, "group_by": "project"},
     "delivery": {"client_timeout_seconds": 8.0, "server_deadline_seconds": 6.0,
                  "receipt_timeout_seconds": 0.75, "hook_concurrency": 4,
-                 "hybrid_slo_ms": 3000},
+                 "hybrid_slo_ms": 3000, "hook_budget_seconds": 20.0},
     "server": {"host": "127.0.0.1", "port": 7777, "open_browser": True},
     "index": {"exclude_sidechains": True, "strip_injected": True, "tool_blobs": False,
               "batch_size": 64, "transcript_providers": ["claude", "codex"],
@@ -235,6 +246,10 @@ def load_config() -> Config:
         raw["scope"]["codex_home"] = env["CLAUDEMEM_CODEX_HOME"]
     if "CLAUDEMEM_MEMORY_ROOT" in env:
         raw["scope"]["memory_root"] = env["CLAUDEMEM_MEMORY_ROOT"]
+    # Lets a client be pointed at a different (or deliberately unresponsive) server instance
+    # without editing config — needed to exercise the hook watchdog against a real stall.
+    if "CLAUDEMEM_SERVER_PORT" in env:
+        raw["server"]["port"] = int(env["CLAUDEMEM_SERVER_PORT"])
 
     pg_pw = env.get("CLAUDEMEM_PG_PASSWORD", "claudemem")
 
@@ -254,6 +269,10 @@ def load_config() -> Config:
     # Preserve a real fallback/receipt window even when an override is misordered.
     server_deadline = min(max(0.25, float(dl["server_deadline_seconds"])),
                           max(0.25, client_timeout - max(1.0, receipt_timeout)))
+    # The self-imposed ceiling must never cut off work the ladder below it is still allowed to
+    # do, or the watchdog would kill healthy prompts. Floor it above the server wait plus a
+    # fallback allowance, whatever the file says.
+    hook_budget = max(float(dl["hook_budget_seconds"]), client_timeout + 4.0)
 
     return Config(
         root=ROOT,
@@ -274,9 +293,11 @@ def load_config() -> Config:
         ),
         embeddings=EmbeddingsCfg(provider=em["provider"], model=em["model"], dim=int(em["dim"]),
                                  query_prefix=em["query_prefix"], doc_prefix=em["doc_prefix"],
-                                 document_microbatch_size=max(1, int(em["document_microbatch_size"]))),
+                                 document_microbatch_size=max(1, int(em["document_microbatch_size"])),
+                                 threads=max(0, int(em["threads"]))),
         reranker=RerankerCfg(enabled=_b(rr["enabled"]), provider=rr["provider"], model=rr["model"],
-                             hot_path=_b(rr["hot_path"]), candidates=int(rr["candidates"])),
+                             hot_path=_b(rr["hot_path"]), candidates=int(rr["candidates"]),
+                             threads=max(0, int(rr["threads"]))),
         contextual=ContextualCfg(enabled=_b(ct["enabled"]), model=ct["model"],
                                  enrich_notes=_b(ct["enrich_notes"]),
                                  enrich_transcripts=_b(ct["enrich_transcripts"]),
@@ -299,6 +320,7 @@ def load_config() -> Config:
             receipt_timeout_seconds=receipt_timeout,
             hook_concurrency=max(1, int(dl["hook_concurrency"])),
             hybrid_slo_ms=max(100, int(dl["hybrid_slo_ms"])),
+            hook_budget_seconds=hook_budget,
         ),
         server=ServerCfg(host=sv["host"], port=int(sv["port"]), open_browser=_b(sv["open_browser"])),
         index=IndexCfg(exclude_sidechains=_b(ix["exclude_sidechains"]), strip_injected=_b(ix["strip_injected"]),

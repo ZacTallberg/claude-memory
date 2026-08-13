@@ -13,9 +13,12 @@ class FastEmbedReranker(Reranker):
         from fastembed.rerank.cross_encoder import TextCrossEncoder  # lazy
 
         self.cfg = cfg
-        self._model = TextCrossEncoder(model_name=cfg.reranker.model)
+        # Same ORT oversubscription trap as the embedder, and it bites harder here: reranking is
+        # the dominant hot-path cost (30 candidates measured at 1462ms unbounded vs 478ms at 4).
+        threads = cfg.reranker.threads or None
+        self._model = TextCrossEncoder(model_name=cfg.reranker.model, threads=threads)
         self.name = f"fastembed-rerank:{cfg.reranker.model}"
-        log.info("FastEmbedReranker ready model=%s", cfg.reranker.model)
+        log.info("FastEmbedReranker ready model=%s threads=%s", cfg.reranker.model, threads)
 
     def rerank(self, query: str, items: list[tuple[int, str]], top_n: int) -> list[tuple[int, float]]:
         if not items:

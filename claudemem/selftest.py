@@ -918,6 +918,37 @@ def run_selftest(verbose: bool = True) -> bool:
     else:
         ctx.check("recall hook (subprocess) emits valid additionalContext envelope", c_recall_hook)
 
+    # -- the hook cannot outlive its own budget, whatever stalls ------------
+    def c_recall_watchdog():
+        """Point the hook at a server that accepts and never answers.
+
+        This reproduces the real incident class: not a crash, but an unbounded STALL. Without the
+        watchdog the hook blocks for its full client timeout and then runs an unbounded keyword
+        fallback (one measured run reached 38.1s against a 20s harness limit). With it, the
+        process must exit on its own, cleanly, at its budget — regardless of the stall.
+        """
+        import socket
+        blackhole = socket.socket()
+        blackhole.bind(("127.0.0.1", 0))
+        blackhole.listen(8)  # accept the connection, never write a response
+        port = blackhole.getsockname()[1]
+        budget = 3.0
+        try:
+            rc, elapsed, _ = _run_hook_timed(
+                "recall.py",
+                {"prompt": real_q, "cwd": in_scope_cwd, "session_id": "selftest-watchdog"},
+                extra_env={"CLAUDEMEM_SERVER_PORT": str(port),
+                           "CLAUDEMEM_HOOK_BUDGET_S": str(budget)},
+                timeout=60.0)
+        finally:
+            blackhole.close()
+        ceiling = budget + 4.0  # generous allowance for interpreter startup and imports
+        ok = rc == 0 and elapsed <= ceiling
+        return ok, (f"exited rc={rc} after {elapsed:.1f}s under a {budget:.0f}s budget "
+                    f"(want rc=0 within {ceiling:.0f}s despite an unresponsive server)")
+    ctx.check("hook watchdog bounds an unresponsive server (cannot hit the harness timeout)",
+              c_recall_watchdog)
+
     # -- trivial prompt -> no output ----------------------------------------
     def c_recall_trivial():
         event = {"prompt": "hi the a", "cwd": in_scope_cwd, "session_id": "selftest-live"}
@@ -1400,6 +1431,26 @@ def _run_hook(script: str, event: dict, timeout: float = 30.0) -> str:
         return proc.stdout.decode("utf-8", "replace")
     except subprocess.TimeoutExpired:
         return ""
+
+
+def _run_hook_timed(script: str, event: dict, *, extra_env: dict,
+                    timeout: float = 60.0) -> tuple[int | None, float, str]:
+    """Run a hook and report (returncode, wall seconds, stdout) — None rc means it never exited."""
+    import time as _time
+    hook_path = ROOT / "hooks" / script
+    env = _hook_env()
+    env.update(extra_env)
+    started = _time.time()
+    try:
+        proc = subprocess.run(
+            [sys.executable, str(hook_path)],
+            input=json.dumps(event).encode("utf-8"),
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            cwd=str(ROOT), env=env, timeout=timeout,
+        )
+        return proc.returncode, _time.time() - started, proc.stdout.decode("utf-8", "replace")
+    except subprocess.TimeoutExpired:
+        return None, _time.time() - started, ""
 
 
 def _hook_env() -> dict:

@@ -19,7 +19,10 @@ class FastEmbedProvider(EmbeddingProvider):
 
         self.cfg = cfg
         self.model_name = cfg.embeddings.model
-        self._model = TextEmbedding(model_name=self.model_name)
+        # Bound the ORT intra-op pool: unset, it spin-waits across every core and the coordination
+        # cost dwarfs the actual inference for a model this small (see EmbeddingsCfg.threads).
+        threads = cfg.embeddings.threads or None
+        self._model = TextEmbedding(model_name=self.model_name, threads=threads)
         # Probe native dimension once.
         probe = np.asarray(next(iter(self._model.passage_embed(["probe"]))), dtype=np.float32)
         self._native_dim = int(probe.shape[0])

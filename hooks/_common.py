@@ -23,14 +23,20 @@ def read_event() -> dict:
         return {}
 
 
+# Held while the context envelope is being written, so the watchdog can never tear a
+# half-written JSON line (malformed hook output is worse than no output).
+_emitting = __import__("threading").Lock()
+
+
 def emit_context(text: str, event_name: str) -> None:
     text = (text or "")[:9500]
     if not text.strip():
         return
-    sys.stdout.write(json.dumps({
-        "hookSpecificOutput": {"hookEventName": event_name, "additionalContext": text}
-    }))
-    sys.stdout.flush()
+    with _emitting:
+        sys.stdout.write(json.dumps({
+            "hookSpecificOutput": {"hookEventName": event_name, "additionalContext": text}
+        }))
+        sys.stdout.flush()
 
 
 def call_server(path: str, payload: dict, timeout: float) -> dict | None:
@@ -62,8 +68,63 @@ def write_health(**fields) -> None:
         pass
 
 
+def _budget_seconds() -> float:
+    """Hard ceiling for this hook process. Env wins so a harness can tighten it without config."""
+    raw = os.environ.get("CLAUDEMEM_HOOK_BUDGET_S")
+    if raw:
+        try:
+            return max(1.0, float(raw))
+        except ValueError:
+            pass
+    try:
+        from claudemem.config import load_config
+        return load_config().delivery.hook_budget_seconds
+    except Exception:
+        return 20.0  # loading config is itself work; never let that failure remove the ceiling
+
+
+def _start_watchdog(budget: float) -> None:
+    """Force-exit at `budget` seconds, whatever the hook is doing.
+
+    Every other timeout in this system is a request someone else may overrun: the server's own
+    deadline, a socket timeout, a store lock. Those bound the COMMON case, and a transient stall
+    (a 1.9 GB store checkpointing, a model lane held by indexing, a wedged FS) slips past all of
+    them — one measured recall spent 38.1s against a 20s harness limit. A timer that owns the
+    process is the only bound that cannot be overrun, so the harness-visible failure ("hook timed
+    out") becomes structurally impossible rather than merely unlikely.
+    """
+    import threading
+
+    def bail() -> None:
+        # If the envelope is mid-write, let it finish; a torn JSON line is worse than a late one.
+        _emitting.acquire(timeout=0.5)
+        try:
+            sys.stdout.flush()
+        except Exception:
+            pass
+        os._exit(0)
+
+    t = threading.Timer(budget, bail)
+    t.daemon = True
+    t.start()
+
+
 def run_failsafe(fn) -> None:
-    """Run a hook body; swallow everything; always exit 0 (never block the prompt)."""
+    """Run a hook body; swallow everything; always exit 0 (never block the prompt).
+
+    A bootstrap ceiling is armed FIRST, before the config read that resolves the real one, so a
+    stall inside setup is bounded exactly like a stall inside retrieval. Reading config is itself
+    I/O and must not be the one unguarded step.
+    """
+    import threading
+    boot = threading.Timer(45.0, lambda: os._exit(0))
+    boot.daemon = True
+    boot.start()
+    try:
+        budget = _budget_seconds()
+    finally:
+        boot.cancel()
+    _start_watchdog(budget)
     try:
         fn()
     except Exception:

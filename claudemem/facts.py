@@ -96,6 +96,26 @@ def load_notes(cfg: Config) -> list[NoteData]:
     return out
 
 
+def notes_fingerprint(cfg: Config) -> str:
+    """Cheap stat-only signature of the curated-note set: identity, size, and mtime of each file.
+
+    Parsing 200+ notes, diffing their claims, and rewriting the graph costs seconds; deciding
+    whether any of that is needed costs a stat per file. The signature changes on edit (mtime or
+    size), addition, deletion, and rename, so a match means the note phase provably has no work.
+    """
+    import hashlib
+
+    h = hashlib.sha256()
+    for nf, project in sorted(iter_note_files(cfg), key=lambda item: str(item[0])):
+        try:
+            st = nf.stat()
+            h.update(f"{nf}|{project}|{st.st_size}|{st.st_mtime_ns}\n".encode("utf-8"))
+        except OSError:
+            # An unreadable note must never look identical to a stable one.
+            h.update(f"{nf}|{project}|ERR\n".encode("utf-8"))
+    return h.hexdigest()
+
+
 def _entity_id(value: str) -> str:
     import hashlib
     return "entity:" + hashlib.sha256(value.casefold().encode("utf-8")).hexdigest()[:20]
