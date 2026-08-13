@@ -273,6 +273,14 @@ class SqliteStore(Store):
                     (SELECT rowid FROM chunks_vec) ORDER BY id LIMIT ?""", (limit,)).fetchall()
             return [self._row_to_chunk(r) for r in rows]
 
+    def list_source_paths(self) -> list[str]:
+        """Every indexed source path, so callers can reconcile the index against current scope."""
+        try:
+            with self._locked():
+                return [r[0] for r in self._conn.execute("SELECT path FROM sources").fetchall()]
+        except Exception:
+            return []
+
     def delete_source(self, path: str) -> None:
         removed: list[int] = []
         revision: str | None = None

@@ -137,8 +137,23 @@ def discover_transcripts(cfg: Config, *, only_provider: str | None = None) -> li
             if not isinstance(item, TranscriptFile):
                 log.warning("transcript adapter %s returned a non-TranscriptFile; skipping", name)
                 continue
+            # Enforce scope centrally rather than per adapter: every provider funnels through
+            # here, so an excluded directory cannot re-enter the corpus via a different adapter.
+            if _out_of_scope(item, cfg):
+                continue
             out.append(item)
     return sorted(out, key=lambda item: (item.provider, str(item.path).casefold()))
+
+
+def _out_of_scope(item: TranscriptFile, cfg: Config) -> bool:
+    """Whether this transcript belongs to a project the config excludes from the corpus."""
+    from .paths import is_excluded_project
+    candidates = [item.encoded_dir or "", item.project or ""]
+    try:
+        candidates.append(Path(item.path).parent.name)
+    except Exception:
+        pass
+    return any(is_excluded_project(c, cfg) for c in candidates if c)
 
 
 def adapter_status(cfg: Config) -> list[dict]:

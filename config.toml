@@ -78,6 +78,11 @@ recency_half_life_days = 45
 snippet_chars = 600
 include_facts = true
 facts_k = 4
+# Cross-encoder logit below which a reranked hit does not earn a slot in the prompt. A ms-marco
+# logit is positive when the passage actually answers the query, so 0.0 drops hits the reranker
+# itself judged irrelevant. Found 2026-08-13: queries were delivering 8/8 results at scores of
+# -3.7 to -9.0 — the system had an opinion that they were junk and injected them regardless.
+min_rerank_score = 0.0
 
 [unify]                     # session start (SessionStart)
 max_facts = 300
@@ -110,3 +115,9 @@ tool_blobs = false          # store compact tool summaries, not full tool blobs
 batch_size = 64
 transcript_providers = ["claude", "codex"]  # shared corpus; provider adapters normalize both
 live_interval_seconds = 60  # warm-server incremental sync so active workers can recall one another
+# Encoded project-directory globs (case-insensitive) that are never indexed. Sessions launched
+# from a temp dir — headless harness runs, judge passes, scratch tasks — land in ~/.claude/projects
+# like real work, but they are high-volume and near-identical. Measured 2026-08-13: one such
+# directory was 85.3% of a 251k-chunk corpus and crowded real hits out of every recall.
+exclude_projects = ["*appdata-local-temp*", "*appdata-locallow-temp*", "*-windows-temp*",
+                    "*-var-folders-*", "*-tmp"]

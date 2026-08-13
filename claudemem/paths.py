@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import os
 from dataclasses import dataclass
+from fnmatch import fnmatch
 from pathlib import Path
 
 from .config import Config, ROOT
@@ -112,6 +113,22 @@ def memory_write_roots(cfg: Config) -> list[Path]:
     return roots
 
 
+def is_excluded_project(encoded_dir_name: str, cfg: Config) -> bool:
+    """Whether a project directory is ephemeral scratch rather than real work.
+
+    Sessions launched from a temp directory (headless harness runs, judge passes, scratch tasks)
+    land in ~/.claude/projects like any other project. They are high-volume and near-identical,
+    so they do not merely add noise — they CROWD OUT real memory: measured 2026-08-13, one such
+    directory was 85.3% of a 251k-chunk corpus, and a recall could spend every delivered slot on
+    the same pasted config file. Matching is on the encoded directory name, case-insensitively.
+    """
+    name = encoded_dir_name.casefold()
+    for pattern in cfg.index.exclude_projects:
+        if fnmatch(name, pattern.casefold()):
+            return True
+    return False
+
+
 def iter_transcript_files(cfg: Config) -> list[TranscriptFile]:
     """All configured agent transcripts, tagged for provider-specific parsing."""
     out: list[TranscriptFile] = []
@@ -121,6 +138,8 @@ def iter_transcript_files(cfg: Config) -> list[TranscriptFile]:
         if base.exists():
             for proj_dir in sorted(base.iterdir()):
                 if not proj_dir.is_dir():
+                    continue
+                if is_excluded_project(proj_dir.name, cfg):
                     continue
                 label = friendly_project(proj_dir.name)
                 for jf in sorted(proj_dir.glob("*.jsonl")):

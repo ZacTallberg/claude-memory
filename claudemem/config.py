@@ -102,6 +102,11 @@ class RecallCfg:
     snippet_chars: int
     include_facts: bool
     facts_k: int
+    # Cross-encoder logit below which a reranked hit is NOT worth a slot in the prompt. The
+    # reranker already judged these irrelevant (a ms-marco logit is positive when the passage
+    # answers the query); injecting them anyway spends context on noise and teaches the reader
+    # that recalled memory is usually junk. Only applied to reranked scores, never to RRF.
+    min_rerank_score: float
 
 
 @dataclass(frozen=True)
@@ -138,6 +143,7 @@ class IndexCfg:
     batch_size: int
     transcript_providers: tuple[str, ...]
     live_interval_seconds: int
+    exclude_projects: tuple[str, ...]
 
 
 @dataclass(frozen=True)
@@ -188,7 +194,7 @@ _DEFAULTS: dict = {
                       "min_interval_hours": 24.0, "candidate_cap": 15},
     "recall": {"top_k": 6, "bm25_k": 40, "vector_k": 40, "rrf_k": 60, "min_terms": 3,
                "max_chars": 8000, "recency_half_life_days": 45.0, "snippet_chars": 600,
-               "include_facts": True, "facts_k": 4},
+               "include_facts": True, "facts_k": 4, "min_rerank_score": 0.0},
     "unify": {"max_facts": 300, "group_by": "project"},
     "delivery": {"client_timeout_seconds": 8.0, "server_deadline_seconds": 6.0,
                  "receipt_timeout_seconds": 0.75, "hook_concurrency": 4,
@@ -196,7 +202,11 @@ _DEFAULTS: dict = {
     "server": {"host": "127.0.0.1", "port": 7777, "open_browser": True},
     "index": {"exclude_sidechains": True, "strip_injected": True, "tool_blobs": False,
               "batch_size": 64, "transcript_providers": ["claude", "codex"],
-              "live_interval_seconds": 60},
+              "live_interval_seconds": 60,
+              # Encoded project-dir globs never worth indexing. Temp-dir sessions are harness
+              # scratch, not work worth remembering.
+              "exclude_projects": ["*appdata-local-temp*", "*appdata-locallow-temp*",
+                                   "*-windows-temp*", "*-var-folders-*", "*-tmp"]},
 }
 
 
@@ -312,7 +322,8 @@ def load_config() -> Config:
                          max_chars=int(rc["max_chars"]),
                          recency_half_life_days=float(rc["recency_half_life_days"]),
                          snippet_chars=int(rc["snippet_chars"]), include_facts=_b(rc["include_facts"]),
-                         facts_k=int(rc["facts_k"])),
+                         facts_k=int(rc["facts_k"]),
+                         min_rerank_score=float(rc["min_rerank_score"])),
         unify=UnifyCfg(max_facts=int(un["max_facts"]), group_by=un["group_by"]),
         delivery=DeliveryCfg(
             client_timeout_seconds=client_timeout,
@@ -326,5 +337,6 @@ def load_config() -> Config:
         index=IndexCfg(exclude_sidechains=_b(ix["exclude_sidechains"]), strip_injected=_b(ix["strip_injected"]),
                        tool_blobs=_b(ix["tool_blobs"]), batch_size=int(ix["batch_size"]),
                        transcript_providers=tuple(ix["transcript_providers"]),
-                       live_interval_seconds=max(0, int(ix["live_interval_seconds"]))),
+                       live_interval_seconds=max(0, int(ix["live_interval_seconds"])),
+                       exclude_projects=tuple(ix["exclude_projects"])),
     )

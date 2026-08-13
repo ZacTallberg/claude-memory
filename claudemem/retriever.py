@@ -138,12 +138,35 @@ class Retriever:
         if want_rerank and self.reranker.available():
             cand = deduped[: self.cfg.reranker.candidates]
             items = [(cid, self._rerank_text(chunks[cid])) for cid, _w, _f in cand]
-            ranked = self.reranker.rerank(query, items, top_n=k)
+            # Ask for more than k: the floor and duplicate collapse below both discard rows, and
+            # without headroom a query would deliver fewer than the k it was asked for.
+            ranked = self.reranker.rerank(query, items, top_n=max(k * 3, k))
             results = [Result(chunk=chunks[cid], score=s, fused=fused[cid], reranked=True)
                        for cid, s in ranked]
+            results = [r for r in results if r.score >= self.cfg.recall.min_rerank_score]
         else:
-            results = [Result(chunk=chunks[cid], score=w, fused=f) for cid, w, f in deduped[:k]]
-        return results
+            results = [Result(chunk=chunks[cid], score=w, fused=f) for cid, w, f in deduped]
+        return self._collapse_duplicates(results)[:k]
+
+    @staticmethod
+    def _collapse_duplicates(results: list[Result]) -> list[Result]:
+        """Keep one row per distinct body of text.
+
+        Session-level dedup above assumes one session contributes one idea, but the same text
+        recurs ACROSS sessions — a repeated harness prompt, a pasted config, a heartbeat block.
+        Measured 2026-08-13: 81.7% of the corpus was exact duplicates, and a single query could
+        spend all 8 delivered slots on one config file repeated 8 times (identical scores are the
+        tell). Collapsing by content keeps the best-scoring copy and frees the rest for real hits.
+        """
+        out: list[Result] = []
+        seen: set[str] = set()
+        for r in results:
+            key = " ".join((r.chunk.content or "").split())[:400].casefold()
+            if key in seen:
+                continue
+            seen.add(key)
+            out.append(r)
+        return out
 
     @staticmethod
     def _rerank_text(ch: Chunk) -> str:

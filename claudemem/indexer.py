@@ -13,6 +13,7 @@ from .chunking import chunk_text, estimate_tokens
 from .config import Config
 from .log import get_logger
 from .memory_types import conflict_index, find_claim_conflicts
+from .paths import is_excluded_project
 from .providers.contextual import Contextualizer
 from .providers.embeddings import EmbeddingProvider, get_embedding_provider
 from .store.base import Store
@@ -30,6 +31,7 @@ class IndexStats:
     notes: int = 0
     notes_unchanged: int = 0
     notes_pruned: int = 0
+    sources_pruned: int = 0
     embedded: int = 0
     candidates_drafted: int = 0
     errors: int = 0
@@ -97,6 +99,31 @@ def index(cfg: Config, store: Store, *, full: bool = False, progress: Progress =
         except Exception as e:
             stats.errors += 1
             log.exception("transcript index failed: %s (%s)", tf.path, e)
+
+    # --- drop sources that are no longer in scope ---
+    # Making exclude_projects self-enforcing: a directory added to that list must actually leave
+    # the corpus, or the noise it was written to stop keeps winning slots forever. The trigger is
+    # an explicit config list matched against a source's own directory name (deterministic, not
+    # inferred), and chunks are a rebuildable index over transcripts that are left untouched on
+    # disk — so this reconciles scope, it does not destroy anything the user authored.
+    if only_provider is None:
+        try:
+            lister = getattr(store, "list_source_paths", None)
+            if lister:
+                dropped = 0
+                for src in lister():
+                    try:
+                        parent = Path(src).parent.name
+                    except Exception:
+                        continue
+                    if parent and is_excluded_project(parent, cfg):
+                        store.delete_source(src)
+                        dropped += 1
+                if dropped:
+                    stats.sources_pruned = dropped
+                    _emit(progress, f"pruned {dropped} out-of-scope source(s) (excluded projects)")
+        except Exception as e:
+            log.exception("source scope prune failed: %s", e)
 
     # --- curated notes (facts) ---
     # The note phase (parse every note, cross-note conflict analysis, two list_facts() passes over
