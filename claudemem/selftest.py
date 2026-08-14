@@ -1025,7 +1025,15 @@ def run_selftest(verbose: bool = True) -> bool:
                         {"matcher": "", "hooks": [{"type": "command", "command": "other-tool.py"}]}],
                     "SessionStart": [
                         {"matcher": "startup", "hooks": [{"type": "command",
-                         "command": "C:/code/claude-memory/hooks/fleet_autoenroll.py"}]}]},
+                         "command": "C:/code/claude-memory/hooks/fleet_autoenroll.py"}]},
+                        # A FOREIGN SessionStart entry — the Vigor fleet gate. Distinct from
+                        # the retired fleet_autoenroll carrier above, which we do remove.
+                        # Untested until now, and SessionStart is exactly where an installer
+                        # that rebuilds the hooks object drops someone else's governance: a
+                        # member machine was found ungoverned for eleven days with the gate
+                        # missing from settings.json and three stacked copies of ours.
+                        {"matcher": "startup", "hooks": [{"type": "command",
+                         "command": "C:/Users/x/.fleet-hub/fleet_gate.py"}]}]},
             }), encoding="utf-8")
             try:
                 hooks_install.SETTINGS = tmp
@@ -1048,12 +1056,18 @@ def run_selftest(verbose: bool = True) -> bool:
         idempotent = len(ours) == 1  # exactly one of our recall entries despite two installs
         no_fleet = not any("fleet_autoenroll.py" in x.get("command", "")
                            for e in h.get("SessionStart", []) for x in e.get("hooks", []))
-        preserved = data.get("model") == "opus" and foreign_kept
+        # The fleet gate must survive on SessionStart. Dropping another product's
+        # governance hook is silent on both sides: they stop being governed and we never
+        # notice we did it.
+        gate_kept = any("fleet_gate.py" in x.get("command", "")
+                        for e in h.get("SessionStart", []) for x in e.get("hooks", []))
+        preserved = data.get("model") == "opus" and foreign_kept and gate_kept
         return (events_ok and starts_ok and idempotent and no_fleet and preserved,
                 f"events_ok={events_ok} starts_ok={starts_ok} idempotent={idempotent} "
-                f"legacy_carrier_removed={no_fleet} foreign_kept={foreign_kept}")
-    ctx.check("install-hooks is idempotent, preserves foreign hooks, removes retired carrier",
-              c_install_hooks)
+                f"legacy_carrier_removed={no_fleet} foreign_kept={foreign_kept} "
+                f"fleet_gate_kept={gate_kept}")
+    ctx.check("install-hooks is idempotent, preserves foreign hooks (incl. the fleet gate "
+              "on SessionStart), removes retired carrier", c_install_hooks)
 
     # -- uninstall-hooks removes only our entries (on the same copy) --------
     def c_uninstall_hooks():
